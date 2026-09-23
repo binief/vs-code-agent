@@ -27,15 +27,26 @@ current phase - thinking, which tool is running, what it is touching, and for ho
 
 ## Quick start
 
-1. **Build and install**
+1. **Install it**
+
+   Download `coding-harness.vsix` from the [Releases page](https://github.com/binief/vs-code-agent/releases/latest) and install it:
 
    ```bash
-   cd coding-harness-vscode
-   npm install
-   npm run compile
-   npx vsce package --allow-missing-repository --skip-license   # produces coding-harness.vsix
    code --install-extension coding-harness.vsix
    ```
+
+   Or build it yourself from source:
+
+   ```bash
+   npm install
+   npm run compile
+   npm run package            # writes coding-harness.vsix
+   code --install-extension coding-harness.vsix
+   ```
+
+   > The repository holds source only; the packaged extension is attached to each release by
+   > `.github/workflows/release.yml` (push a `v*` tag, or run the workflow manually). Building it
+   > yourself always works too — that is the same command the release workflow runs.
 
    Or press **F5** in this folder to launch an Extension Development Host (it opens
    `playground/`, a scratch project made for experimenting).

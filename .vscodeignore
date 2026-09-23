@@ -1,5 +1,6 @@
 # Sources, build config and dev scaffolding are not needed at runtime.
 .vscode/**
+.github/**
 src/**
 playground/**
 tsconfig.json

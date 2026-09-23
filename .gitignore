@@ -1,4 +1,12 @@
 node_modules/
 out/
-*.vsix
 .DS_Store
+
+# Build artifacts are not committed: coding-harness.vsix ships as a release
+# asset instead (see the Releases page).
+*.vsix
+
+# GitHub refuses to let an OAuth app create .github/workflows/* without the
+# `workflow` token scope, so the release workflow ships separately: land it with
+# a workflow-capable token (or paste it in through the GitHub web UI).
+.github/workflows/
