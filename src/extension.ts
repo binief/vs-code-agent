@@ -145,9 +145,21 @@ function registerCommands(
       const state = controller.getState();
       log.info(
         `state: provider=${state.provider}/${state.model} editPolicy=${state.editPolicy} commandPolicy=${state.commandPolicy} ` +
-          `workspace=${state.workspace || '(none)'} apiKey=${state.keyPresent ? 'set' : 'unset'} tools=${state.toolCount}`,
+          `workspace=${state.workspace || '(none)'} apiKey=${state.keyPresent ? 'set' : 'unset'} tools=${state.toolCount} ` +
+          `mcp=${state.mcpEnabled ? `${state.mcpServers} srv ${state.mcpToolCount} tools` : 'off'} ` +
+          `tokens=${state.cumulativeUsage?.totalTokens || 0} ctx=${Math.round(state.contextPercent || 0)}%`,
       );
       channel.show(true);
+    }),
+
+    vscode.commands.registerCommand('codingHarness.compactConversation', async () => {
+      await chatView.reveal();
+      await controller.compactHistory();
+    }),
+
+    vscode.commands.registerCommand('codingHarness.reloadMcpServers', async () => {
+      await chatView.reveal();
+      await controller.reloadMcpServers();
     }),
   );
 }

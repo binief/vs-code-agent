@@ -1,4 +1,5 @@
 import { CheckpointStore, type RevertReport } from './checkpoints';
+import { compactHistory, estimateMessagesTokens, estimateTokens, shouldCompact } from './compaction';
 import { buildSystemPrompt, summarizeDiagnostics } from './prompt';
 import { createDefaultTools, ToolRegistry } from './tools';
 import {
@@ -46,6 +47,7 @@ export class HarnessSession {
   private history: ChatMessage[] = [];
   private controller?: AbortController;
   private busy = false;
+  private cumulativeUsage: Usage = {};
 
   constructor(private deps: AgentDeps) {
     this.registry = deps.registry ?? deps.tools ?? new ToolRegistry(createDefaultTools());
@@ -64,6 +66,10 @@ export class HarnessSession {
     return this.history;
   }
 
+  get usage(): Usage {
+    return { ...this.cumulativeUsage };
+  }
+
   updateConfig(config: HarnessConfig): void {
     this.deps.config = config;
   }
@@ -80,6 +86,7 @@ export class HarnessSession {
   reset(): void {
     this.history = [];
     this.checkpoints.clear();
+    this.cumulativeUsage = {};
   }
 
   cancel(): void {
@@ -89,6 +96,30 @@ export class HarnessSession {
   /** Undo every file change made since the current/last `runTask` started. */
   async revertLastTask(): Promise<RevertReport> {
     return this.checkpoints.revertAll();
+  }
+
+  /** Estimate current context usage */
+  getContextUsage(systemPrompt?: string): { tokens: number; window: number; percent: number } {
+    const sysTokens = systemPrompt ? estimateTokens(systemPrompt) : 0;
+    const histTokens = estimateMessagesTokens(this.history);
+    const total = sysTokens + histTokens;
+    const window = this.deps.config.compaction.contextWindowTokens;
+    const percent = window > 0 ? (total / window) * 100 : 0;
+    return { tokens: total, window, percent };
+  }
+
+  /** Manually compact the conversation history */
+  compact(): { compacted: boolean; originalTokens: number; newTokens: number; removed: number } {
+    const { newHistory, result } = compactHistory(this.history, this.deps.config);
+    if (result.compacted) {
+      this.history = newHistory;
+    }
+    return {
+      compacted: result.compacted,
+      originalTokens: result.originalTokens,
+      newTokens: result.newTokens,
+      removed: result.removedMessages,
+    };
   }
 
   async runTask(prompt: string, onEvent: (event: HarnessEvent) => void): Promise<TaskResult> {
@@ -107,10 +138,11 @@ export class HarnessSession {
 
     let steps = 0;
     let toolCallsRun = 0;
-    let usage: Usage = {};
+    let usage: Usage = { ...this.cumulativeUsage };
     let outcome: TaskOutcome = 'complete';
     let lastText = '';
     let errorText = '';
+    let lastTokensPerSecond = 0;
 
     try {
       const diagnostics = this.deps.config.includeDiagnosticsInPrompt ? await this.collectDiagnostics() : undefined;
@@ -120,6 +152,29 @@ export class HarnessSession {
         tools: this.registry.specs(),
         diagnostics,
       });
+
+      // Check if we should compact before starting
+      if (this.deps.config.compaction.enabled && this.deps.config.compaction.autoCompact) {
+        const check = shouldCompact([...this.history, ...taskMessages], system, this.deps.config);
+        onEvent({
+          type: 'context',
+          contextTokens: check.tokens,
+          contextWindow: this.deps.config.compaction.contextWindowTokens,
+          contextPercent: check.percent,
+        });
+        if (check.should) {
+          const { newHistory, result } = compactHistory(this.history, this.deps.config);
+          if (result.compacted) {
+            this.history = newHistory;
+            onEvent({
+              type: 'notice',
+              message: `Compacted conversation: removed ${result.removedMessages} old messages, freed ${result.originalTokens - result.newTokens} tokens (${Math.round((result.newTokens / this.deps.config.compaction.contextWindowTokens) * 100)}% context now).`,
+              level: 'info',
+            });
+            host.log('info', `auto-compacted: ${result.originalTokens} -> ${result.newTokens} tokens`);
+          }
+        }
+      }
 
       for (let step = 1; step <= maxSteps; step++) {
         if (signal.aborted) {
@@ -136,6 +191,38 @@ export class HarnessSession {
           ...this.history,
           ...taskMessages,
         ];
+
+        // Estimate context usage for this step
+        const contextTokens = estimateMessagesTokens(messages) + estimateTokens(system);
+        const contextWindow = this.deps.config.compaction.contextWindowTokens;
+        const contextPercent = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
+        onEvent({
+          type: 'context',
+          contextTokens,
+          contextWindow,
+          contextPercent,
+        });
+
+        // Auto-compact if we're approaching limit mid-task
+        if (
+          this.deps.config.compaction.enabled &&
+          this.deps.config.compaction.autoCompact &&
+          contextPercent >= this.deps.config.compaction.threshold * 100 &&
+          this.history.length > this.deps.config.compaction.keepLastMessages
+        ) {
+          const { newHistory, result } = compactHistory(this.history, this.deps.config);
+          if (result.compacted) {
+            this.history = newHistory;
+            onEvent({
+              type: 'notice',
+              message: `Auto-compacted during task: freed ${result.originalTokens - result.newTokens} tokens. Context now ${Math.round((estimateMessagesTokens([...this.history, ...taskMessages]) / contextWindow) * 100)}%.`,
+              level: 'warn',
+            });
+            // Rebuild messages with compacted history
+            messages.splice(1, this.history.length, ...this.history);
+          }
+        }
+
         if (isFinalStep) {
           messages.push({
             role: 'user',
@@ -152,7 +239,10 @@ export class HarnessSession {
         const streamId = `assistant-${step}`;
         const thinkingId = `thinking-${step}`;
         const showThinking = this.deps.config.showThinking;
+        let callStartedAt = 0;
+        let callDurationMs = 0;
         try {
+          callStartedAt = Date.now();
           const response = await this.deps.provider.chat({
             model: this.deps.config.model,
             messages,
@@ -177,12 +267,61 @@ export class HarnessSession {
                   }
                 : undefined,
           });
+          callDurationMs = Date.now() - callStartedAt;
           text = response.text ?? '';
           calls = isFinalStep ? [] : response.toolCalls ?? [];
           if (!thinking && response.thinking) thinking = response.thinking;
           if (response.usage) {
+            // Compute tokens per second
+            const outputTokens = response.usage.outputTokens ?? estimateTokens(text);
+            const tokensPerSecond = callDurationMs > 0 ? (outputTokens / callDurationMs) * 1000 : 0;
+            lastTokensPerSecond = tokensPerSecond;
+
+            const usageWithSpeed: Usage = {
+              ...response.usage,
+              tokensPerSecond,
+              durationMs: callDurationMs,
+            };
+
             usage = mergeUsage(usage, response.usage);
-            onEvent({ type: 'usage', step, usage: response.usage });
+            this.cumulativeUsage = mergeUsage(this.cumulativeUsage, response.usage);
+
+            // Emit usage with speed and context
+            onEvent({
+              type: 'usage',
+              step,
+              usage: usageWithSpeed,
+              durationMs: callDurationMs,
+              tokensPerSecond,
+              contextTokens,
+              contextWindow,
+              contextPercent,
+              cumulative: { ...this.cumulativeUsage },
+            });
+          } else {
+            // No usage from provider, estimate
+            const estimatedOutput = estimateTokens(text);
+            const tokensPerSecond = callDurationMs > 0 ? (estimatedOutput / callDurationMs) * 1000 : 0;
+            lastTokensPerSecond = tokensPerSecond;
+            const estimatedUsage: Usage = {
+              outputTokens: estimatedOutput,
+              totalTokens: estimatedOutput,
+              tokensPerSecond,
+              durationMs: callDurationMs,
+            };
+            usage = mergeUsage(usage, estimatedUsage);
+            this.cumulativeUsage = mergeUsage(this.cumulativeUsage, estimatedUsage);
+            onEvent({
+              type: 'usage',
+              step,
+              usage: estimatedUsage,
+              durationMs: callDurationMs,
+              tokensPerSecond,
+              contextTokens,
+              contextWindow,
+              contextPercent,
+              cumulative: { ...this.cumulativeUsage },
+            });
           }
         } catch (err) {
           if (signal.aborted) {
@@ -225,7 +364,7 @@ export class HarnessSession {
           if (isFinalStep) {
             onEvent({
               type: 'notice',
-              message: `Step budget (${maxSteps}) reached \u2014 the run ended with a summary. Raise codingHarness.maxSteps for longer tasks.`,
+              message: `Step budget (${maxSteps}) reached — the run ended with a summary. Raise codingHarness.maxSteps for longer tasks.`,
               level: 'warn',
             });
           }
@@ -273,8 +412,24 @@ export class HarnessSession {
           ? 'Cancelled by the user.'
           : lastText || (outcome === 'max-steps' ? 'Stopped at the step budget.' : 'Done.');
 
-    onEvent({ type: 'done', reason: outcome, summary, filesChanged });
-    return { outcome, summary, steps, toolCalls: toolCallsRun, filesChanged, usage };
+    onEvent({
+      type: 'done',
+      reason: outcome,
+      summary,
+      filesChanged,
+      usage: this.cumulativeUsage,
+      tokensPerSecond: lastTokensPerSecond,
+    });
+    return {
+      outcome,
+      summary,
+      steps,
+      toolCalls: toolCallsRun,
+      filesChanged,
+      usage: this.cumulativeUsage,
+      tokensPerSecond: lastTokensPerSecond,
+      contextTokens: estimateMessagesTokens(this.history),
+    };
   }
 
   /* ------------------------------------------------------------- internals */
@@ -394,17 +549,19 @@ export function parseToolArguments(raw: string): Record<string, unknown> {
 function mergeUsage(a: Usage, b: Usage): Usage {
   const inputTokens = (a.inputTokens ?? 0) + (b.inputTokens ?? 0);
   const outputTokens = (a.outputTokens ?? 0) + (b.outputTokens ?? 0);
-  const totalTokens = (a.totalTokens ?? 0) + (b.totalTokens ?? 0);
+  const totalTokens = (a.totalTokens ?? 0) + (b.totalTokens ?? 0) || inputTokens + outputTokens;
+  const cachedTokens = (a.cachedTokens ?? 0) + (b.cachedTokens ?? 0);
   return {
     inputTokens: inputTokens || undefined,
     outputTokens: outputTokens || undefined,
     totalTokens: totalTokens || undefined,
+    cachedTokens: cachedTokens || undefined,
   };
 }
 
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
-  return `${text.slice(0, max)}\n\u2026 [truncated: ${text.length - max} more characters]`;
+  return `${text.slice(0, max)}\n… [truncated: ${text.length - max} more characters]`;
 }
 
 /** Keep the tail of the conversation, never starting on an orphaned tool result. */
