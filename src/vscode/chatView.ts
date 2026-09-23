@@ -155,6 +155,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <span class="chip" id="chip-provider">provider</span>
       <span class="chip" id="chip-policy">policy</span>
       <span class="chip" id="chip-stream" title="Token-by-token rendering of model output">stream</span>
+      <span class="chip" id="chip-thinking" title="The model's reasoning stream, when the backend provides one">thinking</span>
       <span class="chip" id="chip-workspace" title=""></span>
     </div>
 
@@ -165,7 +166,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <span class="activity-elapsed" id="activity-elapsed"></span>
     </div>
 
-    <main class="stream" id="stream">
+    <div class="stream-wrap">
+      <button class="jump-latest" id="jump-latest" hidden>Jump to latest &#8595;</button>
+      <main class="stream" id="stream">
       <div class="empty" id="empty">
         <h2>Coding Harness</h2>
         <p>Describe a coding task and the agent will explore the workspace, edit files and run commands through
@@ -176,8 +179,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           <li data-prompt="Run the test suite and fix the first failing test.">Run the tests and fix failures</li>
           <li data-prompt="Add a docstring to every public function in the main module.">Document the main module</li>
         </ul>
-      </div>
-    </main>
+        </div>
+      </main>
+    </div>
 
     <footer class="composer">
       <div class="composer-row">

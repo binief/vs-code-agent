@@ -9,7 +9,9 @@ offline rule-based planner) so it works with a cloud API, a local model through 
 with no API key at all.
 
 Model output **streams token by token** into the panel, and a live activity strip always shows the
-current phase - thinking, which tool is running, what it is touching, and for how long.
+current phase - thinking, which tool is running, what it is touching, and for how long. When the
+backend exposes a reasoning stream it renders in its own **thinking lane** above each answer: expanded
+and following along while it is written, then collapsed to a one-line summary once the answer lands.
 
 ```
  ┌──────────────┐   prompt    ┌──────────────────────────────────────────────┐
@@ -120,6 +122,7 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.maxFileBytes` | `262144` | Skip files larger than this |
 | `codingHarness.includeDiagnosticsInPrompt` | `true` | Send current errors with each task |
 | `codingHarness.stream` | `true` | Render output token by token; off = one response per turn |
+| `codingHarness.showThinking` | `true` | Show the model's reasoning lane when the backend provides one |
 | `codingHarness.systemPromptExtra` | `""` | Project conventions appended to the system prompt |
 
 ## Commands
@@ -156,6 +159,27 @@ whose text is finalised when the turn ends — no duplicated or half-rendered me
 `codingHarness.stream` to `false` to skip streaming entirely. The offline planner types its text out
 word by word, so the harness demonstrates the same progressive rendering without any model.
 
+### Reasoning streams
+
+`ChatRequest.onThinking` is a second, independent channel from `onDelta`, because reasoning is shown
+differently and must never be treated as the answer:
+
+- **OpenAI-compatible**: `reasoning_content` (DeepSeek, vLLM, Kimi) or `reasoning` (OpenRouter and
+  some gateways), read from both streaming deltas and single responses.
+- **Anthropic**: `thinking` content blocks and `thinking_delta` chunks. `signature_delta` chunks are
+  skipped rather than displayed.
+- **Offline planner**: narrates a rationale per step, so the lane can be exercised without a model.
+
+Deliberately **display-only**: reasoning is never appended to the transcript sent back to the model, so
+it cannot be mistaken for conversation history. Turn it off with `codingHarness.showThinking: false`.
+
+### Panel behaviour
+
+The message list is the only scroll container (`html`/`body` are `overflow: hidden`), and its children
+are pinned with `flex: 0 0 auto`. Children of a column flex container shrink by default, which used to
+compress every bubble as the transcript grew instead of scrolling. Auto-follow also yields: scroll up
+to read earlier output and the view stays put, with a **Jump to latest** button to re-stick.
+
 ## Headless use (no editor)
 
 The whole agent lives in `src/core` with no `vscode` import, so you can drive it from a terminal:
@@ -174,7 +198,7 @@ diff before asking. Model text streams to the terminal as it arrives; `--no-stre
 ```bash
 npm install
 npm run compile        # tsc → out/
-npm test               # 54 unit tests (paths, policy, tools, agent loop, providers, manifest)
+npm test               # 74 unit tests (paths, policy, tools, agent loop, providers, manifest)
 npm run watch          # incremental compile while you hack
 npm run package        # build a .vsix
 ```
@@ -196,8 +220,9 @@ src/vscode/          the editor integration
   host.ts            HarnessHost impl + approval service
   proposals.ts       virtual documents for diff previews
 media/               chat.css / chat.js (no bundler)
-src/test/            node --test suites (paths, policy, tools, loop,
-                     SSE streaming, panel messages via a stubbed vscode)
+src/test/            node --test suites (paths, policy, tools, loop, SSE
+                     streaming, panel messages via a stubbed vscode, webview
+                     layout/rendering rules and markup structure)
 playground/          toy project for the F5 sandbox
 ```
 
@@ -227,8 +252,10 @@ in `createProvider()` (`src/core/providers/index.ts`). `mock.ts` is a compact re
 ## Limitations worth knowing
 
 - **Single workspace folder.** The first folder of a multi-root workspace is the sandbox root.
-- **The mock provider is not a model.** It pattern-matches the prompt and writes sensible starter
-  files; it exists to demo and test the harness, not to write production code.
+- **The mock provider is not a model.** It pattern-matches the prompt, writes sensible starter files
+  and narrates a canned rationale; it exists to demo and test the harness, not to write production
+  code. Real reasoning needs a backend that emits one (DeepSeek-R1, o-series, Claude with extended
+  thinking), enabled on the provider side.
 - **Revert vs. your own edits.** Reverting restores the pre-task content of *touched* files. If you
   edited those files yourself after the agent did, your changes in them are replaced (checkpoints are
   per task, not per change).

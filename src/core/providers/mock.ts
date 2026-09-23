@@ -25,7 +25,8 @@ export class MockPlannerProvider implements Provider {
     // The agent passes an empty tool list on its final turn: answer in prose.
     if (!prompting) {
       const answer = this.finalAnswer();
-      await streamWords(answer, req);
+      await streamWords(FINAL_REASONING, req.onThinking, req.signal, 6);
+      await streamWords(answer, req.onDelta, req.signal);
       return { text: answer, toolCalls: [] };
     }
 
@@ -46,7 +47,9 @@ export class MockPlannerProvider implements Provider {
     const intent = parseIntent(prompt);
     const call = async (name: string, args: Record<string, unknown>): Promise<ProviderResponse> => {
       const text = intentSentence(name, args);
-      await streamWords(text, req);
+      const reasoning = reasoningFor(name, args);
+      if (reasoning) await streamWords(reasoning, req.onThinking, req.signal, 6);
+      await streamWords(text, req.onDelta, req.signal);
       return {
         text,
         toolCalls: [{ id: `mock_${this.step}_${name}`, name, arguments: JSON.stringify(args) }],
@@ -56,7 +59,8 @@ export class MockPlannerProvider implements Provider {
     };
     const done = async (): Promise<ProviderResponse> => {
       const text = this.finalAnswer();
-      await streamWords(text, req);
+      await streamWords(RECAP_REASONING, req.onThinking, req.signal, 6);
+      await streamWords(text, req.onDelta, req.signal);
       return { text, toolCalls: [] };
     };
 
@@ -149,15 +153,20 @@ export class MockPlannerProvider implements Provider {
  * streaming model. Awaiting real delays keeps the panel's live view honest
  * (text appears progressively instead of jumping in fully formed).
  */
-async function streamWords(text: string, req: ChatRequest, msPerChunk = 8): Promise<void> {
-  const onDelta = req.onDelta;
-  if (!onDelta || !text) return;
+async function streamWords(
+  text: string,
+  /** The lane to write to; never falls back to another lane. */
+  emit: ((chunk: string) => void) | undefined,
+  signal?: AbortSignal,
+  msPerChunk = 8,
+): Promise<void> {
+  if (!emit || !text) return;
   const chunks = text.match(/\S+\s*/g) ?? [text];
   const budget = 400; // never stall a task for the sake of a typing animation
   const delay = Math.max(1, Math.min(msPerChunk, Math.floor(budget / Math.max(1, chunks.length))));
   for (const chunk of chunks) {
-    if (req.signal?.aborted) return;
-    onDelta(chunk);
+    if (signal?.aborted) return;
+    emit(chunk);
     await new Promise((resolve) => setTimeout(resolve, delay));
   }
 }
@@ -231,6 +240,36 @@ function extractListedFiles(listing: string): string[] {
 }
 
 const EXTENSIONS = 'py|js|mjs|cjs|ts|tsx|jsx|md|json|txt|sh|bash|zsh|c|h|cpp|hpp|java|go|rs|rb|php|html|css|scss|yml|yaml|toml|ini|cfg|sql|kt|swift';
+
+/**
+ * Reasoning the planner "thinks" before acting. Stands in for a model's
+ * chain-of-thought so the thinking lane is exercised without a real backend.
+ */
+function reasoningFor(name: string, args: Record<string, unknown>): string {
+  const target = typeof args.path === 'string' ? args.path : typeof args.command === 'string' ? args.command : '';
+  switch (name) {
+    case 'list_files':
+      return 'The request needs context first. I do not know the layout of this workspace, so I should enumerate it before touching anything - guessing at file names is how edits land in the wrong place.\n';
+    case 'write_file':
+      return `Nothing matching ${target || 'the target'} was in the listing, so this is a new file rather than an edit. I will create it at the workspace root with a complete, self-contained body and then verify it parses.\n`;
+    case 'read_file':
+      return `Before changing ${target || 'this file'} I need its exact current contents, including indentation, so any replacement I make matches verbatim.\n`;
+    case 'search_text':
+      return `Rather than read every file, I will search for the symbol and use the hits to decide which files actually need opening.\n`;
+    case 'run_command':
+      return `Checking that the change is sound: ${target || 'running a verification step'}. A syntax or test check here is cheaper than reporting success on something broken.\n`;
+    case 'replace_in_file':
+      return `Making the smallest edit that satisfies the request, leaving surrounding formatting untouched.\n`;
+    default:
+      return `Deciding the next step for ${name}.\n`;
+  }
+}
+
+const FINAL_REASONING =
+  'Every step finished, so I can summarise now: what I inspected, what changed, and how it was verified. No further tool calls are needed.\n';
+
+const RECAP_REASONING =
+  'The work is done, so the useful thing now is a short report of the actions taken rather than more tool calls.\n';
 
 export interface Intent {
   kind: 'create' | 'read' | 'edit' | 'search' | 'test' | 'explain';

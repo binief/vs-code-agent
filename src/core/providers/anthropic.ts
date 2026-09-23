@@ -9,6 +9,8 @@ export interface AnthropicProviderOptions {
 interface AnthropicBlock {
   type: string;
   text?: string;
+  /** Present on `type: "thinking"` blocks (extended thinking). */
+  thinking?: string;
   id?: string;
   name?: string;
   input?: unknown;
@@ -87,7 +89,7 @@ export class AnthropicProvider implements Provider {
 
     const contentType = res.headers.get('content-type') ?? '';
     if (streaming && res.body && /text\/event-stream/i.test(contentType)) {
-      return readAnthropicStream(res.body, req.onDelta!, req.signal);
+      return readAnthropicStream(res.body, req.onDelta!, req.signal, req.onThinking);
     }
 
     const raw = await res.text();
@@ -99,8 +101,10 @@ export class AnthropicProvider implements Provider {
     }
 
     const textParts: string[] = [];
+    const thinkingParts: string[] = [];
     const toolCalls: ToolCall[] = [];
     for (const block of json.content ?? []) {
+      if (block.type === 'thinking' && block.thinking) thinkingParts.push(block.thinking);
       if (block.type === 'text' && block.text) textParts.push(block.text);
       if (block.type === 'tool_use' && block.name) {
         toolCalls.push({
@@ -111,6 +115,8 @@ export class AnthropicProvider implements Provider {
       }
     }
     const text = textParts.join('\n').trim();
+    const thinking = thinkingParts.join('\n').trim();
+    if (thinking && req.onThinking) req.onThinking(thinking);
     if (text && req.onDelta) req.onDelta(text);
 
     return {
@@ -118,6 +124,7 @@ export class AnthropicProvider implements Provider {
       toolCalls,
       finishReason: json.stop_reason,
       usage: json.usage ? { inputTokens: json.usage.input_tokens, outputTokens: json.usage.output_tokens } : undefined,
+      thinking: thinking || undefined,
     };
   }
 }
@@ -138,12 +145,14 @@ export async function readAnthropicStream(
   body: ReadableStream<Uint8Array>,
   onDelta: (text: string) => void,
   signal?: AbortSignal,
+  onThinking?: (text: string) => void,
 ): Promise<ProviderResponse> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const blocks = new Map<number, PartialBlock>();
   let buffer = '';
   let text = '';
+  let thinking = '';
   let stopReason: string | undefined;
   let inputTokens: number | undefined;
   let outputTokens: number | undefined;
@@ -167,12 +176,19 @@ export async function readAnthropicStream(
         const block = event.content_block ?? {};
         if (block.type === 'tool_use') {
           blocks.set(event.index ?? 0, { id: block.id ?? '', name: block.name ?? '', json: '' });
+        } else if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking) {
+          thinking += block.thinking;
+          onThinking?.(block.thinking);
         }
         break;
       }
       case 'content_block_delta': {
         const delta = event.delta ?? {};
-        if (delta.type === 'text_delta' && delta.text) {
+        if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string' && delta.thinking) {
+          // Extended thinking streams here; `signature_delta` chunks are skipped.
+          thinking += delta.thinking;
+          onThinking?.(delta.thinking);
+        } else if (delta.type === 'text_delta' && delta.text) {
           text += delta.text;
           onDelta(delta.text);
         } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
@@ -236,6 +252,7 @@ export async function readAnthropicStream(
     toolCalls,
     finishReason: stopReason,
     usage: inputTokens || outputTokens ? { inputTokens, outputTokens } : undefined,
+    thinking: thinking || undefined,
   };
 }
 

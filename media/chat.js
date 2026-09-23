@@ -24,6 +24,8 @@
   const activityDetail = document.getElementById('activity-detail');
   const activityElapsed = document.getElementById('activity-elapsed');
   const chipStream = document.getElementById('chip-stream');
+  const chipThinking = document.getElementById('chip-thinking');
+  const btnJump = document.getElementById('jump-latest');
 
   /** @type {Map<string, any>} */
   const items = new Map();
@@ -33,6 +35,9 @@
   /** Latest activity payload from the extension (drives the live strip). */
   let activity = null;
   let streamEnabled = true;
+  let thinkingEnabled = true;
+  /** Auto-follow the transcript, until the reader scrolls up to inspect something. */
+  let stickToBottom = true;
 
   /* ------------------------------------------------------------ helpers */
 
@@ -104,6 +109,11 @@
     chipStream.title = streamEnabled
       ? 'Model output is rendered token by token'
       : 'Streaming disabled (codingHarness.stream = false)';
+    thinkingEnabled = state.showThinking !== false;
+    chipThinking.textContent = 'thinking: ' + (thinkingEnabled ? 'shown' : 'hidden');
+    chipThinking.title = thinkingEnabled
+      ? "The model's reasoning stream is shown in its own lane"
+      : 'Reasoning hidden (codingHarness.showThinking = false)';
     chipWorkspace.textContent = state.workspace || 'no folder open';
     chipWorkspace.title = state.workspace || '';
 
@@ -140,6 +150,13 @@
   }
 
   /** Keep the elapsed timer on running tool cards moving. */
+  /** While thinking streams in, keep the lane's own scroll pinned to the end. */
+  function tickThinking() {
+    for (const node of stream.querySelectorAll('.thinking.streaming .thinking-body')) {
+      node.scrollTop = node.scrollHeight;
+    }
+  }
+
   function tickRunningTools() {
     for (const node of stream.querySelectorAll('.tool.running')) {
       const started = Number(node.dataset.startedAt || 0);
@@ -150,10 +167,41 @@
     }
   }
 
-  function autoScroll() {
-    const nearBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 160;
-    if (nearBottom || busy) stream.scrollTop = stream.scrollHeight;
+  function nearBottom() {
+    return stream.scrollHeight - stream.scrollTop - stream.clientHeight < 120;
   }
+
+  /**
+   * Follow the newest output, but do not yank the view back down while the
+   * reader is scrolled up reading earlier tool calls - offer the jump button
+   * instead. This is what used to make long transcripts unusable.
+   */
+  function autoScroll(force) {
+    const atBottom = nearBottom();
+    if (force || stickToBottom || atBottom) {
+      stickToBottom = true;
+      stream.scrollTop = stream.scrollHeight;
+      btnJump.hidden = true;
+      return;
+    }
+    btnJump.hidden = false;
+  }
+
+  stream.addEventListener('scroll', () => {
+    if (nearBottom()) {
+      stickToBottom = true;
+      btnJump.hidden = true;
+    } else {
+      stickToBottom = false;
+      btnJump.hidden = false;
+    }
+  });
+
+  btnJump.addEventListener('click', () => {
+    stickToBottom = true;
+    btnJump.hidden = true;
+    stream.scrollTop = stream.scrollHeight;
+  });
 
   function toggleEmpty() {
     if (items.size === 0) {
@@ -174,6 +222,8 @@
         node.innerHTML = renderMarkdown(item.text) + '<span class="caret"></span>';
         return node;
       }
+      case 'thinking':
+        return renderThinking(item);
       case 'notice': {
         const node = el('div', 'msg notice' + (item.level === 'info' ? '' : ' ' + item.level));
         node.textContent = item.message;
@@ -188,6 +238,39 @@
       default:
         return el('div', 'msg notice', JSON.stringify(item));
     }
+  }
+
+  /**
+   * The reasoning lane. Expanded and following along while the model is
+   * thinking, then collapsed to a one-line summary once the answer lands so it
+   * does not crowd out the actual results.
+   */
+  function renderThinking(item) {
+    const node = el('div', 'thinking' + (item.streaming ? ' streaming' : '') + (item.streaming ? ' open' : ''));
+    node.dataset.id = item.id;
+
+    const head = el('div', 'thinking-head');
+    head.appendChild(el('span', 'thinking-icon', '\u2733'));
+    head.appendChild(el('span', 'thinking-label', item.streaming ? 'Thinking\u2026' : 'Thought'));
+
+    const preview = el('span', 'thinking-preview');
+    preview.textContent = item.streaming ? '' : oneLine(item.text);
+    head.appendChild(preview);
+    if (!item.streaming && item.durationMs) {
+      head.appendChild(el('span', 'thinking-time', formatMs(item.durationMs)));
+    }
+    head.addEventListener('click', () => node.classList.toggle('open'));
+    node.appendChild(head);
+
+    const body = el('div', 'thinking-body');
+    body.textContent = item.text || '';
+    node.appendChild(body);
+    return node;
+  }
+
+  function oneLine(text) {
+    const flat = String(text || '').replace(/\s+/g, ' ').trim();
+    return flat.length > 110 ? flat.slice(0, 107) + '\u2026' : flat;
   }
 
   function renderTool(item) {
@@ -356,9 +439,16 @@
 
   function updateItem(item) {
     const previous = items.get(item.id);
+    // A reader who opened a collapsed thinking block should keep it open
+    // across the next repaint of that item.
+    if (previous && previous.kind === 'thinking' && item.kind === 'thinking') {
+      const node = elements.get(item.id);
+      if (node && node.classList.contains('open') && !item.streaming) item = Object.assign({}, item, { open: true });
+    }
     items.set(item.id, Object.assign({}, previous, item));
     const old = elements.get(item.id);
     const node = renderItem(items.get(item.id));
+    if (items.get(item.id).open) node.classList.add('open');
     if (old && old.parentElement) old.parentElement.replaceChild(node, old);
     else stream.appendChild(node);
     elements.set(item.id, node);
@@ -473,6 +563,7 @@
     if (!busy) return;
     tickActivity();
     tickRunningTools();
+    tickThinking();
   }, 250);
 
   vscode.postMessage({ type: 'ready' });

@@ -14,6 +14,14 @@ export type TranscriptItem =
   | { id: string; kind: 'assistant'; text: string; final: boolean; streaming?: boolean }
   | {
       id: string;
+      kind: 'thinking';
+      text: string;
+      streaming: boolean;
+      durationMs?: number;
+      startedAt?: number;
+    }
+  | {
+      id: string;
       kind: 'tool';
       toolCallId: string;
       name: string;
@@ -58,6 +66,8 @@ export interface UiState {
   toolCount: number;
   /** Whether model output is streamed into the panel. */
   stream: boolean;
+  /** Whether the model's reasoning stream is shown in its own lane. */
+  showThinking: boolean;
 }
 
 const MAX_ITEMS = 400;
@@ -97,6 +107,7 @@ export class HarnessController {
     keyPresent: false,
     toolCount: 0,
     stream: true,
+    showThinking: true,
   };
 
   constructor(
@@ -165,6 +176,7 @@ export class HarnessController {
       includeDiagnosticsInPrompt: c.get('includeDiagnosticsInPrompt'),
       systemPromptExtra: c.get('systemPromptExtra'),
       stream: c.get('stream'),
+      showThinking: c.get('showThinking'),
     });
   }
 
@@ -227,6 +239,7 @@ export class HarnessController {
       keyPresent: Boolean(apiKey),
       toolCount: this.session.toolNames.length,
       stream: config.stream,
+      showThinking: config.showThinking,
     };
     return this.session;
   }
@@ -246,6 +259,7 @@ export class HarnessController {
         maxSteps: config.maxSteps,
         keyPresent: Boolean(apiKey),
         stream: config.stream,
+        showThinking: config.showThinking,
       };
       if (this.session) {
         this.session.updateConfig(config);
@@ -385,6 +399,12 @@ export class HarnessController {
       case 'assistant-delta':
         this.appendDelta(event.id, event.text);
         break;
+      case 'thinking-delta':
+        this.appendThinkingDelta(event.id, event.text);
+        break;
+      case 'thinking':
+        this.finishThinking(event.id, event.text, event.durationMs);
+        break;
       case 'assistant':
         this.finishAssistant(event.id, event.text, event.final);
         break;
@@ -507,6 +527,44 @@ export class HarnessController {
       }, 60);
       this.streams.set(id, entry);
     }
+  }
+
+  /** Append a reasoning fragment; creates the thinking lane on first text. */
+  private appendThinkingDelta(id: string, text: string): void {
+    let item = this.items.find(
+      (i): i is Extract<TranscriptItem, { kind: 'thinking' }> => i.kind === 'thinking' && i.id === id,
+    );
+    if (!item) {
+      item = { id, kind: 'thinking', text: '', streaming: true, startedAt: Date.now() };
+      this.items.push(item);
+      this.post({ type: 'item', item: { ...item } });
+    }
+    item.text += text;
+
+    const entry = this.streams.get(id) ?? {};
+    if (!entry.timer) {
+      entry.timer = setTimeout(() => {
+        entry.timer = undefined;
+        this.post({ type: 'update', item: { ...item! } });
+      }, 80);
+      this.streams.set(id, entry);
+    }
+  }
+
+  /** Close the thinking lane: keep the text, record how long it ran. */
+  private finishThinking(id: string, text: string, durationMs: number): void {
+    const entry = this.streams.get(id);
+    if (entry?.timer) clearTimeout(entry.timer);
+    this.streams.delete(id);
+
+    const item = this.items.find(
+      (i): i is Extract<TranscriptItem, { kind: 'thinking' }> => i.kind === 'thinking' && i.id === id,
+    );
+    if (!item) return;
+    item.text = text || item.text;
+    item.streaming = false;
+    item.durationMs = durationMs || (item.startedAt ? Date.now() - item.startedAt : 0);
+    this.post({ type: 'update', item: { ...item } });
   }
 
   /** Finalise a model turn: reconcile with the authoritative full text. */

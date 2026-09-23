@@ -147,7 +147,11 @@ export class HarnessSession {
         let text = '';
         let calls: ToolCall[] = [];
         let streamed = false;
+        let thinking = '';
+        let thinkingStartedAt = 0;
         const streamId = `assistant-${step}`;
+        const thinkingId = `thinking-${step}`;
+        const showThinking = this.deps.config.showThinking;
         try {
           const response = await this.deps.provider.chat({
             model: this.deps.config.model,
@@ -163,9 +167,19 @@ export class HarnessSession {
                   onEvent({ type: 'assistant-delta', id: streamId, text: delta });
                 }
               : undefined,
+            // The reasoning lane: shown, never echoed back to the model.
+            onThinking:
+              this.deps.config.stream && showThinking
+                ? (delta: string) => {
+                    if (!thinkingStartedAt) thinkingStartedAt = Date.now();
+                    thinking += delta;
+                    onEvent({ type: 'thinking-delta', id: thinkingId, text: delta });
+                  }
+                : undefined,
           });
           text = response.text ?? '';
           calls = isFinalStep ? [] : response.toolCalls ?? [];
+          if (!thinking && response.thinking) thinking = response.thinking;
           if (response.usage) {
             usage = mergeUsage(usage, response.usage);
             onEvent({ type: 'usage', step, usage: response.usage });
@@ -180,6 +194,16 @@ export class HarnessSession {
           onEvent({ type: 'notice', message: `Model call failed: ${errorText}`, level: 'error' });
           outcome = 'error';
           break;
+        }
+
+        // Close the thinking lane for this turn before the answer is shown.
+        if (thinking.trim() && this.deps.config.stream && showThinking) {
+          onEvent({
+            type: 'thinking',
+            id: thinkingId,
+            text: thinking,
+            durationMs: thinkingStartedAt ? Date.now() - thinkingStartedAt : 0,
+          });
         }
 
         const trimmed = text.trim();

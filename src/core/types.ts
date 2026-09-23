@@ -54,6 +54,8 @@ export interface ProviderResponse {
   toolCalls: ToolCall[];
   usage?: Usage;
   finishReason?: string;
+  /** Reasoning/thinking text, when the backend returned any. */
+  thinking?: string;
 }
 
 export interface ChatRequest {
@@ -66,9 +68,17 @@ export interface ChatRequest {
   /**
    * Called with each streamed text fragment as it arrives. Providers stream
    * when this is supplied (and fall back to a single response otherwise), so
-   * the UI can render the model's reasoning while it is still being produced.
+   * the UI can render output while it is still being produced.
    */
   onDelta?: (text: string) => void;
+  /**
+   * Called with each fragment of the model's *reasoning* stream, when the
+   * backend exposes one: DeepSeek `reasoning_content`, OpenRouter `reasoning`,
+   * OpenAI-compatible reasoning models, or Anthropic extended thinking.
+   * Kept separate from `onDelta` because it is shown in its own lane and is
+   * never fed back to the model as conversation content.
+   */
+  onThinking?: (text: string) => void;
 }
 
 /** A model backend: OpenAI-compatible, Anthropic, or the offline mock planner. */
@@ -144,6 +154,8 @@ export interface HarnessConfig {
   systemPromptExtra?: string;
   /** Stream model output token by token into the panel. */
   stream: boolean;
+  /** Show the model's reasoning stream, when the backend provides one. */
+  showThinking: boolean;
 }
 
 export const DEFAULT_CONFIG: HarnessConfig = {
@@ -161,10 +173,17 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   maxFileBytes: 256 * 1024,
   includeDiagnosticsInPrompt: true,
   stream: true,
+  showThinking: true,
 };
 
 export function resolveConfig(partial: Partial<HarnessConfig> | undefined): HarnessConfig {
-  return { ...DEFAULT_CONFIG, ...(partial ?? {}) };
+  const merged: HarnessConfig = { ...DEFAULT_CONFIG };
+  for (const [key, value] of Object.entries(partial ?? {})) {
+    // Values explicitly set to undefined must not clobber a default: a settings
+    // lookup that returns nothing would otherwise disable that feature.
+    if (value !== undefined) (merged as unknown as Record<string, unknown>)[key] = value;
+  }
+  return merged;
 }
 
 /* --------------------------------------------------------------- events */
@@ -174,6 +193,8 @@ export type HarnessEvent =
   | { type: 'step'; index: number; maxSteps: number }
   | { type: 'assistant-delta'; id: string; text: string }
   | { type: 'assistant'; id: string; text: string; final: boolean; streamed: boolean }
+  | { type: 'thinking-delta'; id: string; text: string }
+  | { type: 'thinking'; id: string; text: string; durationMs: number }
   | { type: 'tool-start'; id: string; name: string; args: string }
   | {
       type: 'tool-end';

@@ -26,10 +26,16 @@ interface OpenAiChoice {
   message?: {
     content?: OpenAiContent;
     tool_calls?: OpenAiToolCallPayload[];
+    reasoning_content?: string | null;
+    reasoning?: string | null;
   } | null;
   delta?: {
     content?: OpenAiContent;
     tool_calls?: OpenAiToolCallPayload[];
+    /** DeepSeek-R1, vLLM and friends. */
+    reasoning_content?: string | null;
+    /** OpenRouter and some gateways. */
+    reasoning?: string | null;
   } | null;
   finish_reason?: string | null;
 }
@@ -107,7 +113,7 @@ export class OpenAiCompatibleProvider implements Provider {
 
     const contentType = res.headers.get('content-type') ?? '';
     if (streaming && res.body && /text\/event-stream/i.test(contentType)) {
-      return readOpenAiStream(res.body, req.onDelta!, req.signal);
+      return readOpenAiStream(res.body, req.onDelta!, req.signal, req.onThinking);
     }
 
     // Non-streaming fallback (or an endpoint that ignored `stream: true`).
@@ -123,7 +129,10 @@ export class OpenAiCompatibleProvider implements Provider {
     const choice = json.choices?.[0];
     const message = choice?.message ?? {};
     const text = normalizeContent(message.content);
+    const thinking = reasoningOf(message);
+
     // An endpoint that ignored `stream` still has to feed the UI something.
+    if (thinking && req.onThinking) req.onThinking(thinking);
     if (text && req.onDelta) req.onDelta(text);
 
     return {
@@ -131,6 +140,7 @@ export class OpenAiCompatibleProvider implements Provider {
       toolCalls: collectToolCalls(message.tool_calls),
       finishReason: choice?.finish_reason ?? undefined,
       usage: normalizeUsage(json.usage),
+      thinking: thinking || undefined,
     };
   }
 }
@@ -148,12 +158,14 @@ export async function readOpenAiStream(
   body: ReadableStream<Uint8Array>,
   onDelta: (text: string) => void,
   signal?: AbortSignal,
+  onThinking?: (text: string) => void,
 ): Promise<ProviderResponse> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const partials = new Map<number, PartialToolCall>();
   let buffer = '';
   let text = '';
+  let thinking = '';
   let finishReason: string | undefined;
   let usage: Usage | undefined;
   let errorMessage: string | undefined;
@@ -178,6 +190,14 @@ export async function readOpenAiStream(
     if (choice.finish_reason) finishReason = choice.finish_reason;
 
     const delta = choice.delta ?? choice.message ?? {};
+
+    // Reasoning arrives on its own field stream, before the answer text.
+    const reason = reasoningOf(delta);
+    if (reason) {
+      thinking += reason;
+      onThinking?.(reason);
+    }
+
     const piece = normalizeContent(delta.content);
     if (piece) {
       text += piece;
@@ -235,10 +255,20 @@ export async function readOpenAiStream(
       .filter((call) => Boolean(call.name)),
     finishReason,
     usage,
+    thinking: thinking || undefined,
   };
 }
 
 /* ---------------------------------------------------------------- helpers */
+
+/**
+ * Reasoning text, whichever field the backend used. DeepSeek, vLLM and Kimi
+ * use `reasoning_content`; OpenRouter and several gateways use `reasoning`.
+ */
+function reasoningOf(source: { reasoning_content?: string | null; reasoning?: string | null }): string {
+  const value = source.reasoning_content ?? source.reasoning;
+  return typeof value === 'string' ? value : '';
+}
 
 function collectToolCalls(payload: OpenAiToolCallPayload[] | undefined): ToolCall[] {
   return (payload ?? [])

@@ -10,6 +10,13 @@ body {
   height: 100%;
   margin: 0;
   padding: 0;
+  /* Only .stream scrolls; a second scrollbar on body fights it. */
+  overflow: hidden;
+}
+
+#app-root,
+body > .app {
+  height: 100%;
 }
 
 body {
@@ -22,8 +29,10 @@ body {
 .app {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100%;
+  max-height: 100vh;
   min-height: 0;
+  overflow: hidden;
 }
 
 /* ------------------------------------------------------------------ head */
@@ -183,10 +192,24 @@ body {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   padding: 4px 10px 10px;
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+/* Children of a column flex container default to flex-shrink: 1, so a long
+   transcript used to compress every bubble to fit the pane instead of
+   scrolling. Pin them to their natural height. */
+.stream > * {
+  flex: 0 0 auto;
+}
+
+.stream > .empty {
+  flex: 0 0 auto;
 }
 
 .empty {
@@ -610,4 +633,113 @@ button:disabled {
   font-size: 10.5px;
   color: var(--vscode-descriptionForeground);
   min-height: 14px;
+}
+
+/* -------------------------------------------------------------- thinking */
+
+/* The model's reasoning stream: visually distinct from its answer, collapsed
+   to a single line once the turn is over so it does not bury the results. */
+.thinking {
+  border-left: 2px dashed var(--vscode-descriptionForeground);
+  border-radius: 5px;
+  background: var(--vscode-textBlockQuote-background, rgba(128, 128, 128, 0.08));
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+  flex: 0 0 auto;
+}
+
+.thinking-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.thinking-head:hover {
+  color: var(--vscode-foreground);
+}
+
+.thinking-icon {
+  flex: none;
+  color: var(--vscode-charts-purple, #b180d7);
+}
+
+.thinking.streaming .thinking-icon {
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.thinking-label {
+  flex: none;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.thinking-preview {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.75;
+  font-style: italic;
+}
+
+.thinking-time {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+
+.thinking-body {
+  display: none;
+  padding: 0 8px 6px 26px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 260px;
+  overflow-y: auto;
+  font-style: italic;
+  opacity: 0.9;
+}
+
+/* Open while it is being written, closed once the answer has landed. */
+.thinking.open .thinking-body {
+  display: block;
+}
+
+.thinking.open .thinking-preview {
+  display: none;
+}
+
+/* -------------------------------------------------------- jump to latest */
+
+.jump-latest {
+  position: absolute;
+  right: 16px;
+  bottom: 10px;
+  z-index: 5;
+  border-radius: 12px;
+  padding: 3px 10px;
+  font-size: 11px;
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+}
+
+.jump-latest[hidden] {
+  display: none;
+}
+
+/* The stream needs a positioning context for the button above. */
+.stream-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.stream-wrap > .stream {
+  flex: 1 1 auto;
+  min-height: 0;
 }

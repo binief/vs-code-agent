@@ -243,6 +243,37 @@ test('a finished task reports the outcome and the files it changed', async () =>
   assert.ok(fs.existsSync(path.join(root, 'outcome.py')), 'the file really exists on disk');
 });
 
+test('the panel gets a thinking lane that streams then collapses', async () => {
+  const { controller, messages } = makeController();
+  await controller.run('create a python script called think.py that prints hello');
+
+  const thinkingItems = controller.getTranscript().filter((i: any) => i.kind === 'thinking') as any[];
+  assert.ok(thinkingItems.length >= 2, `expected one lane per turn, got ${thinkingItems.length}`);
+
+  const created = messages.find((m) => m.type === 'item' && m.item?.kind === 'thinking')?.item;
+  assert.ok(created, 'the lane must be created as soon as reasoning arrives');
+  assert.equal(created.streaming, true, 'it starts in the streaming state');
+  assert.equal(created.text, '', 'and grows in place from empty');
+  assert.ok(created.startedAt > 0, 'start time drives the live indicator');
+
+  const updates = messages.filter((m) => m.type === 'update' && m.item?.kind === 'thinking');
+  assert.ok(updates.length >= 2, `expected progressive repaints, got ${updates.length}`);
+
+  for (const lane of thinkingItems) {
+    assert.equal(lane.streaming, false, 'every lane is closed when its turn ends');
+    assert.ok(lane.text.length > 20, 'and keeps the rationale text');
+    assert.ok(lane.durationMs >= 0, 'with a duration to display');
+  }
+
+  // Thinking must not be mixed into the assistant bubbles.
+  const assistantText = controller
+    .getTranscript()
+    .filter((i: any) => i.kind === 'assistant')
+    .map((i: any) => i.text)
+    .join('\n');
+  assert.ok(!assistantText.includes('I do not know the layout of this workspace'), 'reasoning leaked into answers');
+});
+
 test('streaming can be disabled and the panel still renders each turn', async () => {
   settings.stream = false;
   try {

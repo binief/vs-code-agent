@@ -2,7 +2,7 @@
   "name": "coding-harness",
   "displayName": "Coding Harness",
   "description": "An in-editor coding agent. Give it a prompt and it plans, reads, searches, edits files and runs commands in your workspace using a sandboxed tool set.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "binief",
   "license": "MIT",
   "repository": {
@@ -227,6 +227,11 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Render model output token by token while it is produced. Turn off for endpoints that do not support server-sent events (the harness then falls back to a single response per turn)."
+        },
+        "codingHarness.showThinking": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show the model's reasoning stream in its own lane when the backend provides one (DeepSeek `reasoning_content`, OpenRouter `reasoning`, OpenAI-compatible reasoning models, Anthropic extended thinking). The reasoning is displayed only \u2014 it is never sent back to the model as conversation content."
         },
         "codingHarness.systemPromptExtra": {
           "type": "string",

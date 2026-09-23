@@ -212,6 +212,159 @@ test('Anthropic provider streams text and reassembles tool_use JSON', async () =
   assert.equal((stub.calls[0] as any).body.stream, true, 'the request must ask for a stream');
 });
 
+/* ------------------------------------------------------------- thinking */
+
+test('OpenAI provider streams reasoning_content into the thinking lane', async () => {
+  stubFetch(
+    sseResponse([
+      // DeepSeek-style: reasoning arrives first, on its own field.
+      sseChunk({ choices: [{ delta: { reasoning_content: 'The user wants ' } }] }),
+      sseChunk({ choices: [{ delta: { reasoning_content: 'the tests run.' } }] }),
+      sseChunk({ choices: [{ delta: { content: 'Running them now.' } }] }),
+      sseChunk({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+    ]),
+  );
+
+  const provider = new OpenAiCompatibleProvider({ apiKey: 'k', baseUrl: 'https://example.test/v1' });
+  const answer: string[] = [];
+  const reasoning: string[] = [];
+  const response = await provider.chat({
+    model: 'deepseek-reasoner',
+    messages: [{ role: 'user', content: 'run the tests' }],
+    tools: [],
+    onDelta: (t) => answer.push(t),
+    onThinking: (t) => reasoning.push(t),
+  });
+
+  assert.deepEqual(reasoning, ['The user wants ', 'the tests run.']);
+  assert.deepEqual(answer, ['Running them now.'], 'reasoning must not leak into the answer stream');
+  assert.equal(response.text, 'Running them now.');
+  assert.equal(response.thinking, 'The user wants the tests run.');
+});
+
+test('OpenAI provider accepts the OpenRouter `reasoning` field too', async () => {
+  stubFetch(
+    sseResponse([
+      sseChunk({ choices: [{ delta: { reasoning: 'weighing options' } }] }),
+      sseChunk({ choices: [{ delta: { content: 'Done.' } }] }),
+    ]),
+  );
+  const provider = new OpenAiCompatibleProvider({ apiKey: 'k', baseUrl: 'https://example.test/v1' });
+  const reasoning: string[] = [];
+  const response = await provider.chat({
+    model: 'some-model',
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [],
+    onDelta: () => {},
+    onThinking: (t) => reasoning.push(t),
+  });
+  assert.deepEqual(reasoning, ['weighing options']);
+  assert.equal(response.thinking, 'weighing options');
+});
+
+test('OpenAI provider keeps reasoning when the endpoint ignores stream', async () => {
+  stubFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: 'Answer.', reasoning_content: 'Thought first.' }, finish_reason: 'stop' }],
+      }),
+      { headers: { 'content-type': 'application/json' } },
+    ),
+  );
+  const provider = new OpenAiCompatibleProvider({ apiKey: 'k', baseUrl: 'https://example.test/v1' });
+  const reasoning: string[] = [];
+  const response = await provider.chat({
+    model: 'deepseek-reasoner',
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [],
+    onDelta: () => {},
+    onThinking: (t) => reasoning.push(t),
+  });
+  assert.deepEqual(reasoning, ['Thought first.']);
+  assert.equal(response.text, 'Answer.');
+  assert.equal(response.thinking, 'Thought first.');
+});
+
+test('Anthropic provider streams extended thinking blocks separately', async () => {
+  stubFetch(
+    sseResponse([
+      'event: content_block_start\n' +
+        sseChunk({ type: 'content_block_start', index: 0, content_block: { type: 'thinking' } }),
+      'event: content_block_delta\n' +
+        sseChunk({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'Let me check ' } }),
+      'event: content_block_delta\n' +
+        sseChunk({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'the file list.' } }),
+      // signature chunks must be ignored, not rendered
+      'event: content_block_delta\n' +
+        sseChunk({ type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'abc123' } }),
+      'event: content_block_start\n' +
+        sseChunk({ type: 'content_block_start', index: 1, content_block: { type: 'text' } }),
+      'event: content_block_delta\n' +
+        sseChunk({ type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'Here is the answer.' } }),
+      'event: message_delta\n' + sseChunk({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }),
+    ]),
+  );
+
+  const provider = new AnthropicProvider({ apiKey: 'k', baseUrl: 'https://api.anthropic.test' });
+  const answer: string[] = [];
+  const reasoning: string[] = [];
+  const response = await provider.chat({
+    model: 'claude-sonnet-4-5',
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [],
+    onDelta: (t) => answer.push(t),
+    onThinking: (t) => reasoning.push(t),
+  });
+
+  assert.deepEqual(reasoning, ['Let me check ', 'the file list.']);
+  assert.deepEqual(answer, ['Here is the answer.']);
+  assert.equal(response.thinking, 'Let me check the file list.');
+  assert.ok(!JSON.stringify(reasoning).includes('abc123'), 'signatures must not be displayed');
+});
+
+test('Anthropic provider reads thinking blocks from a non-streaming reply', async () => {
+  stubFetch(
+    new Response(
+      JSON.stringify({
+        content: [
+          { type: 'thinking', thinking: 'Considered the options.' },
+          { type: 'text', text: 'The answer is 42.' },
+        ],
+        stop_reason: 'end_turn',
+      }),
+      { headers: { 'content-type': 'application/json' } },
+    ),
+  );
+  const provider = new AnthropicProvider({ apiKey: 'k', baseUrl: 'https://api.anthropic.test' });
+  const reasoning: string[] = [];
+  const response = await provider.chat({
+    model: 'claude-sonnet-4-5',
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [],
+    onDelta: () => {},
+    onThinking: (t) => reasoning.push(t),
+  });
+  assert.deepEqual(reasoning, ['Considered the options.']);
+  assert.equal(response.text, 'The answer is 42.');
+  assert.equal(response.thinking, 'Considered the options.');
+});
+
+test('the offline planner narrates its reasoning via onThinking', async () => {
+  const provider = new MockPlannerProvider();
+  const reasoning: string[] = [];
+  const answer: string[] = [];
+  const response = await provider.chat({
+    model: 'mock',
+    messages: [{ role: 'user', content: 'create a python script called demo.py' }],
+    tools: [{ name: 'list_files', description: 'list', parameters: { type: 'object' } }],
+    onDelta: (t) => answer.push(t),
+    onThinking: (t) => reasoning.push(t),
+  });
+  assert.ok(reasoning.length > 3, `expected a reasoning stream, got ${reasoning.length} chunks`);
+  assert.ok(reasoning.join(' ').length > 40, 'the reasoning should say something substantive');
+  assert.equal(answer.join(''), response.text, 'the answer lane is separate');
+});
+
 /* ------------------------------------------------------------- mock typing */
 
 test('the offline planner streams its narration word by word', async () => {
@@ -310,6 +463,58 @@ test('the agent emits assistant-delta events and finalises the same bubble', asy
     assert.equal(finals[1].final, true);
     assert.equal(result.outcome, 'complete');
     assert.equal(result.summary, 'All done: nothing needed changing.');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the agent emits thinking events and keeps them out of its own summary', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-thinking-'));
+  try {
+    const events: HarnessEvent[] = [];
+    const session = new HarnessSession({
+      host: new FakeHost(dir),
+      config: { ...DEFAULT_CONFIG, provider: 'mock', stream: true, showThinking: true, maxSteps: 4 },
+      provider: new MockPlannerProvider(),
+    });
+
+    await session.runTask('create a python script called think.py that prints hello', (e) => events.push(e));
+
+    const deltas = events.filter(
+      (e): e is Extract<HarnessEvent, { type: 'thinking-delta' }> => e.type === 'thinking-delta',
+    );
+    assert.ok(deltas.length > 2, `expected a streamed rationale, got ${deltas.length} chunks`);
+    assert.ok(deltas.every((d) => d.id.startsWith('thinking-')));
+
+    const done = events.filter((e): e is Extract<HarnessEvent, { type: 'thinking' }> => e.type === 'thinking');
+    assert.ok(done.length >= 1, 'the lane must be closed with a duration');
+    assert.ok(done[0].durationMs >= 0);
+    assert.equal(done[0].text, deltas.filter((d) => d.id === done[0].id).map((d) => d.text).join(''));
+
+    // The reasoning must not be treated as the assistant's answer.
+    const finals = events.filter((e): e is Extract<HarnessEvent, { type: 'assistant' }> => e.type === 'assistant');
+    assert.ok(finals.length > 0);
+    for (const final of finals) {
+      assert.ok(!final.text.includes('The request needs context first'), 'reasoning leaked into the answer text');
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('showThinking=false suppresses the reasoning lane entirely', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-thinking-off-'));
+  try {
+    const events: HarnessEvent[] = [];
+    const session = new HarnessSession({
+      host: new FakeHost(dir),
+      config: { ...DEFAULT_CONFIG, provider: 'mock', stream: true, showThinking: false, maxSteps: 3 },
+      provider: new MockPlannerProvider(),
+    });
+
+    await session.runTask('create a python script called quiet.py that prints hello', (e) => events.push(e));
+    assert.equal(events.filter((e) => e.type === 'thinking-delta').length, 0);
+    assert.equal(events.filter((e) => e.type === 'thinking').length, 0);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
