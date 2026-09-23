@@ -84,6 +84,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'revert':
         await this.controller.revertLastTask();
         break;
+      case 'compact':
+        await this.controller.compactHistory();
+        break;
+      case 'mcp-reload':
+        await this.controller.reloadMcpServers();
+        break;
       case 'approval-response': {
         const decision: ApprovalDecision = message.decision === 'apply' ? 'apply' : 'reject';
         const remember = message.remember === 'kind' || message.remember === 'all' ? message.remember : undefined;
@@ -145,6 +151,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <span class="headline-text" id="status-text">Idle</span>
       </div>
       <div class="headline-actions">
+        <button class="icon-btn" id="btn-compact" title="Compact conversation to free context">Compact</button>
+        <button class="icon-btn" id="btn-mcp-reload" title="Reload MCP servers">MCP</button>
         <button class="icon-btn" id="btn-revert" title="Undo the file changes from the last task">Revert</button>
         <button class="icon-btn" id="btn-reset" title="Start a new conversation">New</button>
         <button class="icon-btn" id="btn-settings" title="Open Coding Harness settings">&#9881;</button>
@@ -156,18 +164,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <span class="chip" id="chip-policy">policy</span>
       <span class="chip" id="chip-stream" title="Token-by-token rendering of model output">stream</span>
       <span class="chip" id="chip-thinking" title="The model's reasoning stream, when the backend provides one">thinking</span>
+      <span class="chip tokens" id="chip-tokens" title="Total tokens used (input + output)">0 tokens</span>
+      <span class="chip speed" id="chip-speed" title="Current generation speed" hidden>0 tok/s</span>
+      <span class="chip context" id="chip-context" title="Context window utilisation">ctx 0%</span>
+      <span class="chip mcp" id="chip-mcp" title="MCP servers" hidden>mcp: off</span>
       <span class="chip" id="chip-workspace" title=""></span>
     </div>
 
+    <div class="compact-banner" id="compact-banner" hidden>
+      <span class="compact-text" id="compact-text">Context is getting full. Consider compacting.</span>
+      <div class="compact-actions">
+        <button class="primary" id="btn-compact-banner" title="Summarise older messages to free context">Compact</button>
+        <button id="btn-compact-dismiss" title="Dismiss">✕</button>
+      </div>
+    </div>
+
     <div class="activity" id="activity" hidden>
-      <span class="spinner" id="activity-spinner">\u25d0</span>
-      <span class="activity-text" id="activity-text">Working\u2026</span>
+      <span class="spinner" id="activity-spinner">◐</span>
+      <span class="activity-text" id="activity-text">Working…</span>
       <span class="activity-detail" id="activity-detail"></span>
       <span class="activity-elapsed" id="activity-elapsed"></span>
     </div>
 
     <div class="stream-wrap">
-      <button class="jump-latest" id="jump-latest" hidden>Jump to latest &#8595;</button>
+      <button class="jump-latest" id="jump-latest" hidden>Jump to latest ↓</button>
       <main class="stream" id="stream">
       <div class="empty" id="empty">
         <h2>Coding Harness</h2>
@@ -185,7 +205,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     <footer class="composer">
       <div class="composer-row">
-        <textarea id="input" rows="1" placeholder="Ask for a change, a fix, an explanation&#8230;" spellcheck="false"></textarea>
+        <textarea id="input" rows="1" placeholder="Ask for a change, a fix, an explanation…" spellcheck="false"></textarea>
         <div class="composer-buttons">
           <button class="primary" id="btn-send" title="Run the task (Enter)">Run</button>
           <button class="danger" id="btn-stop" title="Stop the running task" hidden>Stop</button>

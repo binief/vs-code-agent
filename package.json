@@ -37,7 +37,9 @@
     "onCommand:codingHarness.revertTask",
     "onCommand:codingHarness.setApiKey",
     "onCommand:codingHarness.showLog",
-    "onCommand:codingHarness.askAboutSelection"
+    "onCommand:codingHarness.askAboutSelection",
+    "onCommand:codingHarness.compactConversation",
+    "onCommand:codingHarness.reloadMcpServers"
   ],
   "contributes": {
     "viewsContainers": {
@@ -62,7 +64,7 @@
     "commands": [
       {
         "command": "codingHarness.newTask",
-        "title": "Coding Harness: New Task\u2026",
+        "title": "Coding Harness: New Task…",
         "icon": "$(sparkle)"
       },
       {
@@ -90,19 +92,39 @@
         "command": "codingHarness.showLog",
         "title": "Coding Harness: Show Log",
         "icon": "$(output)"
+      },
+      {
+        "command": "codingHarness.compactConversation",
+        "title": "Coding Harness: Compact Conversation",
+        "icon": "$(compress)"
+      },
+      {
+        "command": "codingHarness.reloadMcpServers",
+        "title": "Coding Harness: Reload MCP Servers",
+        "icon": "$(refresh)"
       }
     ],
     "menus": {
       "view/title": [
         {
-          "command": "codingHarness.revertTask",
+          "command": "codingHarness.compactConversation",
           "when": "view == codingHarness.chat",
           "group": "navigation@1"
         },
         {
-          "command": "codingHarness.showLog",
+          "command": "codingHarness.revertTask",
           "when": "view == codingHarness.chat",
           "group": "navigation@2"
+        },
+        {
+          "command": "codingHarness.reloadMcpServers",
+          "when": "view == codingHarness.chat",
+          "group": "navigation@3"
+        },
+        {
+          "command": "codingHarness.showLog",
+          "when": "view == codingHarness.chat",
+          "group": "navigation@4"
         }
       ],
       "editor/context": [
@@ -231,12 +253,70 @@
         "codingHarness.showThinking": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Show the model's reasoning stream in its own lane when the backend provides one (DeepSeek `reasoning_content`, OpenRouter `reasoning`, OpenAI-compatible reasoning models, Anthropic extended thinking). The reasoning is displayed only \u2014 it is never sent back to the model as conversation content."
+          "markdownDescription": "Show the model's reasoning stream in its own lane when the backend provides one (DeepSeek `reasoning_content`, OpenRouter `reasoning`, OpenAI-compatible reasoning models, Anthropic extended thinking). The reasoning is displayed only — it is never sent back to the model as conversation content."
         },
         "codingHarness.systemPromptExtra": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Extra instructions appended to the system prompt (project conventions, preferred commands, style rules, \u2026)."
+          "markdownDescription": "Extra instructions appended to the system prompt (project conventions, preferred commands, style rules, …)."
+        },
+        "codingHarness.mcp.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Enable Model Context Protocol (MCP) servers. When enabled, tools from configured MCP servers are added to the agent's tool set."
+        },
+        "codingHarness.mcp.servers": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "MCP servers configuration. Each key is a server ID, value is an object with `command` (required), `args` (optional array), `env` (optional object), `cwd` (optional), `disabled` (optional boolean), `timeoutMs` (optional number). Example: `{\"my-server\": {\"command\": \"node\", \"args\": [\"./mcp-server.js\"]}}`",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string" },
+              "args": { "type": "array", "items": { "type": "string" } },
+              "env": { "type": "object", "additionalProperties": { "type": "string" } },
+              "cwd": { "type": "string" },
+              "disabled": { "type": "boolean" },
+              "timeoutMs": { "type": "number" }
+            },
+            "required": ["command"]
+          }
+        },
+        "codingHarness.mcp.timeoutMs": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1000,
+          "markdownDescription": "Default timeout for MCP tool calls (ms)."
+        },
+        "codingHarness.compaction.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Enable conversation compaction to manage context window usage."
+        },
+        "codingHarness.compaction.autoCompact": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Automatically compact the conversation when it approaches the context window limit."
+        },
+        "codingHarness.compaction.threshold": {
+          "type": "number",
+          "default": 0.75,
+          "minimum": 0.1,
+          "maximum": 0.95,
+          "markdownDescription": "Context utilization threshold (0-1) at which auto-compaction triggers. 0.75 = compact when 75% of context window is used."
+        },
+        "codingHarness.compaction.contextWindowTokens": {
+          "type": "number",
+          "default": 128000,
+          "minimum": 1000,
+          "markdownDescription": "Estimated context window size in tokens. Used to calculate utilization percentage. Adjust based on your model (e.g., 128k for gpt-4o, 200k for Claude)."
+        },
+        "codingHarness.compaction.keepLastMessages": {
+          "type": "number",
+          "default": 10,
+          "minimum": 2,
+          "maximum": 50,
+          "markdownDescription": "Number of recent messages to keep uncompacted when compaction occurs."
         }
       }
     }

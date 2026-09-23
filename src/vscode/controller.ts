@@ -2,7 +2,9 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { HarnessSession } from '../core/agent';
 import { apiKeyFromEnv, createProvider } from '../core/providers';
-import { resolveConfig, type ApprovalRequest, type HarnessConfig, type HarnessEvent, type TaskOutcome } from '../core/types';
+import { createDefaultTools, ToolRegistry } from '../core/tools';
+import { McpManager } from '../core/tools/mcp';
+import { resolveConfig, type ApprovalRequest, type HarnessConfig, type HarnessEvent, type TaskOutcome, type Usage } from '../core/types';
 import type { ApprovalService } from './host';
 import { VsCodeHost } from './host';
 import type { Logger } from './log';
@@ -35,7 +37,7 @@ export type TranscriptItem =
     }
   | { id: string; kind: 'approval'; approvalId: string; request: ApprovalRequest; decision?: 'apply' | 'reject' }
   | { id: string; kind: 'notice'; level: 'info' | 'warn' | 'error'; message: string }
-  | { id: string; kind: 'done'; reason: TaskOutcome; summary: string; filesChanged: string[] };
+  | { id: string; kind: 'done'; reason: TaskOutcome; summary: string; filesChanged: string[]; usage?: Usage; tokensPerSecond?: number };
 
 /** What the agent is doing right now, for the live activity strip. */
 export interface Activity {
@@ -68,6 +70,17 @@ export interface UiState {
   stream: boolean;
   /** Whether the model's reasoning stream is shown in its own lane. */
   showThinking: boolean;
+  /** Token usage */
+  usage?: Usage;
+  cumulativeUsage?: Usage;
+  tokensPerSecond?: number;
+  contextTokens?: number;
+  contextWindow?: number;
+  contextPercent?: number;
+  /** MCP */
+  mcpEnabled?: boolean;
+  mcpServers?: number;
+  mcpToolCount?: number;
 }
 
 const MAX_ITEMS = 400;
@@ -80,6 +93,7 @@ const MAX_ITEMS = 400;
 export class HarnessController {
   private session?: HarnessSession;
   private host?: VsCodeHost;
+  private mcpManager?: McpManager;
   private items: TranscriptItem[] = [];
   private readonly listeners = new Set<(message: unknown) => void>();
   private counter = 0;
@@ -108,7 +122,18 @@ export class HarnessController {
     toolCount: 0,
     stream: true,
     showThinking: true,
+    usage: { totalTokens: 0 },
+    cumulativeUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    tokensPerSecond: 0,
+    contextTokens: 0,
+    contextWindow: 128000,
+    contextPercent: 0,
+    mcpEnabled: false,
+    mcpServers: 0,
+    mcpToolCount: 0,
   };
+  private cumulativeUsage: Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  private lastTokensPerSecond = 0;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -159,6 +184,17 @@ export class HarnessController {
 
   readConfig(): HarnessConfig {
     const c = vscode.workspace.getConfiguration('codingHarness');
+    const mcpConfig = c.get<Record<string, any>>('mcp.servers') ?? c.get('mcpServers') ?? {};
+    const mcpEnabled = c.get<boolean>('mcp.enabled') ?? c.get('mcpEnabled') ?? false;
+    const mcpTimeout = c.get<number>('mcp.timeoutMs') ?? c.get('mcpTimeoutMs') ?? 10000;
+
+    // Support both new and legacy compaction settings
+    const compactionEnabled = c.get<boolean>('compaction.enabled') ?? c.get('autoCompact') ?? true;
+    const autoCompact = c.get<boolean>('compaction.autoCompact') ?? c.get('autoCompact') ?? true;
+    const threshold = c.get<number>('compaction.threshold') ?? c.get('compactThreshold') ?? 0.75;
+    const contextWindow = c.get<number>('compaction.contextWindowTokens') ?? c.get('contextWindowTokens') ?? 128000;
+    const keepLast = c.get<number>('compaction.keepLastMessages') ?? c.get('keepLastMessages') ?? 10;
+
     return resolveConfig({
       provider: c.get('provider'),
       model: c.get('model'),
@@ -177,6 +213,18 @@ export class HarnessController {
       systemPromptExtra: c.get('systemPromptExtra'),
       stream: c.get('stream'),
       showThinking: c.get('showThinking'),
+      mcp: {
+        enabled: Boolean(mcpEnabled),
+        servers: (mcpConfig as Record<string, any>) || {},
+        timeoutMs: typeof mcpTimeout === 'number' ? mcpTimeout : 10000,
+      },
+      compaction: {
+        enabled: Boolean(compactionEnabled),
+        autoCompact: Boolean(autoCompact),
+        threshold: typeof threshold === 'number' ? threshold : 0.75,
+        contextWindowTokens: typeof contextWindow === 'number' ? contextWindow : 128000,
+        keepLastMessages: typeof keepLast === 'number' ? keepLast : 10,
+      },
     });
   }
 
@@ -219,13 +267,61 @@ export class HarnessController {
       });
     }
 
+    // Handle MCP servers
+    let toolRegistry: ToolRegistry | undefined;
+    if (config.mcp.enabled && Object.keys(config.mcp.servers).length > 0) {
+      try {
+        if (this.mcpManager) {
+          await this.mcpManager.stopAll();
+        }
+        this.mcpManager = new McpManager(root, config.mcp.timeoutMs);
+        const { started, failed } = await this.mcpManager.startServers(config.mcp.servers);
+        if (started.length > 0) {
+          this.log.info(`MCP: started ${started.length} server(s): ${started.join(', ')}`);
+          this.post({ type: 'mcp-status', enabled: true, servers: started.length, tools: this.mcpManager.toolCount });
+        }
+        if (failed.length > 0) {
+          for (const f of failed) {
+            this.log.warn(`MCP server ${f.id} failed: ${f.error}`);
+            this.pushNotice('warn', `MCP server "${f.id}" failed to start: ${f.error}`);
+          }
+        }
+        const defaultTools = createDefaultTools();
+        const mcpTools = this.mcpManager.getTools();
+        toolRegistry = new ToolRegistry([...defaultTools, ...mcpTools]);
+        this.log.info(`MCP: loaded ${mcpTools.length} tools from ${started.length} servers`);
+      } catch (err) {
+        this.log.warn(`MCP initialization failed: ${(err as Error).message}`);
+        this.pushNotice('warn', `MCP initialization failed: ${(err as Error).message}`);
+        toolRegistry = new ToolRegistry(createDefaultTools());
+      }
+    } else {
+      if (this.mcpManager) {
+        await this.mcpManager.stopAll();
+        this.mcpManager = undefined;
+      }
+      toolRegistry = new ToolRegistry(createDefaultTools());
+    }
+
     if (!this.session || !this.host || this.host.workspaceRoot !== root) {
       this.host = new VsCodeHost({ root, log: this.log, approvals: this.approvals });
-      this.session = new HarnessSession({ host: this.host, config, provider });
-      this.log.info(`session created for ${root} using ${provider.label}`);
+      this.session = new HarnessSession({ host: this.host, config, provider, registry: toolRegistry });
+      this.log.info(`session created for ${root} using ${provider.label} with ${toolRegistry.size} tools`);
     } else {
       this.session.updateConfig(config);
       this.session.setProvider(provider);
+      // If tools changed, we need to recreate session to pick up new registry
+      // For simplicity, we recreate registry via a private field hack: create new session if tool count changed
+      if (toolRegistry && toolRegistry.size !== this.session.toolNames.length) {
+        this.host = new VsCodeHost({ root, log: this.log, approvals: this.approvals });
+        const oldHistory = this.session.transcript;
+        this.session = new HarnessSession({ host: this.host, config, provider, registry: toolRegistry });
+        // Restore history and cumulative usage
+        // @ts-ignore - accessing private for restoration
+        (this.session as any).history = [...oldHistory];
+        (this.session as any).cumulativeUsage = { ...this.cumulativeUsage };
+        this.log.info(`session recreated with ${toolRegistry.size} tools (MCP updated)`);
+      }
     }
 
     this.state = {
@@ -240,6 +336,12 @@ export class HarnessController {
       toolCount: this.session.toolNames.length,
       stream: config.stream,
       showThinking: config.showThinking,
+      contextWindow: config.compaction.contextWindowTokens,
+      mcpEnabled: config.mcp.enabled,
+      mcpServers: this.mcpManager?.serverCount ?? 0,
+      mcpToolCount: this.mcpManager?.toolCount ?? 0,
+      cumulativeUsage: this.cumulativeUsage,
+      tokensPerSecond: this.lastTokensPerSecond,
     };
     return this.session;
   }
@@ -260,6 +362,12 @@ export class HarnessController {
         keyPresent: Boolean(apiKey),
         stream: config.stream,
         showThinking: config.showThinking,
+        contextWindow: config.compaction.contextWindowTokens,
+        mcpEnabled: config.mcp.enabled,
+        mcpServers: this.mcpManager?.serverCount ?? 0,
+        mcpToolCount: this.mcpManager?.toolCount ?? 0,
+        cumulativeUsage: this.cumulativeUsage,
+        tokensPerSecond: this.lastTokensPerSecond,
       };
       if (this.session) {
         this.session.updateConfig(config);
@@ -299,7 +407,15 @@ export class HarnessController {
 
     try {
       const result = await session.runTask(text, (event) => this.handleEvent(event));
-      this.log.info(`task finished: ${result.outcome} in ${result.steps} step(s), ${result.toolCalls} tool call(s)`);
+      this.cumulativeUsage = result.usage;
+      this.lastTokensPerSecond = result.tokensPerSecond || 0;
+      this.state = {
+        ...this.state,
+        cumulativeUsage: this.cumulativeUsage,
+        tokensPerSecond: this.lastTokensPerSecond,
+        contextTokens: result.contextTokens,
+      };
+      this.log.info(`task finished: ${result.outcome} in ${result.steps} step(s), ${result.toolCalls} tool call(s), ${result.usage.totalTokens || 0} tokens`);
     } catch (err) {
       const message = (err as Error).message;
       this.pushNotice('error', message);
@@ -315,15 +431,90 @@ export class HarnessController {
   cancel(): void {
     if (!this.session?.isRunning) return;
     this.session.cancel();
-    this.pushNotice('info', 'Cancelling the current task\u2026');
+    this.pushNotice('info', 'Cancelling the current task…');
   }
 
   reset(): void {
     if (this.session?.isRunning) this.session.cancel();
     this.session?.reset();
+    this.cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+    this.lastTokensPerSecond = 0;
     this.items = [];
     this.post({ type: 'reset' });
     this.log.info('conversation reset');
+  }
+
+  async compactHistory(): Promise<void> {
+    if (!this.session) {
+      void vscode.window.showInformationMessage('No active session to compact.');
+      return;
+    }
+    const result = this.session.compact();
+    if (result.compacted) {
+      this.pushNotice('info', `Compacted conversation: removed ${result.removed} old messages, freed ${result.originalTokens - result.newTokens} tokens (${result.newTokens} tokens now).`);
+      this.log.info(`manual compaction: ${result.originalTokens} -> ${result.newTokens} tokens, removed ${result.removed}`);
+      // Update context display
+      const ctx = this.session.getContextUsage();
+      this.state = {
+        ...this.state,
+        contextTokens: ctx.tokens,
+        contextPercent: ctx.percent,
+      };
+      this.post({ type: 'state', state: this.state });
+      this.post({ type: 'context', contextTokens: ctx.tokens, contextWindow: ctx.window, contextPercent: ctx.percent });
+    } else {
+      void vscode.window.showInformationMessage('Nothing to compact — conversation is already short.');
+    }
+  }
+
+  async reloadMcpServers(): Promise<void> {
+    const root = this.workspaceRoot();
+    if (!root) {
+      void vscode.window.showErrorMessage('Open a folder first.');
+      return;
+    }
+    const config = this.readConfig();
+    if (!config.mcp.enabled) {
+      void vscode.window.showInformationMessage('MCP is disabled. Enable codingHarness.mcp.enabled in settings.');
+      return;
+    }
+    try {
+      if (this.mcpManager) await this.mcpManager.stopAll();
+      this.mcpManager = new McpManager(root, config.mcp.timeoutMs);
+      const { started, failed } = await this.mcpManager.startServers(config.mcp.servers);
+      this.state = {
+        ...this.state,
+        mcpServers: started.length,
+        mcpToolCount: this.mcpManager.toolCount,
+      };
+      this.post({ type: 'state', state: this.state });
+      this.post({ type: 'mcp-status', enabled: true, servers: started.length, tools: this.mcpManager.toolCount });
+
+      if (started.length > 0) {
+        void vscode.window.showInformationMessage(`MCP: started ${started.length} server(s) with ${this.mcpManager.toolCount} tools.`);
+        this.log.info(`MCP reload: ${started.length} servers, ${this.mcpManager.toolCount} tools`);
+      }
+      if (failed.length > 0) {
+        for (const f of failed) {
+          this.pushNotice('warn', `MCP server "${f.id}" failed: ${f.error}`);
+        }
+      }
+      // Recreate session with new tools
+      if (this.session && this.host) {
+        const defaultTools = createDefaultTools();
+        const mcpTools = this.mcpManager.getTools();
+        const registry = new ToolRegistry([...defaultTools, ...mcpTools]);
+        const oldHistory = this.session.transcript;
+        this.session = new HarnessSession({ host: this.host, config, provider: createProvider({ config, apiKey: await this.resolveApiKey(config) }), registry });
+        (this.session as any).history = [...oldHistory];
+        (this.session as any).cumulativeUsage = { ...this.cumulativeUsage };
+        this.state = { ...this.state, toolCount: registry.size };
+        this.post({ type: 'state', state: this.state });
+      }
+    } catch (err) {
+      void vscode.window.showErrorMessage(`MCP reload failed: ${(err as Error).message}`);
+      this.log.error(`MCP reload failed: ${(err as Error).message}`);
+    }
   }
 
   /** Undo every file change made during the last task. */
@@ -479,9 +670,66 @@ export class HarnessController {
       case 'notice':
         this.pushNotice(event.level, event.message);
         break;
-      case 'usage':
-        this.post({ type: 'usage', usage: event.usage, step: event.step });
+      case 'usage': {
+        // Merge cumulative usage
+        if (event.usage) {
+          if (event.cumulative) {
+            this.cumulativeUsage = event.cumulative;
+          } else {
+            this.cumulativeUsage = mergeUsage(this.cumulativeUsage, event.usage);
+          }
+          if (event.tokensPerSecond) this.lastTokensPerSecond = event.tokensPerSecond;
+          else if (event.durationMs && event.usage.outputTokens) {
+            const sec = event.durationMs / 1000;
+            if (sec > 0) this.lastTokensPerSecond = event.usage.outputTokens / sec;
+          }
+
+          this.state = {
+            ...this.state,
+            usage: event.usage,
+            cumulativeUsage: this.cumulativeUsage,
+            tokensPerSecond: this.lastTokensPerSecond,
+            contextTokens: event.contextTokens ?? this.state.contextTokens,
+            contextWindow: event.contextWindow ?? this.state.contextWindow,
+            contextPercent: event.contextPercent ?? this.state.contextPercent,
+          };
+          this.post({ type: 'state', state: this.state });
+        }
+        this.post({
+          type: 'usage',
+          usage: event.usage,
+          step: event.step,
+          durationMs: event.durationMs,
+          tokensPerSecond: event.tokensPerSecond,
+          contextTokens: event.contextTokens,
+          contextWindow: event.contextWindow,
+          contextPercent: event.contextPercent,
+          cumulative: event.cumulative || this.cumulativeUsage,
+        });
         break;
+      }
+      case 'context': {
+        this.state = {
+          ...this.state,
+          contextTokens: event.contextTokens,
+          contextWindow: event.contextWindow,
+          contextPercent: event.contextPercent,
+        };
+        this.post({ type: 'state', state: this.state });
+        this.post({ type: 'context', contextTokens: event.contextTokens, contextWindow: event.contextWindow, contextPercent: event.contextPercent });
+        break;
+      }
+      case 'mcp-status': {
+        this.state = {
+          ...this.state,
+          mcpEnabled: event.enabled,
+          mcpServers: event.servers,
+          mcpToolCount: event.tools,
+        };
+        this.post({ type: 'state', state: this.state });
+        this.post({ type: 'mcp-status', enabled: event.enabled, servers: event.servers, tools: event.tools });
+        break;
+      }
       case 'done':
         this.push({
           id: this.id(),
@@ -489,6 +737,8 @@ export class HarnessController {
           reason: event.reason,
           summary: event.summary,
           filesChanged: event.filesChanged,
+          usage: event.usage || this.cumulativeUsage,
+          tokensPerSecond: event.tokensPerSecond || this.lastTokensPerSecond,
         });
         this.setStatus('idle', false);
         break;
@@ -640,6 +890,17 @@ export class HarnessController {
   }
 }
 
+function mergeUsage(a: Usage, b: Usage): Usage {
+  const inputTokens = (a.inputTokens ?? 0) + (b.inputTokens ?? 0);
+  const outputTokens = (a.outputTokens ?? 0) + (b.outputTokens ?? 0);
+  const totalTokens = (a.totalTokens ?? 0) + (b.totalTokens ?? 0) || inputTokens + outputTokens;
+  return {
+    inputTokens: inputTokens || undefined,
+    outputTokens: outputTokens || undefined,
+    totalTokens: totalTokens || undefined,
+  };
+}
+
 /** Short "what is it touching" hint for the activity strip. */
 function describeToolCall(name: string, rawArgs: string): string | null {
   try {
@@ -647,7 +908,7 @@ function describeToolCall(name: string, rawArgs: string): string | null {
     const pick = args.path ?? args.command ?? args.query ?? args.file;
     if (typeof pick !== 'string' || !pick) return null;
     const oneLine = pick.replace(/\s+/g, ' ').trim();
-    const value = oneLine.length > 70 ? `${oneLine.slice(0, 67)}\u2026` : oneLine;
+    const value = oneLine.length > 70 ? `${oneLine.slice(0, 67)}…` : oneLine;
     return name === 'run_command' ? `$ ${value}` : value;
   } catch {
     return null;

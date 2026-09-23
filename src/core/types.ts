@@ -47,6 +47,12 @@ export interface Usage {
   inputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
+  /** Cached tokens when provider reports them (e.g. Anthropic) */
+  cachedTokens?: number;
+  /** Estimated tokens per second for this step */
+  tokensPerSecond?: number;
+  /** Duration of the model call in ms */
+  durationMs?: number;
 }
 
 export interface ProviderResponse {
@@ -136,6 +142,31 @@ export type ProviderId = 'openai' | 'anthropic' | 'mock';
 export type EditPolicy = 'ask' | 'auto';
 export type CommandPolicy = 'auto-safe' | 'ask' | 'auto-all' | 'deny-all';
 
+export interface McpServerConfig {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+  disabled?: boolean;
+  /** Optional timeout override for this server */
+  timeoutMs?: number;
+}
+
+export interface McpConfig {
+  enabled: boolean;
+  servers: Record<string, McpServerConfig>;
+  timeoutMs: number;
+}
+
+export interface CompactionConfig {
+  enabled: boolean;
+  autoCompact: boolean;
+  threshold: number; // 0-1, e.g. 0.75 means compact when 75% of context window used
+  contextWindowTokens: number;
+  keepLastMessages: number;
+  summaryModel?: string; // optional model to use for summarization, defaults to main model
+}
+
 export interface HarnessConfig {
   provider: ProviderId;
   model: string;
@@ -156,6 +187,10 @@ export interface HarnessConfig {
   stream: boolean;
   /** Show the model's reasoning stream, when the backend provides one. */
   showThinking: boolean;
+  /** MCP servers configuration */
+  mcp: McpConfig;
+  /** Conversation compaction configuration */
+  compaction: CompactionConfig;
 }
 
 export const DEFAULT_CONFIG: HarnessConfig = {
@@ -174,14 +209,49 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   includeDiagnosticsInPrompt: true,
   stream: true,
   showThinking: true,
+  mcp: {
+    enabled: false,
+    servers: {},
+    timeoutMs: 10_000,
+  },
+  compaction: {
+    enabled: true,
+    autoCompact: true,
+    threshold: 0.75,
+    contextWindowTokens: 128_000,
+    keepLastMessages: 10,
+  },
 };
 
 export function resolveConfig(partial: Partial<HarnessConfig> | undefined): HarnessConfig {
-  const merged: HarnessConfig = { ...DEFAULT_CONFIG };
+  const merged: HarnessConfig = {
+    ...DEFAULT_CONFIG,
+    mcp: { ...DEFAULT_CONFIG.mcp, ...(partial?.mcp ?? {}) },
+    compaction: { ...DEFAULT_CONFIG.compaction, ...(partial?.compaction ?? {}) },
+  };
   for (const [key, value] of Object.entries(partial ?? {})) {
+    if (key === 'mcp' || key === 'compaction') continue;
     // Values explicitly set to undefined must not clobber a default: a settings
     // lookup that returns nothing would otherwise disable that feature.
     if (value !== undefined) (merged as unknown as Record<string, unknown>)[key] = value;
+  }
+  // Deep merge for nested configs that might be partial
+  if (partial?.mcp) {
+    merged.mcp = {
+      enabled: partial.mcp.enabled ?? DEFAULT_CONFIG.mcp.enabled,
+      servers: partial.mcp.servers ?? DEFAULT_CONFIG.mcp.servers,
+      timeoutMs: partial.mcp.timeoutMs ?? DEFAULT_CONFIG.mcp.timeoutMs,
+    };
+  }
+  if (partial?.compaction) {
+    merged.compaction = {
+      enabled: partial.compaction.enabled ?? DEFAULT_CONFIG.compaction.enabled,
+      autoCompact: partial.compaction.autoCompact ?? DEFAULT_CONFIG.compaction.autoCompact,
+      threshold: partial.compaction.threshold ?? DEFAULT_CONFIG.compaction.threshold,
+      contextWindowTokens: partial.compaction.contextWindowTokens ?? DEFAULT_CONFIG.compaction.contextWindowTokens,
+      keepLastMessages: partial.compaction.keepLastMessages ?? DEFAULT_CONFIG.compaction.keepLastMessages,
+      summaryModel: partial.compaction.summaryModel ?? DEFAULT_CONFIG.compaction.summaryModel,
+    };
   }
   return merged;
 }
@@ -208,9 +278,11 @@ export type HarnessEvent =
     }
   | { type: 'approval'; id: string; phase: 'request'; request: ApprovalRequest }
   | { type: 'approval'; id: string; phase: 'resolved'; request: ApprovalRequest; decision: ApprovalDecision }
-  | { type: 'usage'; step: number; usage: Usage }
+  | { type: 'usage'; step: number; usage: Usage; durationMs?: number; tokensPerSecond?: number; contextTokens?: number; contextWindow?: number; contextPercent?: number; cumulative?: Usage }
+  | { type: 'context'; contextTokens: number; contextWindow: number; contextPercent: number }
+  | { type: 'mcp-status'; enabled: boolean; servers: number; tools: number }
   | { type: 'notice'; message: string; level: 'info' | 'warn' | 'error' }
-  | { type: 'done'; reason: TaskOutcome; summary: string; filesChanged: string[] };
+  | { type: 'done'; reason: TaskOutcome; summary: string; filesChanged: string[]; usage?: Usage; tokensPerSecond?: number };
 
 export type TaskOutcome = 'complete' | 'max-steps' | 'cancelled' | 'error';
 
@@ -221,6 +293,8 @@ export interface TaskResult {
   toolCalls: number;
   filesChanged: string[];
   usage: Usage;
+  tokensPerSecond?: number;
+  contextTokens?: number;
 }
 
 /* ---------------------------------------------------------------- tools */
@@ -231,7 +305,7 @@ export interface ToolResult {
   content: string;
   /** One-line summary for the UI. */
   summary?: string;
-  /** Extra structured info (paths touched, exit codes, \u2026). */
+  /** Extra structured info (paths touched, exit codes, …). */
   meta?: Record<string, unknown>;
 }
 
@@ -244,7 +318,7 @@ export interface ToolContext {
   /**
    * Ask the user to authorise the action a tool is *about* to perform.
    * Supplied by the agent loop, which also emits the matching UI events.
-   * Calling it twice for one action would prompt twice \u2014 call it once, only
+   * Calling it twice for one action would prompt twice — call it once, only
    * when the configured policy actually requires confirmation.
    */
   approval(req: ApprovalRequest): Promise<ApprovalDecision>;

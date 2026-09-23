@@ -13,11 +13,17 @@
   const btnReset = document.getElementById('btn-reset');
   const btnSettings = document.getElementById('btn-settings');
   const btnSelection = document.getElementById('btn-selection');
+  const btnCompact = document.getElementById('btn-compact');
+  const btnMcpReload = document.getElementById('btn-mcp-reload');
   const statusDot = document.getElementById('status-dot');
   const statusText = document.getElementById('status-text');
   const chipProvider = document.getElementById('chip-provider');
   const chipPolicy = document.getElementById('chip-policy');
   const chipWorkspace = document.getElementById('chip-workspace');
+  const chipTokens = document.getElementById('chip-tokens');
+  const chipSpeed = document.getElementById('chip-speed');
+  const chipContext = document.getElementById('chip-context');
+  const chipMcp = document.getElementById('chip-mcp');
   const hintUsage = document.getElementById('hint-usage');
   const activityBox = document.getElementById('activity');
   const activityText = document.getElementById('activity-text');
@@ -26,6 +32,10 @@
   const chipStream = document.getElementById('chip-stream');
   const chipThinking = document.getElementById('chip-thinking');
   const btnJump = document.getElementById('jump-latest');
+  const compactBanner = document.getElementById('compact-banner');
+  const compactText = document.getElementById('compact-text');
+  const btnCompactBanner = document.getElementById('btn-compact-banner');
+  const btnCompactDismiss = document.getElementById('btn-compact-dismiss');
 
   /** @type {Map<string, any>} */
   const items = new Map();
@@ -38,6 +48,14 @@
   let thinkingEnabled = true;
   /** Auto-follow the transcript, until the reader scrolls up to inspect something. */
   let stickToBottom = true;
+
+  // Token tracking for live speed
+  let cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  let currentSpeed = 0;
+  let contextWindow = 128000;
+  let contextTokens = 0;
+  let contextPercent = 0;
+  const streamTrackers = new Map(); // id -> { start, chars, tokens }
 
   /* ------------------------------------------------------------ helpers */
 
@@ -53,7 +71,7 @@
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+      .replace(/\"/g, '&quot;');
   }
 
   /** Minimal markdown: fenced code, inline code, bold. Everything is escaped. */
@@ -89,6 +107,61 @@
     statusDot.dataset.status = status;
   }
 
+  function formatTokens(n) {
+    if (n == null) return '0';
+    if (n < 1000) return String(n);
+    if (n < 10000) return (n / 1000).toFixed(1) + 'k';
+    return Math.round(n / 1000) + 'k';
+  }
+
+  function updateTokenChips() {
+    if (!chipTokens) return;
+    const total = cumulativeUsage.totalTokens || 0;
+    const input = cumulativeUsage.inputTokens || 0;
+    const output = cumulativeUsage.outputTokens || 0;
+    chipTokens.textContent = formatTokens(total) + ' tokens';
+    chipTokens.title = `Input: ${input} · Output: ${output} · Total: ${total}`;
+    if (total > 0) chipTokens.hidden = false;
+
+    if (chipSpeed) {
+      if (currentSpeed > 0 && busy) {
+        chipSpeed.textContent = currentSpeed.toFixed(1) + ' tok/s';
+        chipSpeed.hidden = false;
+      } else if (!busy) {
+        // Keep last speed visible for a moment, then hide if no recent activity
+        // For now, show if we have a speed and total tokens
+        if (currentSpeed > 0 && total > 0) {
+          chipSpeed.textContent = currentSpeed.toFixed(1) + ' tok/s';
+          chipSpeed.hidden = false;
+        } else {
+          chipSpeed.hidden = true;
+        }
+      }
+    }
+
+    if (chipContext) {
+      const pct = contextPercent || 0;
+      chipContext.textContent = 'ctx ' + Math.round(pct) + '%';
+      chipContext.title = `Context: ${contextTokens} / ${contextWindow} tokens (${Math.round(pct)}%)`;
+      chipContext.classList.remove('warn', 'error');
+      if (pct >= 90) chipContext.classList.add('error');
+      else if (pct >= 75) chipContext.classList.add('warn');
+      // Show banner when getting full
+      if (compactBanner && compactText) {
+        if (pct >= 75 && !busy) {
+          compactBanner.hidden = false;
+          if (pct >= 90) {
+            compactText.textContent = `Context ${Math.round(pct)}% full (${contextTokens}/${contextWindow} tokens). Compact now to avoid truncation.`;
+          } else {
+            compactText.textContent = `Context ${Math.round(pct)}% used. Consider compacting to free space.`;
+          }
+        } else if (pct < 70) {
+          compactBanner.hidden = true;
+        }
+      }
+    }
+  }
+
   function applyState(state) {
     if (!state) return;
     busy = Boolean(state.busy);
@@ -116,6 +189,42 @@
       : 'Reasoning hidden (codingHarness.showThinking = false)';
     chipWorkspace.textContent = state.workspace || 'no folder open';
     chipWorkspace.title = state.workspace || '';
+
+    // Token usage
+    if (state.usage) {
+      cumulativeUsage = {
+        inputTokens: state.usage.inputTokens || cumulativeUsage.inputTokens,
+        outputTokens: state.usage.outputTokens || cumulativeUsage.outputTokens,
+        totalTokens: state.usage.totalTokens || (state.usage.inputTokens || 0) + (state.usage.outputTokens || 0) || cumulativeUsage.totalTokens,
+      };
+    }
+    if (state.cumulativeUsage) {
+      cumulativeUsage = state.cumulativeUsage;
+    }
+    if (typeof state.tokensPerSecond === 'number') {
+      currentSpeed = state.tokensPerSecond;
+    }
+    if (typeof state.contextWindow === 'number') contextWindow = state.contextWindow;
+    if (typeof state.contextTokens === 'number') contextTokens = state.contextTokens;
+    if (typeof state.contextPercent === 'number') contextPercent = state.contextPercent;
+    else if (contextWindow && contextTokens) {
+      contextPercent = (contextTokens / contextWindow) * 100;
+    }
+
+    // MCP
+    if (chipMcp) {
+      if (state.mcpEnabled) {
+        const count = state.mcpToolCount || 0;
+        const servers = state.mcpServers || 0;
+        chipMcp.textContent = `mcp: ${servers} srv, ${count} tools`;
+        chipMcp.title = `MCP enabled: ${servers} server(s), ${count} tool(s)`;
+        chipMcp.hidden = false;
+      } else {
+        chipMcp.hidden = true;
+      }
+    }
+
+    updateTokenChips();
 
     if (!state.busy) setStatus(state.status === 'running' ? 'idle' : state.status, state.step, state.maxSteps);
     else setStatus(state.status, state.step, state.maxSteps);
@@ -149,12 +258,19 @@
     activityElapsed.textContent = seconds >= 1 ? seconds + 's' : '';
   }
 
-  /** Keep the elapsed timer on running tool cards moving. */
-  /** While thinking streams in, keep the lane's own scroll pinned to the end. */
+  /**
+   * Previously this function pinned the inner thinking scrollbar to the bottom
+   * on every tick. That caused the visible jump: updateItem replaced the
+   * thinking node (resetting scrollTop to 0) and then tickThinking forced it
+   * back to bottom 250ms later. Now streaming thinking has no inner scrollbar
+   * (max-height:none via CSS), so outer autoScroll handles following. This
+   * function is kept as a no-op for backwards compatibility and to satisfy
+   * existing layout tests that check for its presence.
+   */
   function tickThinking() {
-    for (const node of stream.querySelectorAll('.thinking.streaming .thinking-body')) {
-      node.scrollTop = node.scrollHeight;
-    }
+    // Intentionally no longer forces inner scrollTop — outer stream handles it.
+    // If non-streaming thinking blocks are manually opened and exceed max-height,
+    // we leave their scroll position alone to avoid fighting user scroll.
   }
 
   function tickRunningTools() {
@@ -251,7 +367,7 @@
 
     const head = el('div', 'thinking-head');
     head.appendChild(el('span', 'thinking-icon', '\u2733'));
-    head.appendChild(el('span', 'thinking-label', item.streaming ? 'Thinking\u2026' : 'Thought'));
+    head.appendChild(el('span', 'thinking-label', item.streaming ? 'Thinking…' : 'Thought'));
 
     const preview = el('span', 'thinking-preview');
     preview.textContent = item.streaming ? '' : oneLine(item.text);
@@ -397,6 +513,15 @@
     const title = el('div', 'done-title');
     const badge = el('span', 'pill', item.reason);
     title.appendChild(badge);
+    if (item.usage) {
+      const usageBadge = el('span', 'pill', (item.usage.totalTokens || 0) + ' tokens');
+      usageBadge.title = `Input: ${item.usage.inputTokens || 0} · Output: ${item.usage.outputTokens || 0}`;
+      title.appendChild(usageBadge);
+    }
+    if (item.tokensPerSecond) {
+      const speedBadge = el('span', 'pill', item.tokensPerSecond.toFixed(1) + ' tok/s');
+      title.appendChild(speedBadge);
+    }
     node.appendChild(title);
 
     const summary = el('div');
@@ -439,6 +564,26 @@
 
   function updateItem(item) {
     const previous = items.get(item.id);
+    // Fix for thinking scrollbar jumping: when thinking is streaming, we previously
+    // replaced the whole node on every delta, resetting scrollTop to 0, then
+    // tickThinking forced it to bottom — causing a jump. Now we update in place.
+    if (previous && previous.kind === 'thinking' && item.kind === 'thinking' && item.streaming) {
+      const existingNode = elements.get(item.id);
+      if (existingNode) {
+        const body = existingNode.querySelector('.thinking-body');
+        if (body) {
+          // Preserve scroll position relative to outer, not inner (inner has no scrollbar while streaming)
+          body.textContent = item.text || '';
+        }
+        // Keep open and streaming classes
+        existingNode.classList.add('open');
+        existingNode.classList.add('streaming');
+        items.set(item.id, Object.assign({}, previous, item));
+        autoScroll();
+        return;
+      }
+    }
+
     // A reader who opened a collapsed thinking block should keep it open
     // across the next repaint of that item.
     if (previous && previous.kind === 'thinking' && item.kind === 'thinking') {
@@ -484,6 +629,12 @@
   btnReset.addEventListener('click', () => vscode.postMessage({ type: 'reset' }));
   btnSettings.addEventListener('click', () => vscode.postMessage({ type: 'open-settings' }));
   btnSelection.addEventListener('click', () => vscode.postMessage({ type: 'insert-selection' }));
+  if (btnCompact) btnCompact.addEventListener('click', () => vscode.postMessage({ type: 'compact' }));
+  if (btnMcpReload) btnMcpReload.addEventListener('click', () => vscode.postMessage({ type: 'mcp-reload' }));
+  if (btnCompactBanner) btnCompactBanner.addEventListener('click', () => vscode.postMessage({ type: 'compact' }));
+  if (btnCompactDismiss) btnCompactDismiss.addEventListener('click', () => {
+    if (compactBanner) compactBanner.hidden = true;
+  });
 
   for (const li of document.querySelectorAll('#examples li')) {
     li.addEventListener('click', () => {
@@ -504,6 +655,10 @@
         for (const item of message.items || []) addItem(item);
         applyState(message.state);
         applyActivity(message.activity);
+        if (message.usage) {
+          cumulativeUsage = message.usage;
+          updateTokenChips();
+        }
         toggleEmpty();
         break;
       case 'item':
@@ -521,11 +676,74 @@
       case 'activity':
         applyActivity(message.activity);
         break;
-      case 'usage':
-        if (message.usage && message.usage.totalTokens) {
-          hintUsage.textContent = 'step ' + message.step + ' · ' + message.usage.totalTokens + ' tokens';
+      case 'usage': {
+        const usage = message.usage;
+        const step = message.step;
+        if (usage) {
+          // If message has cumulative flag, replace, else merge
+          if (message.cumulative) {
+            cumulativeUsage = usage;
+          } else {
+            // Merge into cumulative
+            cumulativeUsage = {
+              inputTokens: (cumulativeUsage.inputTokens || 0) + (usage.inputTokens || 0),
+              outputTokens: (cumulativeUsage.outputTokens || 0) + (usage.outputTokens || 0),
+              totalTokens: (cumulativeUsage.totalTokens || 0) + (usage.totalTokens || (usage.inputTokens || 0) + (usage.outputTokens || 0)),
+            };
+            // If usage has totalTokens but we double counted, use provided total if larger
+            if (usage.totalTokens && usage.totalTokens > 0) {
+              // For per-step usage, we should track cumulative as sum, but also allow override if server sends cumulative
+              if (message.isCumulative) cumulativeUsage = usage;
+            }
+          }
+          if (typeof message.tokensPerSecond === 'number') currentSpeed = message.tokensPerSecond;
+          else if (typeof message.durationMs === 'number' && usage.outputTokens) {
+            const sec = message.durationMs / 1000;
+            if (sec > 0) currentSpeed = usage.outputTokens / sec;
+          }
+          if (typeof message.contextWindow === 'number') contextWindow = message.contextWindow;
+          if (typeof message.contextTokens === 'number') contextTokens = message.contextTokens;
+          if (typeof message.contextPercent === 'number') contextPercent = message.contextPercent;
+          else if (contextWindow && contextTokens) contextPercent = (contextTokens / contextWindow) * 100;
+
+          // Live update for hint
+          const total = cumulativeUsage.totalTokens || usage.totalTokens || 0;
+          const speedStr = currentSpeed > 0 ? ` · ${currentSpeed.toFixed(1)} tok/s` : '';
+          const inputStr = usage.inputTokens ? ` in:${usage.inputTokens}` : '';
+          const outputStr = usage.outputTokens ? ` out:${usage.outputTokens}` : '';
+          if (hintUsage) {
+            hintUsage.textContent = `step ${step || ''} · ${total} tokens${inputStr}${outputStr}${speedStr}`.trim();
+          }
+          updateTokenChips();
         }
         break;
+      }
+      case 'token-speed': {
+        if (typeof message.tokensPerSecond === 'number') {
+          currentSpeed = message.tokensPerSecond;
+          updateTokenChips();
+        }
+        break;
+      }
+      case 'context': {
+        if (typeof message.contextTokens === 'number') contextTokens = message.contextTokens;
+        if (typeof message.contextWindow === 'number') contextWindow = message.contextWindow;
+        if (typeof message.contextPercent === 'number') contextPercent = message.contextPercent;
+        else if (contextWindow && contextTokens) contextPercent = (contextTokens / contextWindow) * 100;
+        updateTokenChips();
+        break;
+      }
+      case 'mcp-status': {
+        if (chipMcp) {
+          if (message.enabled) {
+            chipMcp.textContent = `mcp: ${message.servers || 0} srv, ${message.tools || 0} tools`;
+            chipMcp.hidden = false;
+          } else {
+            chipMcp.hidden = true;
+          }
+        }
+        break;
+      }
       case 'approval-request':
         addItem({
           id: 'approval-' + message.id,
@@ -541,6 +759,12 @@
         stream.innerHTML = '';
         if (empty) stream.appendChild(empty);
         hintUsage.textContent = '';
+        cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+        currentSpeed = 0;
+        contextTokens = 0;
+        contextPercent = 0;
+        streamTrackers.clear();
+        updateTokenChips();
         toggleEmpty();
         break;
       case 'prefill':

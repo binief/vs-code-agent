@@ -1,5 +1,5 @@
 /**
- * Headless driver for the harness \u2014 the same core the VS Code extension uses.
+ * Headless driver for the harness — the same core the VS Code extension uses.
  *
  *   node out/demo/cli.js "create a python script called fib.py that prints fibonacci" --provider mock --dir ./playground
  *   node out/demo/cli.js "add a test for the parser" --provider openai --model gpt-4o-mini --dir .
@@ -13,6 +13,8 @@ import * as path from 'path';
 import * as readline from 'readline/promises';
 import { HarnessSession } from '../core/agent';
 import { apiKeyFromEnv, createProvider } from '../core/providers';
+import { createDefaultTools, ToolRegistry } from '../core/tools';
+import { McpManager } from '../core/tools/mcp';
 import { DEFAULT_CONFIG, type ApprovalRequest, type HarnessConfig, type HarnessEvent, type HarnessHost, type ProviderId } from '../core/types';
 
 const COLOR = !process.env.NO_COLOR;
@@ -35,6 +37,8 @@ interface Args {
   maxSteps?: number;
   verbose: boolean;
   noStream: boolean;
+  mcp?: string;
+  compactThreshold?: number;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -52,6 +56,8 @@ function parseArgs(argv: string[]): Args {
       case '--auto': args.auto = true; break;
       case '--no-stream': args.noStream = true; break;
       case '--verbose': args.verbose = true; break;
+      case '--mcp': args.mcp = value(); break;
+      case '--compact-threshold': args.compactThreshold = Number(value()); break;
       case '--help':
       case '-h':
         printHelp();
@@ -65,7 +71,7 @@ function parseArgs(argv: string[]): Args {
 }
 
 function printHelp(): void {
-  console.log(`Coding Harness \u2014 headless driver
+  console.log(`Coding Harness — headless driver
 
 Usage: node out/demo/cli.js "<prompt>" [options]
 
@@ -73,11 +79,13 @@ Options:
   --dir <path>          Workspace root (default: cwd)
   --provider <id>       openai | anthropic | mock   (default: mock)
   --model <id>          Model id, e.g. gpt-4o-mini, claude-sonnet-4-5
-  --base-url <url>      OpenAI-compatible base URL (Ollama, OpenRouter, \u2026)
+  --base-url <url>      OpenAI-compatible base URL (Ollama, OpenRouter, …)
   --max-steps <n>       Step budget (default: 12)
   --auto                Approve every edit/command without asking
   --no-stream           Wait for each model turn instead of streaming it
   --verbose             Print full tool output
+  --mcp <json>          MCP servers JSON, e.g. '{"my-server":{"command":"node","args":["./mcp.js"]}}'
+  --compact-threshold <n> Context threshold 0-1 for auto-compaction (default 0.75)
 `);
 }
 
@@ -96,7 +104,7 @@ class CliHost implements HarnessHost {
 
   async requestApproval(req: ApprovalRequest): Promise<'apply' | 'reject'> {
     const header =
-      req.kind === 'command' ? c.yellow(`\n\u26a0  Approve command?`) : c.yellow(`\n\u26a0  Approve ${req.kind}: ${req.title}`);
+      req.kind === 'command' ? c.yellow(`\n⚠  Approve command?`) : c.yellow(`\n⚠  Approve ${req.kind}: ${req.title}`);
     console.log(header);
     const body = req.kind === 'write' ? req.detail.split('\n').slice(0, 60).join('\n') : req.detail;
     console.log(c.dim(indent(body, '   ')));
@@ -120,7 +128,7 @@ function indent(text: string, pad: string): string {
 }
 
 function truncate(text: string, max = 600): string {
-  return text.length <= max ? text : `${text.slice(0, max)}\n\u2026 (${text.length - max} more chars)`;
+  return text.length <= max ? text : `${text.slice(0, max)}\n… (${text.length - max} more chars)`;
 }
 
 async function main(): Promise<void> {
@@ -142,17 +150,53 @@ async function main(): Promise<void> {
     editPolicy: 'ask',
     commandPolicy: 'ask',
     stream: !args.noStream,
+    compaction: {
+      ...DEFAULT_CONFIG.compaction,
+      threshold: args.compactThreshold ?? DEFAULT_CONFIG.compaction.threshold,
+    },
   };
+
+  if (args.mcp) {
+    try {
+      const servers = JSON.parse(args.mcp);
+      config.mcp = {
+        enabled: true,
+        servers,
+        timeoutMs: 10000,
+      };
+    } catch (e) {
+      console.error(c.red(`Failed to parse --mcp JSON: ${(e as Error).message}`));
+      process.exit(1);
+    }
+  }
 
   const apiKey = apiKeyFromEnv(config.provider);
   const provider = createProvider({ config, apiKey });
   const host = new CliHost(root, args.auto, args.verbose);
 
-  console.log(c.bold(`\nCoding Harness \u2014 ${provider.label} (${config.model})`));
+  console.log(c.bold(`\nCoding Harness — ${provider.label} (${config.model})`));
   console.log(c.dim(`workspace: ${root}\nprompt:    ${args.prompt}\n`));
+  if (config.mcp.enabled) {
+    console.log(c.dim(`MCP: enabled with ${Object.keys(config.mcp.servers).length} server(s)\n`));
+  }
 
-  const session = new HarnessSession({ host, config, provider });
+  let mcpManager: McpManager | undefined;
+  let registry: ToolRegistry;
+  if (config.mcp.enabled && Object.keys(config.mcp.servers).length > 0) {
+    mcpManager = new McpManager(root, config.mcp.timeoutMs);
+    const { started, failed } = await mcpManager.startServers(config.mcp.servers);
+    console.log(c.dim(`MCP: started ${started.length} server(s), ${mcpManager.toolCount} tools`));
+    if (failed.length) {
+      for (const f of failed) console.error(c.red(`MCP ${f.id} failed: ${f.error}`));
+    }
+    registry = new ToolRegistry([...createDefaultTools(), ...mcpManager.getTools()]);
+  } else {
+    registry = new ToolRegistry(createDefaultTools());
+  }
+
+  const session = new HarnessSession({ host, config, provider, registry });
   let streaming = false;
+  let totalTokens = 0;
   const render = (event: HarnessEvent): void => {
     switch (event.type) {
       case 'step':
@@ -160,30 +204,44 @@ async function main(): Promise<void> {
           process.stdout.write('\n');
           streaming = false;
         }
-        console.log(c.dim(`\u2500\u2500 step ${event.index}/${event.maxSteps}`));
+        console.log(c.dim(`── step ${event.index}/${event.maxSteps}`));
         break;
       case 'assistant-delta':
         // Live token stream: no newline until the turn ends.
         if (!streaming) {
-          process.stdout.write(c.cyan('\u25b8 '));
+          process.stdout.write(c.cyan('▸ '));
           streaming = true;
         }
         process.stdout.write(c.cyan(event.text));
+        break;
+      case 'thinking-delta':
+        if (!streaming) {
+          process.stdout.write(c.dim('💭 '));
+          streaming = true;
+        }
+        process.stdout.write(c.dim(event.text));
+        break;
+      case 'thinking':
+        if (streaming) {
+          process.stdout.write('\n');
+          streaming = false;
+        }
+        console.log(c.dim(`💭 thought ${event.durationMs}ms: ${truncate(event.text, 200)}`));
         break;
       case 'assistant':
         if (streaming) {
           process.stdout.write('\n');
           streaming = false;
         } else if (event.text) {
-          console.log(c.cyan(`\u25b8 ${truncate(event.text, 1200)}`));
+          console.log(c.cyan(`▸ ${truncate(event.text, 1200)}`));
         }
         break;
       case 'tool-start':
-        console.log(`  \u2699  ${c.bold(event.name)} ${c.dim(truncate(event.args, 200))}`);
+        console.log(`  ⚙  ${c.bold(event.name)} ${c.dim(truncate(event.args, 200))}`);
         break;
       case 'tool-end':
         console.log(
-          `  ${event.ok ? c.green('\u2713') : c.red('\u2717')} ${event.name} \u2014 ${event.summary} ${c.dim(`${event.durationMs}ms`)}`,
+          `  ${event.ok ? c.green('✓') : c.red('✗')} ${event.name} — ${event.summary} ${c.dim(`${event.durationMs}ms`)}`,
         );
         if (args.verbose) console.log(c.dim(indent(truncate(event.detail, 2000), '     ')));
         break;
@@ -191,14 +249,29 @@ async function main(): Promise<void> {
         console.log(c.yellow(`  ! ${event.message}`));
         break;
       case 'usage':
-        if (args.verbose && event.usage.totalTokens) console.log(c.dim(`  tokens: ${event.usage.totalTokens}`));
+        totalTokens = event.cumulative?.totalTokens ?? event.usage.totalTokens ?? totalTokens;
+        const speed = event.tokensPerSecond ? ` ${event.tokensPerSecond.toFixed(1)} tok/s` : '';
+        const ctx = event.contextPercent ? ` ctx ${Math.round(event.contextPercent)}%` : '';
+        console.log(c.dim(`  tokens: ${event.usage.totalTokens || 0} (in ${event.usage.inputTokens || 0} out ${event.usage.outputTokens || 0})${speed}${ctx} | total ${totalTokens}`));
+        break;
+      case 'context':
+        console.log(c.dim(`  context: ${event.contextTokens}/${event.contextWindow} (${Math.round(event.contextPercent)}%)`));
+        break;
+      case 'mcp-status':
+        console.log(c.dim(`  MCP: ${event.servers} server(s), ${event.tools} tool(s)`));
         break;
       case 'done':
         console.log(
-          `\n${event.reason === 'complete' ? c.green('\u2714 complete') : c.yellow(`\u25a0 ${event.reason}`)}: ${event.summary}`,
+          `\n${event.reason === 'complete' ? c.green('✔ complete') : c.yellow(`■ ${event.reason}`)}: ${event.summary}`,
         );
         if (event.filesChanged.length) {
           console.log(c.dim(`files changed: ${event.filesChanged.join(', ')}`));
+        }
+        if (event.usage) {
+          console.log(c.dim(`total tokens: ${event.usage.totalTokens || 0} (in ${event.usage.inputTokens || 0} out ${event.usage.outputTokens || 0})`));
+        }
+        if (event.tokensPerSecond) {
+          console.log(c.dim(`speed: ${event.tokensPerSecond.toFixed(1)} tok/s`));
         }
         break;
       default:
@@ -207,6 +280,7 @@ async function main(): Promise<void> {
   };
 
   const result = await session.runTask(args.prompt, render);
+  if (mcpManager) await mcpManager.stopAll();
   process.exitCode = result.outcome === 'complete' ? 0 : 1;
 }
 

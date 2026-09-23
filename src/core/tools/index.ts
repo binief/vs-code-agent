@@ -55,9 +55,19 @@ export class ToolRegistry {
       parameters: t.parameters,
     }));
   }
+
+  add(tool: Tool): void {
+    if (this.byName.has(tool.name)) throw new Error(`Duplicate tool name: ${tool.name}`);
+    this.byName.set(tool.name, tool);
+  }
+
+  addAll(tools: Tool[]): void {
+    for (const tool of tools) this.add(tool);
+  }
 }
 
 export { deleteFileTool, listFilesTool, readFileTool, replaceInFileTool, writeFileTool };
 export { getDiagnosticsTool, openFileTool };
 export { searchTextTool };
 export { runCommandTool, runShellCommand };
+export { McpManager, McpClient } from './mcp';
