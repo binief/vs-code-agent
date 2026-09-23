@@ -1,0 +1,4 @@
+# Keep line endings sane across Windows/macOS/Linux contributors.
+* text=auto eol=lf
+*.png binary
+*.vsix binary

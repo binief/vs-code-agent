@@ -1,0 +1,246 @@
+{
+  "name": "coding-harness",
+  "displayName": "Coding Harness",
+  "description": "An in-editor coding agent. Give it a prompt and it plans, reads, searches, edits files and runs commands in your workspace using a sandboxed tool set.",
+  "version": "0.1.0",
+  "publisher": "local-dev",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "agent",
+    "ai",
+    "copilot",
+    "harness",
+    "tools"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onView:codingHarness.chat",
+    "onCommand:codingHarness.newTask",
+    "onCommand:codingHarness.runTask",
+    "onCommand:codingHarness.focusChat",
+    "onCommand:codingHarness.revertTask",
+    "onCommand:codingHarness.setApiKey",
+    "onCommand:codingHarness.showLog",
+    "onCommand:codingHarness.askAboutSelection"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codingHarness",
+          "title": "Coding Harness",
+          "icon": "media/harness.svg"
+        }
+      ]
+    },
+    "views": {
+      "codingHarness": [
+        {
+          "type": "webview",
+          "id": "codingHarness.chat",
+          "name": "Agent",
+          "icon": "media/harness.svg"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "codingHarness.newTask",
+        "title": "Coding Harness: New Task\u2026",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "codingHarness.focusChat",
+        "title": "Coding Harness: Open Agent Panel"
+      },
+      {
+        "command": "codingHarness.runTask",
+        "title": "Coding Harness: Run Task (quick input)"
+      },
+      {
+        "command": "codingHarness.askAboutSelection",
+        "title": "Coding Harness: Ask About Selection"
+      },
+      {
+        "command": "codingHarness.revertTask",
+        "title": "Coding Harness: Revert Changes From Last Task",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "codingHarness.setApiKey",
+        "title": "Coding Harness: Set API Key (stored in Secret Storage)"
+      },
+      {
+        "command": "codingHarness.showLog",
+        "title": "Coding Harness: Show Log",
+        "icon": "$(output)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "codingHarness.revertTask",
+          "when": "view == codingHarness.chat",
+          "group": "navigation@1"
+        },
+        {
+          "command": "codingHarness.showLog",
+          "when": "view == codingHarness.chat",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "codingHarness.askAboutSelection",
+          "when": "editorHasSelection",
+          "group": "codingHarness@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "codingHarness.askAboutSelection",
+          "when": "editorHasSelection"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "codingHarness.newTask",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k"
+      }
+    ],
+    "configuration": {
+      "title": "Coding Harness",
+      "properties": {
+        "codingHarness.provider": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "anthropic",
+            "mock"
+          ],
+          "enumDescriptions": [
+            "Any OpenAI-compatible /chat/completions endpoint (OpenAI, OpenRouter, Groq, Together, vLLM, Ollama, LM Studio, llama.cpp server).",
+            "Anthropic Messages API.",
+            "Offline rule-based planner. No API key, no network. Useful to smoke-test the harness and to demo the tool loop."
+          ],
+          "default": "openai",
+          "markdownDescription": "Which model backend the harness talks to. Use `mock` for a zero-config offline demo."
+        },
+        "codingHarness.baseUrl": {
+          "type": "string",
+          "default": "https://api.openai.com/v1",
+          "markdownDescription": "Base URL of the API. Examples: `https://api.openai.com/v1`, `https://openrouter.ai/api/v1`, `http://localhost:11434/v1` (Ollama), `http://localhost:1234/v1` (LM Studio), `https://api.anthropic.com`."
+        },
+        "codingHarness.model": {
+          "type": "string",
+          "default": "gpt-4o-mini",
+          "markdownDescription": "Model id, e.g. `gpt-4o-mini`, `claude-sonnet-4-5`, `qwen2.5-coder:14b`."
+        },
+        "codingHarness.apiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "API key. Prefer the **Coding Harness: Set API Key** command, which stores it in VS Code secret storage instead of settings. The env vars `HARNESS_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` are used as a fallback."
+        },
+        "codingHarness.maxSteps": {
+          "type": "number",
+          "default": 12,
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Maximum model turns (each turn may run several tools) before the task is stopped."
+        },
+        "codingHarness.temperature": {
+          "type": "number",
+          "default": 0.2,
+          "minimum": 0,
+          "maximum": 2
+        },
+        "codingHarness.maxOutputTokens": {
+          "type": "number",
+          "default": 2048,
+          "minimum": 128
+        },
+        "codingHarness.editPolicy": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "auto"
+          ],
+          "default": "ask",
+          "markdownDescription": "`ask`: every file write / delete shows a diff and needs approval. `auto`: the agent applies edits directly (every change is still checkpointed and can be reverted)."
+        },
+        "codingHarness.commandPolicy": {
+          "type": "string",
+          "enum": [
+            "auto-safe",
+            "ask",
+            "auto-all",
+            "deny-all"
+          ],
+          "default": "auto-safe",
+          "markdownDescription": "How shell commands are gated. `auto-safe` runs known read-only commands silently and asks for everything else. `ask` asks for all commands. `auto-all` runs everything that is not on the hard deny-list. `deny-all` disables the shell tool."
+        },
+        "codingHarness.allowDangerousCommands": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Disable the hard deny-list (e.g. `rm -rf /`, `mkfs`, `dd of=/dev/*`, `curl | sh`). Leave this off unless you really know what you are doing."
+        },
+        "codingHarness.commandTimeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 1000,
+          "description": "Default timeout for shell commands run by the agent."
+        },
+        "codingHarness.allowOutsideWorkspace": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Allow the file tools to read and write outside the workspace folder. Off by default; the tools otherwise refuse any path that escapes the workspace root (including via symlinks)."
+        },
+        "codingHarness.maxFileBytes": {
+          "type": "number",
+          "default": 262144,
+          "description": "Files larger than this are not read or scanned by the tools (bytes)."
+        },
+        "codingHarness.includeDiagnosticsInPrompt": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Send a compact snapshot of current workspace problems (VS Code diagnostics) with each task, so the agent knows what is already broken."
+        },
+        "codingHarness.stream": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Render model output token by token while it is produced. Turn off for endpoints that do not support server-sent events (the harness then falls back to a single response per turn)."
+        },
+        "codingHarness.systemPromptExtra": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Extra instructions appended to the system prompt (project conventions, preferred commands, style rules, \u2026)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "test": "tsc -p ./ && node --test out/test/",
+    "demo": "tsc -p ./ && node out/demo/cli.js",
+    "package": "vsce package --allow-missing-repository --skip-license --out coding-harness.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.5",
+    "@vscode/vsce": "^3.2.1"
+  }
+}
