@@ -2,7 +2,7 @@
   "name": "coding-harness",
   "displayName": "Coding Harness",
   "description": "An in-editor coding agent. Give it a prompt and it plans, reads, searches, edits files and runs commands in your workspace using a sandboxed tool set.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "publisher": "binief",
   "license": "MIT",
   "repository": {
@@ -183,10 +183,10 @@
         },
         "codingHarness.maxSteps": {
           "type": "number",
-          "default": 12,
+          "default": 40,
           "minimum": 1,
-          "maximum": 50,
-          "description": "Maximum model turns (each turn may run several tools) before the task is stopped."
+          "maximum": 200,
+          "description": "Hard ceiling on model turns per task (each turn may run several tools). The last turn withholds tools so the model has to summarise, and the run ends there wherever the task got to — raise it for long multi-step work."
         },
         "codingHarness.temperature": {
           "type": "number",

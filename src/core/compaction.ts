@@ -34,6 +34,11 @@ export interface CompactionResult {
  * Compact conversation history by summarizing older messages.
  * Keeps the most recent `keepLast` messages intact.
  * Older messages are replaced with a summary.
+ *
+ * The cut is moved back to the start of a tool-call group so the kept tail can
+ * never begin with a tool result whose request was summarised away: OpenAI and
+ * Anthropic both reject such a transcript outright, which would end the next
+ * task with an HTTP 400 before the model ran a single tool.
  */
 export function compactHistory(
   history: ChatMessage[],
@@ -56,8 +61,26 @@ export function compactHistory(
   }
 
   const originalTokens = estimateMessagesTokens(history);
-  const toCompact = history.slice(0, history.length - keepLast);
-  const toKeep = history.slice(history.length - keepLast);
+
+  let cut = history.length - keepLast;
+  while (cut > 0 && history[cut].role === 'tool') cut--;
+
+  // Walking back past every tool result would mean summarising nothing at all.
+  if (cut <= 0) {
+    return {
+      newHistory: history,
+      result: {
+        compacted: false,
+        originalTokens,
+        newTokens: originalTokens,
+        removedMessages: 0,
+        summary: 'No compaction needed - history is one tool-call group',
+      },
+    };
+  }
+
+  const toCompact = history.slice(0, cut);
+  const toKeep = history.slice(cut);
 
   // Build a heuristic summary of the compacted part
   const summaryParts: string[] = [];
@@ -101,8 +124,11 @@ export function compactHistory(
 
   const summaryText = summaryParts.join('\n');
 
+  // The summary is the first message of the new history, so it has to be a
+  // *user* turn: Anthropic rejects a conversation that starts with an assistant
+  // message, and the model reads it as context it was handed either way.
   const summaryMessage: ChatMessage = {
-    role: 'assistant',
+    role: 'user',
     content: `[Conversation compacted: ${toCompact.length} older messages summarized to save context]\n${summaryText}`,
   };
 

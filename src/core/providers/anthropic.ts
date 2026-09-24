@@ -1,4 +1,5 @@
 import type { ChatMessage, ChatRequest, Provider, ProviderResponse, ToolCall } from '../types';
+import { httpError, parseRetryAfter } from './errors';
 
 export interface AnthropicProviderOptions {
   apiKey?: string;
@@ -84,7 +85,11 @@ export class AnthropicProvider implements Provider {
           : res.status === 404
             ? ' Check codingHarness.model and codingHarness.baseUrl.'
             : '';
-      throw new Error(`HTTP ${res.status} from ${this.endpoint()}: ${detail}${hint}`);
+      throw httpError(
+        res.status,
+        `HTTP ${res.status} from ${this.endpoint()}: ${detail}${hint}`,
+        parseRetryAfter(res.headers.get('retry-after')),
+      );
     }
 
     const contentType = res.headers.get('content-type') ?? '';

@@ -121,7 +121,7 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.baseUrl` | `https://api.openai.com/v1` | Endpoint for OpenAI-compatible APIs |
 | `codingHarness.model` | `gpt-4o-mini` | Model id |
 | `codingHarness.apiKey` | `""` | Prefer the Set API Key command; env vars also work |
-| `codingHarness.maxSteps` | `12` | Model turns per task (the last turn is forced to summarise) |
+| `codingHarness.maxSteps` | `40` | Hard ceiling on model turns per task (the last turn is forced to summarise) |
 | `codingHarness.temperature` / `maxOutputTokens` | `0.2` / `2048` | Sampling and response cap |
 | `codingHarness.editPolicy` | `ask` | `ask` \| `auto` for file writes and deletes |
 | `codingHarness.commandPolicy` | `auto-safe` | `auto-safe` \| `ask` \| `auto-all` \| `deny-all` |
@@ -161,6 +161,24 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 7. Repeat until the model stops calling tools or `maxSteps` is hit — on the last turn tools are
    withheld so the model must summarise.
 8. Events stream to the panel; `done` reports the outcome and the files changed.
+
+A run is only ended by the model finishing, by the user cancelling, by the step ceiling, or by an
+error the provider will not accept twice. Everything that used to stop a task early is handled:
+
+- **Transient provider failures are retried.** A 429, 5xx or dropped connection backs off (honouring
+  `Retry-After`) and tries again up to three times, with a notice in the panel; only definitive
+  failures (401/403/404/400) end the run.
+- **A reply cut off by `maxOutputTokens` is continued** instead of being reported as the final answer:
+  the partial text stays on screen and the model is asked to carry on from where it stopped.
+- **The transcript is always valid.** Every requested tool call gets a result — including calls
+  skipped because the task was cancelled — and `repairToolMessages()` drops any orphaned half (a
+  result with no request, a request with no result) before the list is sent. Providers reject a
+  transcript with a dangling `tool_calls` entry, so one aborted turn used to make the *next* task
+  fail with HTTP 400 before it could run a single tool.
+- **Compaction cuts on tool-call boundaries.** The kept tail never starts with a tool result whose
+  request was summarised away, the summary is a user turn (Anthropic rejects a conversation that
+  starts with the assistant), and a mid-task compaction rebuilds the prompt instead of splicing the
+  message list with the wrong length.
 
 Streaming is SSE parsing in both providers (`readOpenAiStream`, `readAnthropicStream`). Some gateways
 ignore `stream: true` and answer with plain JSON; that is detected from the response Content-Type and
@@ -217,13 +235,16 @@ Layout:
 
 ```
 src/core/            no vscode imports — unit-testable, reusable
-  agent.ts           the loop (HarnessSession)
+  agent.ts           the loop (HarnessSession), retries, transcript trimming
+  transcript.ts      tool-call/result pairing repair
+  compaction.ts      context-window summaries that keep tool groups intact
   prompt.ts          system prompt + project snapshot
   paths.ts           workspace confinement / globbing
   policy.ts          command classification (safe / ask / deny)
   checkpoints.ts     revert support + diff previews
   tools/             the 9 tools, one file per group
-  providers/         openai.ts, anthropic.ts, mock.ts
+  providers/         openai.ts, anthropic.ts, mock.ts, errors.ts (HTTP status
+                     and which failures are worth retrying)
 src/vscode/          the editor integration
   controller.ts      session + transcript items + settings/keys
   chatView.ts        webview view (HTML/CSP) and message handling

@@ -7,6 +7,7 @@ import {
   type ToolCall,
   type Usage,
 } from '../types';
+import { httpError, parseRetryAfter } from './errors';
 
 export interface OpenAiProviderOptions {
   apiKey?: string;
@@ -108,7 +109,11 @@ export class OpenAiCompatibleProvider implements Provider {
 
     if (!res.ok) {
       const raw = await res.text();
-      throw new Error(describeHttpError(res.status, raw, this.endpoint()));
+      throw httpError(
+        res.status,
+        describeHttpError(res.status, raw, this.endpoint()),
+        parseRetryAfter(res.headers.get('retry-after')),
+      );
     }
 
     const contentType = res.headers.get('content-type') ?? '';
