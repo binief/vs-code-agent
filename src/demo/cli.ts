@@ -80,7 +80,7 @@ Options:
   --provider <id>       openai | anthropic | mock   (default: mock)
   --model <id>          Model id, e.g. gpt-4o-mini, claude-sonnet-4-5
   --base-url <url>      OpenAI-compatible base URL (Ollama, OpenRouter, …)
-  --max-steps <n>       Step budget (default: 12)
+  --max-steps <n>       Step budget (default: 40)
   --auto                Approve every edit/command without asking
   --no-stream           Wait for each model turn instead of streaming it
   --verbose             Print full tool output

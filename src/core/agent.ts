@@ -1,16 +1,20 @@
 import { CheckpointStore, type RevertReport } from './checkpoints';
 import { compactHistory, estimateMessagesTokens, estimateTokens, shouldCompact } from './compaction';
+import { isRetryableProviderError, retryDelayMs } from './providers/errors';
 import { buildSystemPrompt, summarizeDiagnostics } from './prompt';
 import { createDefaultTools, ToolRegistry } from './tools';
+import { repairToolMessages } from './transcript';
 import {
   DEFAULT_CONFIG,
   type ApprovalDecision,
   type ApprovalRequest,
   type ChatMessage,
+  type ChatRequest,
   type HarnessConfig,
   type HarnessEvent,
   type HarnessHost,
   type Provider,
+  type ProviderResponse,
   type TaskOutcome,
   type TaskResult,
   type ToolCall,
@@ -32,6 +36,16 @@ export interface AgentDeps {
 const MAX_TOOL_RESULT_CHARS = 30_000;
 const MAX_HISTORY_MESSAGES = 48;
 const MAX_HISTORY_CHARS = 140_000;
+/**
+ * Attempts per model call. Transient failures (429, 5xx, a dropped connection)
+ * are retried with backoff instead of ending the task where it stands.
+ */
+const MAX_PROVIDER_ATTEMPTS = 3;
+/** Text handed back to the model when a turn was cut off by the output limit. */
+const CONTINUE_AFTER_TRUNCATION =
+  'Your previous message was cut off by the output token limit. Continue from exactly where it stopped — do not repeat what you already wrote.';
+/** Result recorded for tool calls the user cancelled before they could run. */
+const CANCELLED_TOOL_RESULT = 'Skipped: the task was cancelled before this tool ran.';
 
 /**
  * Drives one conversation: builds the prompt, calls the model, executes the
@@ -186,11 +200,28 @@ export class HarnessSession {
         onEvent({ type: 'step', index: step, maxSteps });
         onEvent({ type: 'status', status: 'thinking' });
 
-        const messages: ChatMessage[] = [
-          { role: 'system', content: system },
-          ...this.history,
-          ...taskMessages,
-        ];
+        /**
+         * The exact list handed to the provider for this step. Rebuilt after a
+         * mid-task compaction, and repaired so a malformed turn can never make
+         * the provider reject the whole request.
+         */
+        const buildMessages = (): ChatMessage[] => {
+          const list: ChatMessage[] = [
+            { role: 'system', content: system },
+            ...this.history,
+            ...taskMessages,
+          ];
+          if (isFinalStep) {
+            list.push({
+              role: 'user',
+              content:
+                'Step budget reached: reply now WITHOUT calling any tools. Summarise what you changed, how it was verified, and what is still left to do.',
+            });
+          }
+          return repairToolMessages(list);
+        };
+
+        let messages = buildMessages();
 
         // Estimate context usage for this step
         const contextTokens = estimateMessagesTokens(messages) + estimateTokens(system);
@@ -218,58 +249,85 @@ export class HarnessSession {
               message: `Auto-compacted during task: freed ${result.originalTokens - result.newTokens} tokens. Context now ${Math.round((estimateMessagesTokens([...this.history, ...taskMessages]) / contextWindow) * 100)}%.`,
               level: 'warn',
             });
-            // Rebuild messages with compacted history
-            messages.splice(1, this.history.length, ...this.history);
+            // Rebuild the prompt from the compacted history (never splice: the
+            // compacted history has a different length than the slice it replaces).
+            messages = buildMessages();
           }
-        }
-
-        if (isFinalStep) {
-          messages.push({
-            role: 'user',
-            content:
-              'Step budget reached: reply now WITHOUT calling any tools. Summarise what you changed, how it was verified, and what is still left to do.',
-          });
         }
 
         let text = '';
         let calls: ToolCall[] = [];
         let streamed = false;
+        let attemptText = '';
         let thinking = '';
         let thinkingStartedAt = 0;
-        const streamId = `assistant-${step}`;
-        const thinkingId = `thinking-${step}`;
+        const streamIdFor = (attempt: number) => (attempt === 1 ? `assistant-${step}` : `assistant-${step}-retry${attempt}`);
+        const thinkingIdFor = (attempt: number) => (attempt === 1 ? `thinking-${step}` : `thinking-${step}-retry${attempt}`);
+        let streamId = streamIdFor(1);
+        let thinkingId = thinkingIdFor(1);
         const showThinking = this.deps.config.showThinking;
         let callStartedAt = 0;
         let callDurationMs = 0;
+        let finishReason: string | undefined;
         try {
           callStartedAt = Date.now();
-          const response = await this.deps.provider.chat({
-            model: this.deps.config.model,
-            messages,
-            tools: isFinalStep ? [] : this.registry.specs(),
-            signal,
-            temperature: this.deps.config.temperature,
-            maxTokens: this.deps.config.maxOutputTokens,
-            // Streaming keeps the panel alive while the model is still writing.
-            onDelta: this.deps.config.stream
-              ? (delta: string) => {
-                  streamed = true;
-                  onEvent({ type: 'assistant-delta', id: streamId, text: delta });
-                }
-              : undefined,
-            // The reasoning lane: shown, never echoed back to the model.
-            onThinking:
-              this.deps.config.stream && showThinking
-                ? (delta: string) => {
-                    if (!thinkingStartedAt) thinkingStartedAt = Date.now();
-                    thinking += delta;
-                    onEvent({ type: 'thinking-delta', id: thinkingId, text: delta });
-                  }
-                : undefined,
-          });
+          const response = await this.callProvider(
+            (attempt) => {
+              // A retried turn is a fresh stream, so the panel never shows the
+              // failed attempt's text twice inside one bubble.
+              streamId = streamIdFor(attempt);
+              thinkingId = thinkingIdFor(attempt);
+              streamed = false;
+              attemptText = '';
+              thinking = '';
+              thinkingStartedAt = 0;
+              return {
+                model: this.deps.config.model,
+                messages,
+                tools: isFinalStep ? [] : this.registry.specs(),
+                signal,
+                temperature: this.deps.config.temperature,
+                maxTokens: this.deps.config.maxOutputTokens,
+                // Streaming keeps the panel alive while the model is still writing.
+                onDelta: this.deps.config.stream
+                  ? (delta: string) => {
+                      streamed = true;
+                      attemptText += delta;
+                      onEvent({ type: 'assistant-delta', id: streamId, text: delta });
+                    }
+                  : undefined,
+                // The reasoning lane: shown, never echoed back to the model.
+                onThinking:
+                  this.deps.config.stream && showThinking
+                    ? (delta: string) => {
+                        if (!thinkingStartedAt) thinkingStartedAt = Date.now();
+                        thinking += delta;
+                        onEvent({ type: 'thinking-delta', id: thinkingId, text: delta });
+                      }
+                    : undefined,
+              };
+            },
+            onEvent,
+            () => {
+              // The attempt is being abandoned and retried: close the bubbles it
+              // half-rendered, or the panel keeps them marked as still streaming.
+              if (thinking.trim() && this.deps.config.stream && showThinking) {
+                onEvent({
+                  type: 'thinking',
+                  id: thinkingId,
+                  text: thinking,
+                  durationMs: thinkingStartedAt ? Date.now() - thinkingStartedAt : 0,
+                });
+              }
+              if (attemptText || streamed) {
+                onEvent({ type: 'assistant', id: streamId, text: attemptText.trim(), final: false, streamed: true });
+              }
+            },
+          );
           callDurationMs = Date.now() - callStartedAt;
           text = response.text ?? '';
           calls = isFinalStep ? [] : response.toolCalls ?? [];
+          finishReason = response.finishReason;
           if (!thinking && response.thinking) thinking = response.thinking;
           if (response.usage) {
             // Compute tokens per second
@@ -355,6 +413,22 @@ export class HarnessSession {
         });
 
         if (calls.length === 0) {
+          // An answer that hit the output ceiling is not a finished answer:
+          // ending the task there is exactly the "it stopped halfway through"
+          // report. Keep the partial text and ask the model to carry on.
+          if (isTruncated(finishReason) && !isFinalStep && !signal.aborted) {
+            if (trimmed || streamed) {
+              onEvent({ type: 'assistant', id: streamId, text: trimmed, final: false, streamed });
+            }
+            onEvent({
+              type: 'notice',
+              message: `Model output hit the ${this.deps.config.maxOutputTokens}-token limit mid-answer — asking it to continue. Raise codingHarness.maxOutputTokens for longer replies.`,
+              level: 'warn',
+            });
+            taskMessages.push({ role: 'user', content: CONTINUE_AFTER_TRUNCATION });
+            continue;
+          }
+
           if (trimmed || streamed) {
             onEvent({ type: 'assistant', id: streamId, text: trimmed, final: true, streamed });
           }
@@ -376,7 +450,18 @@ export class HarnessSession {
 
         onEvent({ type: 'status', status: 'executing' });
         for (const call of calls) {
-          if (signal.aborted) break;
+          if (signal.aborted) {
+            // Still answer every requested call: a tool call with no result
+            // makes the provider reject the *next* request, which would stop
+            // the follow-up task before it could do anything.
+            taskMessages.push({
+              role: 'tool',
+              toolCallId: call.id,
+              name: call.name,
+              content: CANCELLED_TOOL_RESULT,
+            });
+            continue;
+          }
           const result = await this.executeToolCall(call, onEvent, signal);
           toolCallsRun++;
           taskMessages.push({
@@ -400,7 +485,10 @@ export class HarnessSession {
     } finally {
       this.busy = false;
       this.controller = undefined;
-      this.history = trimHistory([...this.history, ...taskMessages]);
+      // A run that was cancelled or failed part-way can leave an unanswered
+      // tool call behind; repairing here keeps the *next* task runnable
+      // instead of shipping the provider a transcript it will refuse.
+      this.history = repairToolMessages(trimHistory([...this.history, ...taskMessages]));
     }
 
     onEvent({ type: 'status', status: 'idle' });
@@ -433,6 +521,46 @@ export class HarnessSession {
   }
 
   /* ------------------------------------------------------------- internals */
+
+  /**
+   * Call the model, retrying failures that are worth retrying.
+   *
+   * A single 429, 5xx or dropped connection used to end the task where it
+   * stood, which is indistinguishable from "the agent gave up": the task was
+   * left half-finished with nothing but an error in the panel. Transient
+   * failures now back off and try again, and only a definitive refusal from the
+   * API (bad request, auth, unsupported model) ends the run.
+   */
+  private async callProvider(
+    buildRequest: (attempt: number) => ChatRequest,
+    onEvent: (event: HarnessEvent) => void,
+    /** Called when the current attempt is thrown away and another one starts. */
+    onAttemptDiscarded?: () => void,
+  ): Promise<ProviderResponse> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= MAX_PROVIDER_ATTEMPTS; attempt++) {
+      const request = buildRequest(attempt);
+      try {
+        return await this.deps.provider.chat(request);
+      } catch (err) {
+        lastError = err;
+        const aborted = request.signal?.aborted ?? false;
+        if (aborted || attempt >= MAX_PROVIDER_ATTEMPTS || !isRetryableProviderError(err)) throw err;
+        const delay = retryDelayMs(err, attempt);
+        const detail = (err as Error).message;
+        this.deps.host.log('warn', `provider call failed (attempt ${attempt}/${MAX_PROVIDER_ATTEMPTS}): ${detail}`);
+        onEvent({
+          type: 'notice',
+          level: 'warn',
+          message: `Model call failed (${detail}). Retrying in ${(delay / 1000).toFixed(1)}s (attempt ${attempt + 1}/${MAX_PROVIDER_ATTEMPTS})…`,
+        });
+        onAttemptDiscarded?.();
+        await sleep(delay, request.signal);
+        if (request.signal?.aborted) throw err;
+      }
+    }
+    throw lastError;
+  }
 
   private async collectDiagnostics(): Promise<string[] | undefined> {
     try {
@@ -564,12 +692,42 @@ function truncate(text: string, max: number): string {
   return `${text.slice(0, max)}\n… [truncated: ${text.length - max} more characters]`;
 }
 
-/** Keep the tail of the conversation, never starting on an orphaned tool result. */
+/** True when the provider stopped because the reply ran out of output budget. */
+function isTruncated(finishReason: string | undefined): boolean {
+  return finishReason === 'length' || finishReason === 'max_tokens';
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
+ * Keep the tail of the conversation, never starting on an orphaned tool result
+ * and never starting on an assistant turn: Anthropic rejects a conversation
+ * whose first message is not from the user, and a history that opens with the
+ * assistant talking to itself is not a useful prompt either way.
+ */
 function trimHistory(history: ChatMessage[]): ChatMessage[] {
   let out = history;
   if (out.length > MAX_HISTORY_MESSAGES) {
     let drop = out.length - MAX_HISTORY_MESSAGES;
-    while (drop < out.length && out[drop].role === 'tool') drop++;
+    const firstUser = out.findIndex((m, i) => i >= drop && m.role === 'user');
+    if (firstUser !== -1) {
+      drop = firstUser;
+    } else {
+      while (drop < out.length && out[drop].role !== 'user') drop++;
+    }
     out = out.slice(drop);
   }
   let chars = out.reduce((sum, m) => sum + m.content.length + 64, 0);
@@ -581,6 +739,8 @@ function trimHistory(history: ChatMessage[]): ChatMessage[] {
       chars -= extra.content.length + 64;
     }
   }
+  const firstUser = out.findIndex((m) => m.role === 'user');
+  if (firstUser > 0) out = out.slice(firstUser);
   return out;
 }
 

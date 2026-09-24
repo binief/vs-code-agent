@@ -173,6 +173,11 @@ export interface HarnessConfig {
   model: string;
   baseUrl?: string;
   apiKey?: string;
+  /**
+   * Hard ceiling on model turns for one task. It is a safety net, not a
+   * schedule: raise it for long multi-step work, because reaching it forces the
+   * final turn to summarise and ends the run wherever the task got to.
+   */
   maxSteps: number;
   temperature: number;
   maxOutputTokens: number;
@@ -200,7 +205,7 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   provider: 'openai',
   model: 'gpt-4o-mini',
   baseUrl: 'https://api.openai.com/v1',
-  maxSteps: 12,
+  maxSteps: 40,
   temperature: 0.2,
   maxOutputTokens: 2048,
   editPolicy: 'ask',

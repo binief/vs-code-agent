@@ -4,7 +4,15 @@ import { HarnessSession } from '../core/agent';
 import { apiKeyFromEnv, createProvider } from '../core/providers';
 import { createDefaultTools, ToolRegistry } from '../core/tools';
 import { McpManager } from '../core/tools/mcp';
-import { resolveConfig, type ApprovalRequest, type HarnessConfig, type HarnessEvent, type TaskOutcome, type Usage } from '../core/types';
+import {
+  DEFAULT_CONFIG,
+  resolveConfig,
+  type ApprovalRequest,
+  type HarnessConfig,
+  type HarnessEvent,
+  type TaskOutcome,
+  type Usage,
+} from '../core/types';
 import type { ApprovalService } from './host';
 import { VsCodeHost } from './host';
 import type { Logger } from './log';
@@ -112,7 +120,7 @@ export class HarnessController {
     status: 'idle',
     busy: false,
     step: 0,
-    maxSteps: 12,
+    maxSteps: DEFAULT_CONFIG.maxSteps,
     provider: 'openai',
     model: 'gpt-4o-mini',
     workspace: '',
