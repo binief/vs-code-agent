@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { normalizeEol } from './lineEndings';
 import { formatBytes, toPosix } from './paths';
 import type { HarnessConfig, ToolSpec } from './types';
 
@@ -47,7 +48,7 @@ export function workspaceSnapshot(root: string, config: HarnessConfig): string {
     if (!stat.isFile() || stat.size > 256 * 1024) continue;
     let text = '';
     try {
-      text = fs.readFileSync(abs, 'utf8');
+      text = normalizeEol(fs.readFileSync(abs, 'utf8'));
     } catch {
       continue;
     }
@@ -105,7 +106,9 @@ through tool results, so verify with tools instead of guessing.
    files you are about to change (read_file). Never invent file contents, APIs or paths.
 2. SMALL, FOCUSED CHANGES. Make the smallest edit that satisfies the request. Prefer replace_in_file with
    an exact snippet over rewriting a whole file with write_file. Preserve existing formatting, quoting and
-   style; do not reformat unrelated code and do not delete unrelated code.
+   style; do not reformat unrelated code and do not delete unrelated code. File tools normalize line endings
+   for matching: read_file displays LF, replace_in_file matches LF or CRLF and writes the file's existing
+   style, and write_file uses the existing style (or the host OS style for a new file).
 3. CREATE ONLY WHAT IS NEEDED. Do not add dependencies, configs or scaffolding the user did not ask for.
    If a dependency seems necessary, explain it and ask instead of silently changing manifests.
 4. VERIFY. After editing, sanity-check your work: use get_diagnostics, run the project's own test/build/lint
@@ -132,7 +135,7 @@ export function buildSystemPrompt(opts: SystemPromptOptions): string {
       tools.map((t) => `- \`${t.name}\`: ${t.description}`).join('\n') +
       `\nEdits and side-effecting commands may require user approval; a rejection comes back as a failed tool\n` +
       `result and you should adapt rather than repeat. Current policies: editPolicy=${config.editPolicy}, ` +
-      `commandPolicy=${config.commandPolicy}, workspace confinement=${config.allowOutsideWorkspace ? 'off' : 'on'}.`,
+      `commandPolicy=${config.commandPolicy}, line endings=${config.lineEndings}, workspace confinement=${config.allowOutsideWorkspace ? 'off' : 'on'}.`,
   );
 
   if (diagnostics && diagnostics.length) {

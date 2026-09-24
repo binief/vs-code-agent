@@ -2,7 +2,7 @@
   "name": "coding-harness",
   "displayName": "Coding Harness",
   "description": "An in-editor coding agent. Give it a prompt and it plans, reads, searches, edits files and runs commands in your workspace using a sandboxed tool set.",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "publisher": "binief",
   "license": "MIT",
   "repository": {
@@ -240,6 +240,25 @@
           "default": 262144,
           "description": "Files larger than this are not read or scanned by the tools (bytes)."
         },
+        "codingHarness.lineEndings": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "lf",
+            "crlf",
+            "cr",
+            "native"
+          ],
+          "enumDescriptions": [
+            "Preserve the existing file style; use the host OS style for new files.",
+            "Always write LF line endings.",
+            "Always write CRLF line endings.",
+            "Always write CR line endings.",
+            "Always write the host OS line ending."
+          ],
+          "default": "auto",
+          "markdownDescription": "Line-ending policy for files written by the agent. `auto` is recommended: it preserves CRLF files on Windows and LF files on Unix/macOS."
+        },
         "codingHarness.includeDiagnosticsInPrompt": {
           "type": "boolean",
           "default": true,
@@ -325,7 +344,7 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -w -p ./",
-    "test": "tsc -p ./ && node --test out/test/",
+    "test": "tsc -p ./ && node --test out/test/*.test.js",
     "demo": "tsc -p ./ && node out/demo/cli.js",
     "package": "vsce package --allow-missing-repository --skip-license --out coding-harness.vsix"
   },

@@ -74,16 +74,25 @@ and following along while it is written, then collapsed to a one-line summary on
 | Tool | What it does | Approval |
 | --- | --- | --- |
 | `list_files` | List files/dirs, glob filters, skips `node_modules`, `dist`, `.git`, … | never |
-| `read_file` | Line-numbered reads (slices, size/binary guards, directory listing) | never |
+| `read_file` | Line-numbered reads (slices, size/binary guards, directory listing); displays CRLF/CR files as LF | never |
 | `search_text` | Ripgrep-style content search with `path:line:` results | never |
-| `write_file` | Create/overwrite/append a whole file | per `editPolicy` |
-| `replace_in_file` | Exact-snippet replacement (fails loudly if the snippet is absent) | per `editPolicy` |
+| `write_file` | Create/overwrite/append a whole file; preserves existing line endings | per `editPolicy` |
+| `replace_in_file` | Exact-snippet replacement with line-ending-aware matching; preserves the file style | per `editPolicy` |
 | `delete_file` | Remove one file | always |
 | `run_command` | Shell command in the workspace, with timeout and exit-code capture | per `commandPolicy` |
 | `get_diagnostics` | Current errors/warnings from the editor's language servers | never |
 | `open_file` | Reveal a file/line in the editor | never |
 
 Every write shows a diff — inline in the chat card and, on request, in VS Code's native diff editor.
+
+### Cross-platform line endings
+
+The file tools use a canonical LF representation for model matching and display. A CRLF or CR file can
+therefore be edited with the LF snippet returned by `read_file`; `replace_in_file` accepts either LF or
+CRLF or CR in `old_text` and writes the replacement back using the file's dominant existing style. `write_file`
+also preserves the existing style when overwriting or appending. New files use the host OS style by default.
+Use `codingHarness.lineEndings` to force `lf`, `crlf`, `cr`, or `native` when a project requires a specific
+format.
 
 ## Safety model
 
@@ -120,6 +129,7 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.commandTimeoutMs` | `60000` | Shell timeout |
 | `codingHarness.allowOutsideWorkspace` | `false` | Let the file tools leave the workspace |
 | `codingHarness.maxFileBytes` | `262144` | Skip files larger than this |
+| `codingHarness.lineEndings` | `auto` | Preserve existing style; `lf` \| `crlf` \| `cr` \| `native` override it |
 | `codingHarness.includeDiagnosticsInPrompt` | `true` | Send current errors with each task |
 | `codingHarness.stream` | `true` | Render output token by token; off = one response per turn |
 | `codingHarness.showThinking` | `true` | Show the model's reasoning lane when the backend provides one |
@@ -198,7 +208,7 @@ diff before asking. Model text streams to the terminal as it arrives; `--no-stre
 ```bash
 npm install
 npm run compile        # tsc → out/
-npm test               # 74 unit tests (paths, policy, tools, agent loop, providers, manifest)
+npm test               # unit tests (paths, policy, line endings, tools, agent loop, providers, manifest)
 npm run watch          # incremental compile while you hack
 npm run package        # build a .vsix
 ```
