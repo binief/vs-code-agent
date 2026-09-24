@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { normalizeEol } from './lineEndings';
 
 export interface FileSnapshot {
   abs: string;
@@ -113,8 +114,10 @@ export function readIfExists(abs: string): string | null {
 
 /** Very small unified-diff generator, good enough for approval previews. */
 export function diffPreview(relPath: string, oldText: string | null, newText: string): string {
-  const oldLines = (oldText ?? '').split('\n');
-  const newLines = newText.split('\n');
+  // Approval previews should not show a change merely because the file uses
+  // CRLF while model output uses LF.
+  const oldLines = normalizeEol(oldText ?? '').split('\n');
+  const newLines = normalizeEol(newText).split('\n');
   const header = oldText === null ? `--- /dev/null\n+++ b/${relPath}` : `--- a/${relPath}\n+++ b/${relPath}`;
 
   // Trim common head/tail to keep the preview readable.

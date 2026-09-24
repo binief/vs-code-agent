@@ -209,6 +209,7 @@ export class HarnessController {
       commandTimeoutMs: c.get('commandTimeoutMs'),
       allowOutsideWorkspace: c.get('allowOutsideWorkspace'),
       maxFileBytes: c.get('maxFileBytes'),
+      lineEndings: c.get('lineEndings'),
       includeDiagnosticsInPrompt: c.get('includeDiagnosticsInPrompt'),
       systemPromptExtra: c.get('systemPromptExtra'),
       stream: c.get('stream'),

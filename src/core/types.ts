@@ -141,6 +141,7 @@ export interface HarnessHost {
 export type ProviderId = 'openai' | 'anthropic' | 'mock';
 export type EditPolicy = 'ask' | 'auto';
 export type CommandPolicy = 'auto-safe' | 'ask' | 'auto-all' | 'deny-all';
+export type LineEndingPreference = 'auto' | 'lf' | 'crlf' | 'cr' | 'native';
 
 export interface McpServerConfig {
   command: string;
@@ -181,6 +182,8 @@ export interface HarnessConfig {
   commandTimeoutMs: number;
   allowOutsideWorkspace: boolean;
   maxFileBytes: number;
+  /** Newline style for files written by the agent; auto preserves existing files. */
+  lineEndings: LineEndingPreference;
   includeDiagnosticsInPrompt: boolean;
   systemPromptExtra?: string;
   /** Stream model output token by token into the panel. */
@@ -206,6 +209,7 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   commandTimeoutMs: 60_000,
   allowOutsideWorkspace: false,
   maxFileBytes: 256 * 1024,
+  lineEndings: 'auto',
   includeDiagnosticsInPrompt: true,
   stream: true,
   showThinking: true,

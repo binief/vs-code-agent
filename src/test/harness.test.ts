@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { after, test } from 'node:test';
 import { HarnessSession, parseToolArguments } from '../core/agent';
 import { CheckpointStore, diffPreview } from '../core/checkpoints';
+import { applyEol, detectEol, NATIVE_EOL, normalizeEol, resolveEol } from '../core/lineEndings';
 import { globToRegExp, matchesGlob, resolveWorkspacePath, PathError } from '../core/paths';
 import { evaluateCommand } from '../core/policy';
 import { MockPlannerProvider } from '../core/providers/mock';
@@ -167,6 +168,18 @@ test('diffPreview shows removed and added lines', () => {
   assert.match(diff, / one/);
 });
 
+test('line-ending helpers normalize, detect and apply platform styles', () => {
+  assert.equal(detectEol('a\r\nb\r\n'), '\r\n');
+  assert.equal(detectEol('a\nb\n'), '\n');
+  assert.equal(detectEol('a\rb\r'), '\r');
+  assert.equal(detectEol('single line'), null);
+  assert.equal(normalizeEol('a\r\nb\rc\n'), 'a\nb\nc\n');
+  assert.equal(applyEol('a\r\nb\nc', '\r\n'), 'a\r\nb\r\nc');
+  assert.equal(resolveEol('auto', '\r\n'), '\r\n');
+  assert.equal(resolveEol('native', '\r\n'), NATIVE_EOL);
+  assert.equal(resolveEol('crlf', '\n'), '\r\n');
+});
+
 /* --------------------------------------------------------------- tools */
 
 test('write_file creates files with the right content and checkpoints them', async () => {
@@ -215,6 +228,40 @@ test('replace_in_file requires an exact match and edits in place', async () => {
   );
   assert.equal(twice.ok, true);
   assert.match(fs.readFileSync(path.join(root, 'app.js'), 'utf8'), /^let a = 1;\nlet b = 42;/);
+});
+
+test('file tools edit CRLF files with LF snippets and preserve their style', async () => {
+  const root = makeTempWorkspace({ 'windows.txt': 'alpha\r\nbeta\r\ngamma\r\n' });
+  const host = new FakeHost(root);
+  const ctx = makeContext(root, host);
+
+  const read = await readFileTool.run({ path: 'windows.txt' }, ctx);
+  assert.equal(read.ok, true);
+  assert.match(read.content, /alpha\n.*beta\n.*gamma/);
+  assert.match(read.content, /CRLF line endings shown as LF/);
+  assert.ok(!read.content.includes('\r'), 'read_file should return a canonical LF view');
+
+  const edited = await replaceInFileTool.run(
+    { path: 'windows.txt', old_text: 'alpha\nbeta', new_text: 'one\ntwo' },
+    ctx,
+  );
+  assert.equal(edited.ok, true);
+  assert.equal(fs.readFileSync(path.join(root, 'windows.txt'), 'utf8'), 'one\r\ntwo\r\ngamma\r\n');
+
+  const overwritten = await writeFileTool.run({ path: 'windows.txt', content: 'a\nb\n' }, ctx);
+  assert.equal(overwritten.ok, true);
+  assert.equal(fs.readFileSync(path.join(root, 'windows.txt'), 'utf8'), 'a\r\nb\r\n');
+
+  const fresh = await writeFileTool.run({ path: 'fresh.txt', content: 'a\r\nb' }, ctx);
+  assert.equal(fresh.ok, true);
+  assert.equal(fs.readFileSync(path.join(root, 'fresh.txt'), 'utf8'), `a${NATIVE_EOL}b`);
+
+  const forced = await writeFileTool.run(
+    { path: 'forced.txt', content: 'a\nb', mode: 'create' },
+    makeContext(root, host, { lineEndings: 'crlf' }),
+  );
+  assert.equal(forced.ok, true);
+  assert.equal(fs.readFileSync(path.join(root, 'forced.txt'), 'utf8'), 'a\r\nb');
 });
 
 test('read_file refuses oversized and binary files and numbers lines', async () => {

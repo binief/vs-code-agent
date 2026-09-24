@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { normalizeEol } from '../lineEndings';
 import { looksBinary, resolveWorkspacePath } from '../paths';
 import { fail, ok, type Tool } from '../types';
 import { walkFiles } from './walk';
@@ -80,7 +81,7 @@ export const searchTextTool: Tool<{
         continue;
       }
       filesScanned++;
-      const lines = text.split(/\r?\n/);
+      const lines = normalizeEol(text).split('\n');
       let fileMatches = 0;
       for (let i = 0; i < lines.length; i++) {
         pattern.lastIndex = 0;

@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { diffPreview, readIfExists } from '../checkpoints';
+import { applyEol, detectEol, eolName, normalizeEol, resolveEol } from '../lineEndings';
 import { ensureDir, fileSize, formatBytes, looksBinary, resolveWorkspacePath, toPosix } from '../paths';
 import { fail, ok, type Tool, type ToolContext, type ToolResult } from '../types';
 import { walk } from './walk';
@@ -99,8 +100,8 @@ export const readFileTool: Tool<{
 }> = {
   name: 'read_file',
   description:
-    'Read a text file (line-numbered) or list a directory. Always read a file before editing it. ' +
-    'Use start_line/end_line to read a slice of a large file.',
+    'Read a text file (line-numbered) or list a directory. Line endings are shown as LF so snippets match on ' +
+    'Windows and Unix. Always read a file before editing it. Use start_line/end_line to read a slice of a large file.',
   parameters: {
     type: 'object',
     properties: {
@@ -151,7 +152,8 @@ export const readFileTool: Tool<{
       return fail(`Cannot read "${target.rel}": ${(err as Error).message}`, 'read failed');
     }
 
-    const allLines = raw.split('\n');
+    const fileEol = detectEol(raw);
+    const allLines = normalizeEol(raw).split('\n');
     const total = allLines.length;
     const cap = Math.max(1, Math.min(args.max_lines ?? MAX_READ_LINES, 5000));
     const from = Math.max(1, args.start_line ?? 1);
@@ -161,6 +163,7 @@ export const readFileTool: Tool<{
     const numbered = slice.map((line, i) => `${String(from + i).padStart(5)}| ${line}`).join('\n');
     const clipped = clip(numbered, 40_000);
     const notes: string[] = [`${total} lines total`];
+    if (fileEol && fileEol !== '\n') notes.push(`${eolName(fileEol)} line endings shown as LF for editing`);
     if (to < total) notes.push(`showing ${from}-${to}; request more with start_line/end_line`);
     if (clipped.truncated) notes.push('output clipped by size');
 
@@ -182,7 +185,8 @@ export const writeFileTool: Tool<{
   name: 'write_file',
   description:
     'Create or overwrite a file with the full content you provide. Intermediate directories are created. ' +
-    'Prefer replace_in_file for small edits to existing files. Content must be the complete new file body.',
+    'Prefer replace_in_file for small edits to existing files. Content must be the complete new file body. ' +
+    'Line endings are normalized for the model and written with the existing file style (or the OS style for new files).',
   parameters: {
     type: 'object',
     properties: {
@@ -214,7 +218,15 @@ export const writeFileTool: Tool<{
       return fail(`"${target.rel}" does not exist, so there is nothing to append to.`, 'missing file');
     }
 
-    const next = mode === 'append' ? `${existing ?? ''}${args.content}` : args.content;
+    // Model text is canonicalized to LF, then written using the existing
+    // file's style. New files use the host OS style unless the setting
+    // overrides it.
+    const existingEol = existing === null ? null : detectEol(existing);
+    const logicalNext = mode === 'append'
+      ? `${normalizeEol(existing ?? '')}${normalizeEol(args.content)}`
+      : normalizeEol(args.content);
+    const writeEol = resolveEol(ctx.config.lineEndings, existingEol);
+    const next = applyEol(logicalNext, writeEol);
     const diff = diffPreview(target.rel, existing, next);
     ctx.host.log('debug', `write_file ${target.rel} (${mode}) ${diff.length} chars of diff`);
 
@@ -230,10 +242,10 @@ export const writeFileTool: Tool<{
       return fail(`Failed to write "${target.rel}": ${(err as Error).message}`, 'write failed');
     }
 
-    const lineCount = next.split('\n').length;
+    const lineCount = normalizeEol(next).split('\n').length;
     const verb = existing === null ? 'Created' : mode === 'append' ? 'Appended to' : 'Overwrote';
     return ok(
-      `${verb} "${target.rel}" (${formatBytes(Buffer.byteLength(next, 'utf8'))}, ${lineCount} lines).`,
+      `${verb} "${target.rel}" (${formatBytes(Buffer.byteLength(next, 'utf8'))}, ${lineCount} lines, ${eolName(writeEol)} line endings).`,
       `${verb.toLowerCase()} ${target.rel}`,
       { relPath: target.rel, change: existing === null ? 'created' : 'modified', lines: lineCount },
     );
@@ -250,9 +262,9 @@ export const replaceInFileTool: Tool<{
 }> = {
   name: 'replace_in_file',
   description:
-    'Replace an exact text snippet inside an existing file. The default replaces the first occurrence; the call fails ' +
-    'if old_text is not found verbatim (read the file first). Pass count to replace more occurrences, or an empty ' +
-    'new_text to delete the snippet.',
+    'Replace an exact text snippet inside an existing file. The default replaces the first occurrence; line endings ' +
+    'are matched independently of the platform and the file style is preserved. The call fails if old_text is not ' +
+    'found (read the file first). Pass count to replace more occurrences, or an empty new_text to delete the snippet.',
   parameters: {
     type: 'object',
     properties: {
@@ -271,17 +283,25 @@ export const replaceInFileTool: Tool<{
     }
     if (!args.old_text) return fail('"old_text" must not be empty; use write_file to rewrite the whole file.', 'bad arguments');
 
-    const occurrences = countOccurrences(original, args.old_text);
+    const fileEol = detectEol(original);
+    // Match line endings independently of the platform. This lets a model
+    // use the LF text returned by read_file against a CRLF file on Windows.
+    const normalizedOriginal = normalizeEol(original);
+    const needle = normalizeEol(args.old_text);
+    const replacement = normalizeEol(args.new_text ?? '');
+    const occurrences = countOccurrences(normalizedOriginal, needle);
     if (occurrences === 0) {
       return fail(
-        `old_text was not found verbatim in "${target.rel}". Read the file and copy the exact snippet (including indentation).`,
+        `old_text was not found in "${target.rel}". Line endings are matched regardless of platform; read the file and copy the exact snippet (including indentation).`,
         'snippet not found',
         { relPath: target.rel },
       );
     }
 
     const wanted = args.count === undefined ? 1 : args.count < 0 ? occurrences : args.count;
-    const next = replaceN(original, args.old_text, args.new_text ?? '', wanted);
+    const logicalNext = replaceN(normalizedOriginal, needle, replacement, wanted);
+    const writeEol = resolveEol(ctx.config.lineEndings, fileEol);
+    const next = applyEol(logicalNext, writeEol);
     const replaced = Math.min(wanted, occurrences);
 
     const diff = diffPreview(target.rel, original, next);
@@ -304,11 +324,15 @@ export const replaceInFileTool: Tool<{
 
     const remaining = occurrences - replaced;
     const note = remaining > 0 ? ` ${remaining} further occurrence(s) left untouched.` : '';
-    return ok(`Replaced ${replaced} occurrence(s) in "${target.rel}".${note}`, `edited ${target.rel}`, {
-      relPath: target.rel,
-      change: 'modified',
-      replacements: replaced,
-    });
+    return ok(
+      `Replaced ${replaced} occurrence(s) in "${target.rel}".${note} Written with ${eolName(writeEol)} line endings.`,
+      `edited ${target.rel}`,
+      {
+        relPath: target.rel,
+        change: 'modified',
+        replacements: replaced,
+      },
+    );
   },
 };
 
