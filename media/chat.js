@@ -14,7 +14,7 @@
   const btnSettings = document.getElementById('btn-settings');
   const btnSelection = document.getElementById('btn-selection');
   const btnCompact = document.getElementById('btn-compact');
-  const btnMcpReload = document.getElementById('btn-mcp-reload');
+  const btnMcp = document.getElementById('btn-mcp');
   const statusDot = document.getElementById('status-dot');
   const statusText = document.getElementById('status-text');
   const chipProvider = document.getElementById('chip-provider');
@@ -791,7 +791,7 @@
   btnSettings.addEventListener('click', () => vscode.postMessage({ type: 'open-settings' }));
   btnSelection.addEventListener('click', () => vscode.postMessage({ type: 'insert-selection' }));
   if (btnCompact) btnCompact.addEventListener('click', () => vscode.postMessage({ type: 'compact' }));
-  if (btnMcpReload) btnMcpReload.addEventListener('click', () => vscode.postMessage({ type: 'mcp-reload' }));
+  if (btnMcp) btnMcp.addEventListener('click', openMcpModal);
   if (btnCompactBanner) btnCompactBanner.addEventListener('click', () => vscode.postMessage({ type: 'compact' }));
   if (btnCompactDismiss) btnCompactDismiss.addEventListener('click', () => {
     if (compactBanner) compactBanner.hidden = true;
@@ -803,6 +803,341 @@
       input.focus();
     });
   }
+
+  /* --------------------------------------------------------- mcp settings */
+
+  const mcpModal = document.getElementById('mcp-modal');
+  const mcpEnabled = document.getElementById('mcp-enabled');
+  const mcpTimeout = document.getElementById('mcp-timeout');
+  const mcpServerList = document.getElementById('mcp-server-list');
+  const mcpAddServer = document.getElementById('mcp-add');
+  const mcpTarget = document.getElementById('mcp-target');
+  const mcpModalStatus = document.getElementById('mcp-modal-status');
+  const mcpSave = document.getElementById('mcp-save');
+  const mcpReloadBtn = document.getElementById('mcp-reload');
+  const mcpModalClose = document.getElementById('mcp-modal-close');
+
+  /** Live per-server status posted by the extension: { running, tools, error }. */
+  let mcpServerStatus = {};
+  /** True when the form was edited since it was last rendered or saved, so a
+      status refresh never clobbers half-typed input. */
+  let mcpDirty = false;
+
+  function openMcpModal() {
+    mcpModal.hidden = false;
+    mcpModalStatus.classList.remove('error');
+    mcpModalStatus.textContent = 'Loading…';
+    vscode.postMessage({ type: 'get-mcp-settings' });
+  }
+
+  function closeMcpModal() {
+    mcpModal.hidden = true;
+  }
+
+  function mcpBadgeFor(id, disabled) {
+    const info = id ? mcpServerStatus[id] : undefined;
+    if (disabled) return { text: 'disabled', cls: 'off', title: 'Server is disabled' };
+    if (info && info.error) return { text: 'failed', cls: 'error', title: info.error };
+    if (info && info.running) {
+      return { text: info.tools + ' tools', cls: 'ok', title: 'Connected — ' + info.tools + ' tool(s) available' };
+    }
+    return { text: 'not running', cls: 'off', title: 'Configured but not connected (MCP off, or a reload is pending)' };
+  }
+
+  function mcpField(label, control) {
+    const row = el('div', 'form-row');
+    row.appendChild(el('label', null, label));
+    row.appendChild(control);
+    return row;
+  }
+
+  function mcpTextInput(className, placeholder) {
+    const node = document.createElement('input');
+    node.type = 'text';
+    node.className = className;
+    node.placeholder = placeholder || '';
+    node.spellcheck = false;
+    return node;
+  }
+
+  function mcpArea(className, placeholder) {
+    const node = document.createElement('textarea');
+    node.className = className;
+    node.placeholder = placeholder || '';
+    node.rows = 2;
+    node.spellcheck = false;
+    return node;
+  }
+
+  function mapToLines(map, separator) {
+    return Object.keys(map || {})
+      .map((key) => key + separator + ' ' + map[key])
+      .join('\n');
+  }
+
+  /** Parse "KEY=value" / "Name: value" lines into an object; bad lines are reported. */
+  function linesToMap(text, separator) {
+    const map = {};
+    const bad = [];
+    for (const rawLine of String(text || '').split('\n')) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      const idx = line.indexOf(separator);
+      if (idx <= 0) {
+        bad.push(line);
+        continue;
+      }
+      const key = line.slice(0, idx).trim();
+      const value = line.slice(idx + separator.length).trim();
+      if (key) map[key] = value;
+    }
+    return { map, bad };
+  }
+
+  /** One server card. `cfg` uses the codingHarness.mcp.servers shape. */
+  function mcpServerCard(id, cfg) {
+    cfg = cfg || {};
+    const kind = cfg.type || (cfg.url ? 'http' : 'stdio');
+    const card = el('div', 'mcp-server');
+    card.dataset.originalId = id || '';
+
+    const head = el('div', 'mcp-server-head');
+    const name = mcpTextInput('mcp-name', 'server name (e.g. filesystem)');
+    name.value = id || '';
+    const badge = el('span', 'mcp-badge');
+    const state = mcpBadgeFor(id, cfg.disabled);
+    badge.textContent = state.text;
+    badge.classList.add(state.cls);
+    badge.title = state.title;
+    const remove = el('button', 'icon-btn', '✕');
+    remove.title = 'Remove this server';
+    remove.addEventListener('click', () => {
+      card.remove();
+      mcpDirty = true;
+    });
+    head.appendChild(name);
+    head.appendChild(badge);
+    head.appendChild(remove);
+    card.appendChild(head);
+
+    const type = document.createElement('select');
+    type.className = 'mcp-type';
+    const kinds = [
+      ['stdio', 'stdio — spawn a command'],
+      ['http', 'http — Streamable HTTP'],
+      ['sse', 'sse — legacy HTTP + SSE'],
+    ];
+    for (const [value, label] of kinds) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      if (value === kind) option.selected = true;
+      type.appendChild(option);
+    }
+    card.appendChild(mcpField('Transport', type));
+
+    const stdioBox = el('div', 'mcp-fields mcp-stdio');
+    const command = mcpTextInput('mcp-command', 'e.g. node or npx');
+    command.value = cfg.command || '';
+    stdioBox.appendChild(mcpField('Command', command));
+    const args = mcpArea('mcp-args', 'one argument per line, e.g.\n-y\n@modelcontextprotocol/server-filesystem\n.');
+    args.value = Array.isArray(cfg.args) ? cfg.args.join('\n') : '';
+    stdioBox.appendChild(mcpField('Arguments', args));
+    const env = mcpArea('mcp-env', 'KEY=value, one per line');
+    env.value = mapToLines(cfg.env, '=');
+    stdioBox.appendChild(mcpField('Environment', env));
+    const cwd = mcpTextInput('mcp-cwd', 'optional — relative to the workspace');
+    cwd.value = cfg.cwd || '';
+    stdioBox.appendChild(mcpField('Working dir', cwd));
+    card.appendChild(stdioBox);
+
+    const httpBox = el('div', 'mcp-fields mcp-http');
+    const url = mcpTextInput('mcp-url', 'https://mcp.example.com/mcp');
+    url.value = cfg.url || '';
+    httpBox.appendChild(mcpField('URL', url));
+    const headers = mcpArea('mcp-headers', 'Header-Name: value, one per line');
+    headers.value = mapToLines(cfg.headers, ':');
+    httpBox.appendChild(mcpField('Headers', headers));
+    card.appendChild(httpBox);
+
+    const options = el('div', 'mcp-options');
+    const enabledLabel = el('label', 'check-row');
+    const enabledFlag = document.createElement('input');
+    enabledFlag.type = 'checkbox';
+    enabledFlag.className = 'mcp-on';
+    enabledFlag.checked = !cfg.disabled;
+    enabledLabel.appendChild(enabledFlag);
+    enabledLabel.appendChild(el('span', null, 'enabled'));
+    options.appendChild(enabledLabel);
+    options.appendChild(el('label', null, 'timeout (ms)'));
+    const perTimeout = document.createElement('input');
+    perTimeout.type = 'number';
+    perTimeout.min = '1000';
+    perTimeout.className = 'mcp-to';
+    perTimeout.placeholder = 'default';
+    if (cfg.timeoutMs) perTimeout.value = String(cfg.timeoutMs);
+    options.appendChild(perTimeout);
+    card.appendChild(options);
+
+    function syncVisibility() {
+      const isStdio = type.value === 'stdio';
+      stdioBox.hidden = !isStdio;
+      httpBox.hidden = isStdio;
+    }
+    type.addEventListener('change', () => {
+      syncVisibility();
+      mcpDirty = true;
+    });
+    enabledFlag.addEventListener('change', () => {
+      const next = mcpBadgeFor(card.dataset.originalId, !enabledFlag.checked);
+      badge.textContent = next.text;
+      badge.className = 'mcp-badge ' + next.cls;
+      badge.title = next.title;
+    });
+    syncVisibility();
+    card.addEventListener('input', () => {
+      mcpDirty = true;
+    });
+    return card;
+  }
+
+  function refreshMcpBadges() {
+    for (const card of mcpServerList.querySelectorAll('.mcp-server')) {
+      const badge = card.querySelector('.mcp-badge');
+      const enabledFlag = card.querySelector('.mcp-on');
+      if (!badge) continue;
+      const id = card.dataset.originalId || '';
+      const state = mcpBadgeFor(id, enabledFlag ? !enabledFlag.checked : false);
+      badge.textContent = state.text;
+      badge.className = 'mcp-badge ' + state.cls;
+      badge.title = state.title;
+    }
+  }
+
+  function renderMcpSettings(data) {
+    mcpServerStatus = data.status || {};
+    if (mcpModalStatus.textContent === 'Loading…' || mcpModalStatus.textContent === 'Reloading…') {
+      mcpModalStatus.textContent = '';
+    }
+    // Preserve half-typed edits: only the live badges get refreshed.
+    if (mcpDirty) {
+      refreshMcpBadges();
+      return;
+    }
+    mcpEnabled.checked = Boolean(data.enabled);
+    mcpTimeout.value = data.timeoutMs ? String(data.timeoutMs) : '';
+    mcpServerList.innerHTML = '';
+    const servers = data.servers || {};
+    const ids = Object.keys(servers);
+    if (ids.length === 0) {
+      mcpServerList.appendChild(el('p', 'mcp-empty', 'No servers configured yet.'));
+    }
+    for (const id of ids) mcpServerList.appendChild(mcpServerCard(id, servers[id]));
+    const workspaceOption = mcpTarget.querySelector('option[value="workspace"]');
+    if (workspaceOption) workspaceOption.disabled = !data.supportsWorkspace;
+    if (!data.supportsWorkspace && mcpTarget.value === 'workspace') mcpTarget.value = 'user';
+  }
+
+  function collectServers() {
+    const servers = {};
+    const errors = [];
+    for (const card of mcpServerList.querySelectorAll('.mcp-server')) {
+      const id = card.querySelector('.mcp-name').value.trim();
+      if (!id) {
+        errors.push('Every server needs a name.');
+        continue;
+      }
+      if (servers[id]) {
+        errors.push('Duplicate server name "' + id + '".');
+        continue;
+      }
+      const kind = card.querySelector('.mcp-type').value;
+      const cfg = { type: kind };
+      if (kind === 'stdio') {
+        const command = card.querySelector('.mcp-command').value.trim();
+        if (!command) {
+          errors.push('"' + id + '": a command is required for stdio servers.');
+          continue;
+        }
+        cfg.command = command;
+        const args = card
+          .querySelector('.mcp-args')
+          .value.split('\n')
+          .map((line) => line.trim())
+          .filter(Boolean);
+        if (args.length) cfg.args = args;
+        const env = linesToMap(card.querySelector('.mcp-env').value, '=');
+        if (env.bad.length) {
+          errors.push('"' + id + '": environment lines must look like KEY=value — "' + env.bad[0] + '"');
+          continue;
+        }
+        if (Object.keys(env.map).length) cfg.env = env.map;
+        const cwd = card.querySelector('.mcp-cwd').value.trim();
+        if (cwd) cfg.cwd = cwd;
+      } else {
+        const url = card.querySelector('.mcp-url').value.trim();
+        if (!/^https?:\/\//i.test(url)) {
+          errors.push('"' + id + '": the URL must start with http:// or https://');
+          continue;
+        }
+        cfg.url = url;
+        const headers = linesToMap(card.querySelector('.mcp-headers').value, ':');
+        if (headers.bad.length) {
+          errors.push('"' + id + '": header lines must look like Name: value — "' + headers.bad[0] + '"');
+          continue;
+        }
+        if (Object.keys(headers.map).length) cfg.headers = headers.map;
+      }
+      if (!card.querySelector('.mcp-on').checked) cfg.disabled = true;
+      const perTimeout = Number(card.querySelector('.mcp-to').value);
+      if (Number.isFinite(perTimeout) && perTimeout > 0) cfg.timeoutMs = Math.floor(perTimeout);
+      servers[id] = cfg;
+    }
+    return { servers, errors };
+  }
+
+  mcpModalClose.addEventListener('click', closeMcpModal);
+  mcpModal.addEventListener('click', (event) => {
+    if (event.target === mcpModal) closeMcpModal();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !mcpModal.hidden) closeMcpModal();
+  });
+  mcpAddServer.addEventListener('click', () => {
+    const emptyNote = mcpServerList.querySelector('.mcp-empty');
+    if (emptyNote) emptyNote.remove();
+    const card = mcpServerCard('', {});
+    mcpServerList.appendChild(card);
+    mcpDirty = true;
+    const name = card.querySelector('.mcp-name');
+    if (name) name.focus();
+  });
+  mcpSave.addEventListener('click', () => {
+    const collected = collectServers();
+    if (collected.errors.length) {
+      mcpModalStatus.classList.add('error');
+      mcpModalStatus.textContent = collected.errors[0];
+      return;
+    }
+    const timeout = Number(mcpTimeout.value);
+    mcpModalStatus.classList.remove('error');
+    mcpModalStatus.textContent = 'Saving…';
+    // The form now matches what we asked to save; the reply may re-render it.
+    mcpDirty = false;
+    vscode.postMessage({
+      type: 'save-mcp-settings',
+      enabled: mcpEnabled.checked,
+      timeoutMs: Number.isFinite(timeout) && timeout > 0 ? Math.floor(timeout) : 10000,
+      servers: collected.servers,
+      target: mcpTarget.value,
+    });
+  });
+  mcpReloadBtn.addEventListener('click', () => {
+    mcpModalStatus.classList.remove('error');
+    mcpModalStatus.textContent = 'Reloading…';
+    vscode.postMessage({ type: 'mcp-reload' });
+  });
+  if (chipMcp) chipMcp.addEventListener('click', openMcpModal);
 
   window.addEventListener('message', (event) => {
     const message = event.data;
@@ -902,6 +1237,24 @@
           } else {
             chipMcp.hidden = true;
           }
+        }
+        break;
+      }
+      case 'mcp-settings': {
+        if (mcpModal.hidden) break;
+        renderMcpSettings(message);
+        break;
+      }
+      case 'mcp-settings-saved': {
+        if (mcpModal.hidden) break;
+        if (message.ok) {
+          mcpModalStatus.classList.remove('error');
+          mcpModalStatus.textContent = 'Saved ✓';
+        } else {
+          mcpModalStatus.classList.add('error');
+          mcpModalStatus.textContent = 'Save failed: ' + (message.error || 'unknown error');
+          // The stored settings did not change — keep the user's edits.
+          mcpDirty = true;
         }
         break;
       }
