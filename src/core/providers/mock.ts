@@ -1,4 +1,5 @@
 import * as path from 'path';
+import { describeImages } from '../images';
 import type { ChatMessage, ChatRequest, Provider, ProviderResponse, ToolCall } from '../types';
 
 /**
@@ -24,7 +25,7 @@ export class MockPlannerProvider implements Provider {
 
     // The agent passes an empty tool list on its final turn: answer in prose.
     if (!prompting) {
-      const answer = this.finalAnswer();
+      const answer = withAttachmentNote(this.finalAnswer(), req);
       await streamWords(FINAL_REASONING, req.onThinking, req.signal, 6);
       await streamWords(answer, req.onDelta, req.signal);
       return { text: answer, toolCalls: [] };
@@ -58,7 +59,7 @@ export class MockPlannerProvider implements Provider {
       };
     };
     const done = async (): Promise<ProviderResponse> => {
-      const text = this.finalAnswer();
+      const text = withAttachmentNote(this.finalAnswer(), req);
       await streamWords(RECAP_REASONING, req.onThinking, req.signal, 6);
       await streamWords(text, req.onDelta, req.signal);
       return { text, toolCalls: [] };
@@ -291,6 +292,17 @@ const LANGUAGE_BY_WORD: Record<string, { ext: string; file: string }> = {
   rust: { ext: '.rs', file: 'main.rs' },
   java: { ext: '.java', file: 'Main.java' },
 };
+
+/**
+ * The offline planner has no vision: it says so rather than ignoring an
+ * attachment, which would look like the paste was lost.
+ */
+function withAttachmentNote(answer: string, req: ChatRequest): string {
+  const lastUser = req.messages[findLastIndex(req.messages, (m) => m.role === 'user')];
+  const attached = describeImages(lastUser?.images);
+  if (!attached) return answer;
+  return `${answer}\n\n${attached} — the offline mock planner cannot read images; switch codingHarness.provider to a vision-capable model to analyse them.`;
+}
 
 export function parseIntent(prompt: string): Intent {
   const text = prompt.trim();

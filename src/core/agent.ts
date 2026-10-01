@@ -13,6 +13,7 @@ import {
   type HarnessConfig,
   type HarnessEvent,
   type HarnessHost,
+  type ImageAttachment,
   type Provider,
   type ProviderResponse,
   type TaskOutcome,
@@ -22,6 +23,12 @@ import {
   type ToolResult,
   type Usage,
 } from './types';
+
+/** Extra input for a single task, beyond the prompt text. */
+export interface TaskOptions {
+  /** Images the user attached to this turn (pasted or dropped into the panel). */
+  images?: ImageAttachment[];
+}
 
 export interface AgentDeps {
   host: HarnessHost;
@@ -136,7 +143,11 @@ export class HarnessSession {
     };
   }
 
-  async runTask(prompt: string, onEvent: (event: HarnessEvent) => void): Promise<TaskResult> {
+  async runTask(
+    prompt: string,
+    onEvent: (event: HarnessEvent) => void,
+    options: TaskOptions = {},
+  ): Promise<TaskResult> {
     if (this.busy) throw new Error('A task is already running.');
     this.busy = true;
     this.controller = new AbortController();
@@ -144,7 +155,11 @@ export class HarnessSession {
     const host = this.deps.host;
     const maxSteps = Math.max(1, this.deps.config.maxSteps);
 
-    const userMessage: ChatMessage = { role: 'user', content: prompt.trim() };
+    const images = options.images?.length ? options.images : undefined;
+    // An image-only turn still needs words: a bare image block gives the model
+    // no instruction, and some endpoints reject an empty text part outright.
+    const text = prompt.trim() || (images ? 'Look at the attached image(s) and help with what they show.' : '');
+    const userMessage: ChatMessage = { role: 'user', content: text, ...(images ? { images } : {}) };
     /** Everything produced during this task, appended to history when it ends. */
     const taskMessages: ChatMessage[] = [userMessage];
     this.checkpoints.begin(userMessage.content.slice(0, 80));

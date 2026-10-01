@@ -1,3 +1,4 @@
+import { estimateImageTokens } from './images';
 import type { ChatMessage, HarnessConfig } from './types';
 
 /**
@@ -13,6 +14,8 @@ export function estimateMessagesTokens(messages: ChatMessage[]): number {
   let total = 0;
   for (const m of messages) {
     total += estimateTokens(m.content);
+    // Attached images are invisible to a char count but far from free.
+    total += estimateImageTokens(m);
     if (m.toolCalls) {
       for (const tc of m.toolCalls) {
         total += estimateTokens(tc.name) + estimateTokens(tc.arguments);

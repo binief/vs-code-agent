@@ -260,6 +260,34 @@ body {
   white-space: pre-wrap;
 }
 
+.msg.user .msg-text {
+  white-space: pre-wrap;
+}
+
+/* Thumbnails of the images that were sent with a user message. */
+.msg-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.msg-images img {
+  max-width: 120px;
+  max-height: 90px;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-input-border, rgba(128, 128, 128, 0.35));
+  cursor: zoom-in;
+  object-fit: cover;
+}
+
+.msg-images img.zoom {
+  max-width: 100%;
+  max-height: none;
+  cursor: zoom-out;
+  object-fit: contain;
+}
+
 .msg.assistant {
   border-left: 2px solid var(--vscode-charts-blue, #4a9eff);
   padding-left: 9px;
@@ -591,6 +619,61 @@ button:disabled {
   flex: none;
   border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.25));
   padding: 6px 8px 8px;
+}
+
+/* Staged image attachments, above the input box. */
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.attachment {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 180px;
+  padding: 3px 5px;
+  border-radius: 5px;
+  font-size: 11px;
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, rgba(128, 128, 128, 0.35));
+}
+
+.attachment img {
+  width: 28px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: 3px;
+  flex: none;
+}
+
+.attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vscode-descriptionForeground);
+}
+
+.attachment-remove {
+  flex: none;
+  padding: 0 3px;
+  line-height: 1;
+  background: transparent;
+  border: none;
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+}
+
+.attachment-remove:hover {
+  color: var(--vscode-foreground);
+}
+
+/* Drop target feedback while dragging an image over the panel. */
+body.dragging .composer {
+  outline: 1px dashed var(--vscode-focusBorder);
+  outline-offset: -2px;
 }
 
 .composer-row {
