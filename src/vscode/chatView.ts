@@ -90,6 +90,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'mcp-reload':
         await this.controller.reloadMcpServers();
         break;
+      case 'get-mcp-settings':
+        this.post({ type: 'mcp-settings', ...this.controller.getMcpSettings() });
+        break;
+      case 'save-mcp-settings':
+        await this.controller.saveMcpSettings({
+          enabled: message.enabled,
+          timeoutMs: message.timeoutMs,
+          servers: message.servers,
+          target: message.target,
+        });
+        break;
       case 'approval-response': {
         const decision: ApprovalDecision = message.decision === 'apply' ? 'apply' : 'reject';
         const remember = message.remember === 'kind' || message.remember === 'all' ? message.remember : undefined;
@@ -152,7 +163,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       </div>
       <div class="headline-actions">
         <button class="icon-btn" id="btn-compact" title="Compact conversation to free context">Compact</button>
-        <button class="icon-btn" id="btn-mcp-reload" title="Reload MCP servers">MCP</button>
+        <button class="icon-btn" id="btn-mcp" title="MCP servers — configure and reload">MCP</button>
         <button class="icon-btn" id="btn-revert" title="Undo the file changes from the last task">Revert</button>
         <button class="icon-btn" id="btn-reset" title="Start a new conversation">New</button>
         <button class="icon-btn" id="btn-settings" title="Open Coding Harness settings">&#9881;</button>
@@ -219,6 +230,53 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <input type="file" id="file-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden />
       </div>
     </footer>
+
+    <div class="modal-backdrop" id="mcp-modal" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mcp-modal-title">
+        <div class="modal-head">
+          <span class="modal-title" id="mcp-modal-title">MCP servers</span>
+          <button class="icon-btn" id="mcp-modal-close" title="Close">✕</button>
+        </div>
+        <div class="modal-body">
+          <label class="check-row">
+            <input type="checkbox" id="mcp-enabled" />
+            <span>Enable MCP servers</span>
+          </label>
+          <div class="form-row">
+            <label for="mcp-timeout">Tool call timeout (ms)</label>
+            <input type="number" id="mcp-timeout" min="1000" step="500" />
+          </div>
+          <div class="server-list" id="mcp-server-list"></div>
+          <button class="linklike" id="mcp-add">+ Add server</button>
+          <div class="mcp-help">
+            <p>
+              MCP (Model Context Protocol) servers add their tools to the agent, prefixed
+              <code>mcp_&lt;server&gt;_&lt;tool&gt;</code>. A <strong>stdio</strong> server is a command the editor
+              spawns and talks to over its stdin/stdout; <strong>http</strong> and <strong>sse</strong> servers are
+              reached over the network at a <code>https://</code> endpoint — Streamable HTTP by default, with
+              automatic fallback to the older SSE transport (or force one via the type selector).
+            </p>
+            <p>
+              Stdio example: <code>npx -y @modelcontextprotocol/server-filesystem .</code><br />
+              HTTP example: <code>url: https://mcp.example.com/mcp</code> with header
+              <code>Authorization: Bearer …</code>
+            </p>
+            <p>
+              Saved to <code>codingHarness.mcp.*</code>; servers (re)connect on save or via Reload.
+            </p>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <select id="mcp-target" title="Which settings file to write">
+            <option value="user">User settings (all workspaces)</option>
+            <option value="workspace">Workspace settings (.vscode/settings.json)</option>
+          </select>
+          <span class="modal-status" id="mcp-modal-status"></span>
+          <button id="mcp-reload" title="Stop every server and connect again from the stored settings">Reload</button>
+          <button class="primary" id="mcp-save" title="Write these settings and connect">Save</button>
+        </div>
+      </div>
+    </div>
   </div>
   <script nonce="${nonce}" src="${asset('chat.js')}"></script>
 </body>

@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import { HarnessSession } from '../core/agent';
 import { apiKeyFromEnv, createProvider } from '../core/providers';
 import { createDefaultTools, ToolRegistry } from '../core/tools';
-import { McpManager } from '../core/tools/mcp';
+import { McpManager, sanitizeMcpServers } from '../core/tools/mcp';
 import { normalizeImages, toDataUrl, type RawImageInput } from '../core/images';
 import {
   DEFAULT_CONFIG,
@@ -11,6 +11,7 @@ import {
   type ApprovalRequest,
   type ImageAttachment,
   type HarnessConfig,
+  type McpServerConfig,
   type HarnessEvent,
   type TaskOutcome,
   type Usage,
@@ -99,6 +100,22 @@ export interface UiState {
   mcpEnabled?: boolean;
   mcpServers?: number;
   mcpToolCount?: number;
+}
+
+/** Live status of one configured MCP server, shown in the settings dialog. */
+export interface McpServerStatus {
+  running: boolean;
+  tools: number;
+  error?: string;
+}
+
+/** What the panel's MCP dialog renders: settings as stored plus live status. */
+export interface McpSettingsSnapshot {
+  enabled: boolean;
+  timeoutMs: number;
+  servers: Record<string, McpServerConfig>;
+  status: Record<string, McpServerStatus>;
+  supportsWorkspace: boolean;
 }
 
 const MAX_ITEMS = 400;
@@ -506,11 +523,13 @@ export class HarnessController {
     const root = this.workspaceRoot();
     if (!root) {
       void vscode.window.showErrorMessage('Open a folder first.');
+      this.postMcpSettings();
       return;
     }
     const config = this.readConfig();
     if (!config.mcp.enabled) {
       void vscode.window.showInformationMessage('MCP is disabled. Enable codingHarness.mcp.enabled in settings.');
+      this.postMcpSettings();
       return;
     }
     try {
@@ -550,6 +569,94 @@ export class HarnessController {
       void vscode.window.showErrorMessage(`MCP reload failed: ${(err as Error).message}`);
       this.log.error(`MCP reload failed: ${(err as Error).message}`);
     }
+    this.postMcpSettings();
+  }
+
+  /* MCP settings dialog ---------------------------------------------------- */
+
+  /** Editable MCP settings plus live per-server status, for the panel dialog. */
+  getMcpSettings(): McpSettingsSnapshot {
+    const config = this.readConfig();
+    const status: Record<string, McpServerStatus> = {};
+    const running = new Set(this.mcpManager?.serverIds ?? []);
+    for (const id of Object.keys(config.mcp.servers)) {
+      status[id] = {
+        running: running.has(id),
+        tools: running.has(id) ? (this.mcpManager?.toolsOf(id) ?? 0) : 0,
+        error: this.mcpManager?.failureOf(id),
+      };
+    }
+    return {
+      enabled: config.mcp.enabled,
+      timeoutMs: config.mcp.timeoutMs,
+      servers: config.mcp.servers,
+      status,
+      supportsWorkspace: Boolean(this.workspaceRoot()),
+    };
+  }
+
+  private postMcpSettings(): void {
+    this.post({ type: 'mcp-settings', ...this.getMcpSettings() });
+  }
+
+  /** Persist the dialog payload to settings, then (re)connect the servers. */
+  async saveMcpSettings(input: { enabled?: unknown; timeoutMs?: unknown; servers?: unknown; target?: unknown }): Promise<void> {
+    const servers = sanitizeMcpServers(input.servers);
+    const enabled = Boolean(input.enabled);
+    let timeoutMs =
+      typeof input.timeoutMs === 'number' && Number.isFinite(input.timeoutMs) ? Math.floor(input.timeoutMs) : DEFAULT_CONFIG.mcp.timeoutMs;
+    if (timeoutMs < 1000) timeoutMs = 1000;
+    const toWorkspace = input.target === 'workspace';
+    if (toWorkspace && !this.workspaceRoot()) {
+      this.post({ type: 'mcp-settings-saved', ok: false, error: 'Saving workspace settings needs an open folder.' });
+      return;
+    }
+    const target = toWorkspace ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+    try {
+      const c = vscode.workspace.getConfiguration('codingHarness');
+      await c.update('mcp.enabled', enabled, target);
+      await c.update('mcp.timeoutMs', timeoutMs, target);
+      await c.update('mcp.servers', servers, target);
+    } catch (err) {
+      this.log.error(`MCP settings save failed: ${(err as Error).message}`);
+      this.post({ type: 'mcp-settings-saved', ok: false, error: (err as Error).message });
+      return;
+    }
+    this.log.info(
+      `MCP settings saved to ${toWorkspace ? 'workspace' : 'user'} settings: ${Object.keys(servers).length} server(s), enabled=${enabled}`,
+    );
+
+    await this.refreshState();
+    if (enabled) {
+      await this.reloadMcpServers();
+    } else {
+      if (this.mcpManager) {
+        await this.mcpManager.stopAll();
+        this.mcpManager = undefined;
+      }
+      this.state = { ...this.state, mcpEnabled: false, mcpServers: 0, mcpToolCount: 0 };
+      this.post({ type: 'state', state: this.state });
+      this.post({ type: 'mcp-status', enabled: false, servers: 0, tools: 0 });
+      // Swap a live session back to the built-in tools so disabled servers go quiet.
+      if (this.session && this.host) {
+        const config = this.readConfig();
+        const registry = new ToolRegistry(createDefaultTools());
+        const oldHistory = this.session.transcript;
+        this.session = new HarnessSession({
+          host: this.host,
+          config,
+          provider: createProvider({ config, apiKey: await this.resolveApiKey(config) }),
+          registry,
+        });
+        (this.session as any).history = [...oldHistory];
+        (this.session as any).cumulativeUsage = { ...this.cumulativeUsage };
+        this.state = { ...this.state, toolCount: registry.size };
+        this.post({ type: 'state', state: this.state });
+      }
+    }
+    this.pushNotice('info', `MCP settings saved (${toWorkspace ? 'workspace' : 'user'}): ${Object.keys(servers).length} server(s) configured.`);
+    this.post({ type: 'mcp-settings-saved', ok: true });
+    this.postMcpSettings();
   }
 
   /** Undo every file change made during the last task. */

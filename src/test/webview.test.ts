@@ -155,3 +155,40 @@ test('the stylesheet only uses theme variables, never hard-coded colours', () =>
     assert.ok(before.includes('var(--'), `${hex} is used outside a var() fallback`);
   }
 });
+
+/* ------------------------------------------------------------- mcp dialog */
+
+test('the MCP settings dialog is wired end to end', () => {
+  // Markup: the dialog, its form fields and its buttons exist.
+  assert.match(view, /id="mcp-modal"/, 'the dialog markup must exist');
+  assert.match(view, /id="mcp-server-list"/);
+  assert.match(view, /id="mcp-enabled"/);
+  assert.match(view, /id="mcp-timeout"/);
+  assert.match(view, /id="mcp-add"/);
+  assert.match(view, /id="mcp-target"/);
+  assert.match(view, /id="mcp-save"/);
+  assert.match(view, /id="mcp-reload"/);
+  assert.match(view, /id="mcp-modal-status"/);
+  // The header MCP button opens the dialog instead of just reloading.
+  assert.match(view, /id="btn-mcp"/);
+  assert.match(js, /btnMcp\.addEventListener\('click', openMcpModal\)/);
+
+  // Script: asks for the snapshot, renders it, saves and reloads.
+  assert.match(js, /type: 'get-mcp-settings'/);
+  assert.match(js, /type: 'save-mcp-settings'/);
+  assert.match(js, /case 'mcp-settings':/);
+  assert.match(js, /case 'mcp-settings-saved':/);
+  // Validation happens client-side before saving.
+  assert.match(js, /function collectServers\(/);
+  assert.match(js, /URL must start with http:\/\/ or https:\/\//);
+
+  // The extension side answers the dialog.
+  assert.match(view, /case 'get-mcp-settings':/);
+  assert.match(view, /case 'save-mcp-settings':/);
+});
+
+test('the MCP dialog styling has no hard-coded palette of its own', () => {
+  assert.match(css, /\.modal-backdrop/);
+  assert.match(css, /\.mcp-badge\.error/);
+  assert.match(css, /\.modal-backdrop\[hidden\]\s*\{[^}]*display:\s*none/, 'a hidden dialog must not show');
+});

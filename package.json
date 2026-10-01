@@ -287,18 +287,20 @@
         "codingHarness.mcp.servers": {
           "type": "object",
           "default": {},
-          "markdownDescription": "MCP servers configuration. Each key is a server ID, value is an object with `command` (required), `args` (optional array), `env` (optional object), `cwd` (optional), `disabled` (optional boolean), `timeoutMs` (optional number). Example: `{\"my-server\": {\"command\": \"node\", \"args\": [\"./mcp-server.js\"]}}`",
+          "markdownDescription": "MCP servers configuration (also editable from the agent panel via the **MCP** button). Each key is a server ID; the value describes how to reach the server. Local stdio server: `command` + optional `args` (array), `env` (object), `cwd`. Remote HTTP server: `url` + optional `headers` (object, e.g. `{\"Authorization\": \"Bearer …\"}`) and `type` (`http` = Streamable HTTP with automatic fallback to legacy SSE, `sse` = force legacy HTTP+SSE; inferred from `url` when omitted). Common options: `disabled`, `timeoutMs`. Examples: `{\"my-server\": {\"command\": \"node\", \"args\": [\"./mcp-server.js\"]}}`, `{\"remote\": {\"url\": \"https://mcp.example.com/mcp\", \"headers\": {\"Authorization\": \"Bearer token\"}}}`",
           "additionalProperties": {
             "type": "object",
             "properties": {
-              "command": { "type": "string" },
+              "type": { "type": "string", "enum": ["stdio", "http", "sse"], "markdownDescription": "Transport override. Default: inferred — `url` means `http`, `command` means `stdio`." },
+              "command": { "type": "string", "markdownDescription": "Executable to spawn (stdio transport). Required unless `url` is set." },
               "args": { "type": "array", "items": { "type": "string" } },
               "env": { "type": "object", "additionalProperties": { "type": "string" } },
               "cwd": { "type": "string" },
+              "url": { "type": "string", "markdownDescription": "Server endpoint URL, `http://` or `https://` (http/sse transports). Required unless `command` is set." },
+              "headers": { "type": "object", "additionalProperties": { "type": "string" }, "markdownDescription": "Extra HTTP request headers (http/sse transports), e.g. `{\"Authorization\": \"Bearer …\"}`." },
               "disabled": { "type": "boolean" },
               "timeoutMs": { "type": "number" }
-            },
-            "required": ["command"]
+            }
           }
         },
         "codingHarness.mcp.timeoutMs": {

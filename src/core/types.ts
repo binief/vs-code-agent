@@ -161,11 +161,29 @@ export type EditPolicy = 'ask' | 'auto';
 export type CommandPolicy = 'auto-safe' | 'ask' | 'auto-all' | 'deny-all';
 export type LineEndingPreference = 'auto' | 'lf' | 'crlf' | 'cr' | 'native';
 
+/** Transport used to reach an MCP server. Inferred from `url`/`command` when omitted. */
+export type McpTransportType = 'stdio' | 'http' | 'sse';
+
 export interface McpServerConfig {
-  command: string;
+  /**
+   * Explicit transport override: `stdio` spawns `command`, `http` talks
+   * Streamable HTTP to `url` (with automatic fallback to the legacy SSE
+   * transport), `sse` forces the legacy HTTP+SSE transport. When omitted the
+   * transport is inferred: a `url` means HTTP, a `command` means stdio.
+   */
+  type?: McpTransportType;
+  /** stdio: executable to spawn as a child process. */
+  command?: string;
+  /** stdio: process arguments. */
   args?: string[];
+  /** stdio: extra environment variables. */
   env?: Record<string, string>;
+  /** stdio: working directory (resolved against the workspace root). */
   cwd?: string;
+  /** http / sse: server endpoint URL (http:// or https://). */
+  url?: string;
+  /** http / sse: extra request headers, e.g. `{ Authorization: 'Bearer …' }`. */
+  headers?: Record<string, string>;
   disabled?: boolean;
   /** Optional timeout override for this server */
   timeoutMs?: number;

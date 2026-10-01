@@ -14,7 +14,7 @@ import * as readline from 'readline/promises';
 import { HarnessSession } from '../core/agent';
 import { apiKeyFromEnv, createProvider } from '../core/providers';
 import { createDefaultTools, ToolRegistry } from '../core/tools';
-import { McpManager } from '../core/tools/mcp';
+import { McpManager, sanitizeMcpServers } from '../core/tools/mcp';
 import { normalizeImage } from '../core/images';
 import { DEFAULT_CONFIG, type ApprovalRequest, type ImageAttachment, type HarnessConfig, type HarnessEvent, type HarnessHost, type ProviderId } from '../core/types';
 
@@ -88,7 +88,8 @@ Options:
   --auto                Approve every edit/command without asking
   --no-stream           Wait for each model turn instead of streaming it
   --verbose             Print full tool output
-  --mcp <json>          MCP servers JSON, e.g. '{"my-server":{"command":"node","args":["./mcp.js"]}}'
+  --mcp <json>          MCP servers JSON. stdio: '{"my-server":{"command":"node","args":["./mcp.js"]}}'
+                        http:   '{"remote":{"url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer …"}}}'
   --compact-threshold <n> Context threshold 0-1 for auto-compaction (default 0.75)
   --image <path>        Attach an image to the prompt (repeatable, needs a vision model)
 `);
@@ -163,12 +164,15 @@ async function main(): Promise<void> {
 
   if (args.mcp) {
     try {
-      const servers = JSON.parse(args.mcp);
+      const servers = sanitizeMcpServers(JSON.parse(args.mcp));
       config.mcp = {
         enabled: true,
         servers,
         timeoutMs: 10000,
       };
+      if (Object.keys(servers).length === 0) {
+        console.error(c.yellow('Warning: --mcp JSON contained no usable server definitions.'));
+      }
     } catch (e) {
       console.error(c.red(`Failed to parse --mcp JSON: ${(e as Error).message}`));
       process.exit(1);

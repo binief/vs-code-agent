@@ -59,7 +59,11 @@ export class MockPlannerProvider implements Provider {
       };
     };
     const done = async (): Promise<ProviderResponse> => {
-      const text = withAttachmentNote(this.finalAnswer(), req);
+      // Listing files and summarising them is what an "analysis + summary" reply looks
+      // like — a real model deviating from a task. Only report real work as success;
+      // anything else gets an honest "nothing was changed" answer (see rule: default to action).
+      const didRealWork = this.actions.some((a) => a.tool !== 'list_files');
+      const text = withAttachmentNote(didRealWork ? this.finalAnswer() : this.nothingActionableAnswer(prompt, intent), req);
       await streamWords(RECAP_REASONING, req.onThinking, req.signal, 6);
       await streamWords(text, req.onDelta, req.signal);
       return { text, toolCalls: [] };
@@ -117,6 +121,26 @@ export class MockPlannerProvider implements Provider {
     }
 
     return done();
+  }
+
+  /**
+   * The prompt matched nothing the planner can act on — the honest answer, so the
+   * result does not masquerade as an "analysis + summary" of a task that never ran.
+   */
+  private nothingActionableAnswer(prompt: string, intent: Intent): string {
+    if (intent.kind === 'test') {
+      return (
+        'Offline planner: I found no package.json or Python files at the workspace root, ' +
+        'so there is no test suite for me to run. Nothing was changed.'
+      );
+    }
+    const ask = prompt.replace(/\s+/g, ' ').trim();
+    return (
+      `Offline planner: "${ask.length > 80 ? ask.slice(0, 77) + '…' : ask}" is too open-ended for me — ` +
+      'I only rule-match concrete tasks (create a named file, read/explain one, search for a symbol, run ' +
+      'the tests), so nothing was changed. Open-ended asks such as improvements and refactors need a real ' +
+      'model: set codingHarness.provider and run "Coding Harness: Set API Key", then the same prompt works end to end.'
+    );
   }
 
   /** Human-readable summary of what the mock planner actually did. */

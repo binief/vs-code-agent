@@ -85,6 +85,9 @@ and following along while it is written, then collapsed to a one-line summary on
 
 Every write shows a diff — inline in the chat card and, on request, in VS Code's native diff editor.
 
+Tools from configured MCP servers join this set, prefixed `mcp_<server>_<tool>` (see
+[MCP servers](#mcp-servers-model-context-protocol)).
+
 ### Cross-platform line endings
 
 The file tools use a canonical LF representation for model matching and display. A CRLF or CR file can
@@ -93,6 +96,70 @@ CRLF or CR in `old_text` and writes the replacement back using the file's domina
 also preserves the existing style when overwriting or appending. New files use the host OS style by default.
 Use `codingHarness.lineEndings` to force `lf`, `crlf`, `cr`, or `native` when a project requires a specific
 format.
+
+## MCP servers (Model Context Protocol)
+
+The agent can take on tools from external MCP servers — local ones it spawns as processes
+(**stdio**) and remote ones it reaches over the network (**http** / **sse**). Each server's tools
+join the agent's tool set prefixed `mcp_<server>_<tool>`, so prompts and the panel always show
+where a tool came from.
+
+Supported transports:
+
+- **stdio** — the server is spawned as a child process and spoken to over stdin/stdout.
+- **http** — *Streamable HTTP* (spec 2025-03-26): JSON-RPC POSTed to one endpoint; replies come
+  back as JSON or an SSE stream, and session ids plus the negotiated protocol version are echoed
+  on later requests. If the endpoint rejects POSTs with a 4xx, the client automatically falls
+  back to the legacy transport.
+- **sse** — the legacy HTTP+SSE transport (spec 2024-11-05), for older servers; selected
+  automatically on fallback or forced with `"type": "sse"`.
+
+### Configure from the panel
+
+Click **MCP** in the panel header (or the `mcp:` status chip) to open the server dialog: enable
+MCP, add/edit/disable/remove servers with their transport-specific fields (command + args + env,
+or URL + headers), pick whether to save to **User** or **Workspace** settings, and watch each
+server's live state — connected tool count, or the start error when one fails. Saving applies to
+settings and reconnects immediately; **Reload** restarts every server from the stored settings.
+
+### Configure via settings.json
+
+```jsonc
+"codingHarness.mcp.enabled": true,
+"codingHarness.mcp.timeoutMs": 10000,
+"codingHarness.mcp.servers": {
+  // Local stdio server: spawned as a child process, spoken over stdin/stdout.
+  "filesystem": {
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    // optional: "env": { "KEY": "value" }, "cwd": "relative/to/workspace",
+    //           "disabled": false, "timeoutMs": 15000
+  },
+  // Remote HTTP server (Streamable HTTP, with automatic fallback to legacy SSE).
+  "remote-tools": {
+    "url": "https://mcp.example.com/mcp",
+    "headers": { "Authorization": "Bearer <token>" }
+    // optional: "type": "http" | "sse", "disabled", "timeoutMs"
+  }
+}
+```
+
+Notes:
+
+- stdio servers need a `command`; http/sse servers need an `http(s)://` `url`. An entry with
+  neither fails with a clear error and never blocks the other servers.
+- Servers (re)connect when settings change, on save from the dialog, and via
+  *Coding Harness: Reload MCP Servers*.
+- A server that fails to start never breaks the agent run: you get a panel notice, a `failed`
+  badge in the dialog, and a log entry; the run continues with the tools that did load.
+- Headers live in plain settings files, so treat bearer tokens the way you would in any other
+  editor setting (short-lived tokens, or bridge through a local proxy for OAuth-style servers).
+- From the terminal, the CLI accepts the same shape via `--mcp`:
+
+  ```bash
+  node out/demo/cli.js "what tools can you use?" --provider mock --auto \
+    --mcp '{"remote":{"url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer …"}}}'
+  ```
 
 ## Safety model
 
@@ -110,8 +177,9 @@ Being an agent that edits code and runs shell commands, the interesting part is 
   *Coding Harness: Revert Changes From Last Task* (or the **Revert** button) undoes a whole task,
   including deleting files it created.
 - **Secrets.** API keys live in VS Code's secret storage, not in workspace settings.
-- **No hidden network.** The only outbound calls are to the model endpoint you configure; tools never
-  reach the network except through `run_command`, where you can see and gate the exact command line.
+- **No hidden network.** The only outbound calls are to the model endpoint and, when MCP is enabled,
+  the MCP servers you configure; tools never reach the network except through `run_command`, where
+  you can see and gate the exact command line.
 
 ## Settings
 
@@ -134,6 +202,9 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.stream` | `true` | Render output token by token; off = one response per turn |
 | `codingHarness.showThinking` | `true` | Show the model's reasoning lane when the backend provides one |
 | `codingHarness.systemPromptExtra` | `""` | Project conventions appended to the system prompt |
+| `codingHarness.mcp.enabled` | `false` | Load tools from configured MCP servers |
+| `codingHarness.mcp.servers` | `{}` | Server map — stdio `{ id: { command, args, env, cwd } }` or http/sse `{ id: { url, headers, type } }`; see [MCP servers](#mcp-servers-model-context-protocol) |
+| `codingHarness.mcp.timeoutMs` | `10000` | Default timeout for MCP tool calls |
 
 ## Commands
 
@@ -146,6 +217,7 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | *Coding Harness: Revert Changes From Last Task* | Restores files, deletes ones it created |
 | *Coding Harness: Set API Key* | Secret storage; empty value clears it |
 | *Coding Harness: Show Log* | Output channel with the full session log |
+| *Coding Harness: Reload MCP Servers* | Reconnect every configured MCP server; the **MCP** header button opens the settings dialog instead |
 
 ## How a task runs
 
@@ -257,7 +329,7 @@ src/core/            no vscode imports — unit-testable, reusable
   paths.ts           workspace confinement / globbing
   policy.ts          command classification (safe / ask / deny)
   checkpoints.ts     revert support + diff previews
-  tools/             the 9 tools, one file per group
+  tools/             the 9 built-in tools plus the MCP client (mcp.ts)
   providers/         openai.ts, anthropic.ts, mock.ts, errors.ts (HTTP status
                      and which failures are worth retrying)
 src/vscode/          the editor integration
@@ -297,6 +369,11 @@ in `createProvider()` (`src/core/providers/index.ts`). `mock.ts` is a compact re
 
 ## Limitations worth knowing
 
+- **Vague prompts pull vague work.** "Improve the UI" names the area but not the goal. The system prompt
+  pushes the agent to survey the code and implement concrete improvements instead of replying with
+  suggestions, but naming the page, the symptom and what "better" means gets you much better first drafts.
+  And if the answer ever reads like "the offline planner summarised…", the provider is `mock` — open-ended
+  work needs a real model backend.
 - **Single workspace folder.** The first folder of a multi-root workspace is the sandbox root.
 - **The mock provider is not a model.** It pattern-matches the prompt, writes sensible starter files
   and narrates a canned rationale; it exists to demo and test the harness, not to write production
