@@ -4,10 +4,12 @@ import { HarnessSession } from '../core/agent';
 import { apiKeyFromEnv, createProvider } from '../core/providers';
 import { createDefaultTools, ToolRegistry } from '../core/tools';
 import { McpManager } from '../core/tools/mcp';
+import { normalizeImages, toDataUrl, type RawImageInput } from '../core/images';
 import {
   DEFAULT_CONFIG,
   resolveConfig,
   type ApprovalRequest,
+  type ImageAttachment,
   type HarnessConfig,
   type HarnessEvent,
   type TaskOutcome,
@@ -19,8 +21,16 @@ import type { Logger } from './log';
 import type { ProposalStore } from './proposals';
 import { showProposalDiff } from './proposals';
 
+/** An attachment as the webview renders it: data URL plus a label. */
+export interface TranscriptImage {
+  name?: string;
+  mediaType: string;
+  dataUrl: string;
+  bytes?: number;
+}
+
 export type TranscriptItem =
-  | { id: string; kind: 'user'; text: string }
+  | { id: string; kind: 'user'; text: string; images?: TranscriptImage[] }
   | { id: string; kind: 'assistant'; text: string; final: boolean; streaming?: boolean }
   | {
       id: string;
@@ -390,9 +400,16 @@ export class HarnessController {
 
   /* --------------------------------------------------------------- tasks */
 
-  async run(prompt: string): Promise<void> {
+  async run(prompt: string, rawImages?: readonly RawImageInput[]): Promise<void> {
     const text = prompt.trim();
-    if (!text) return;
+    const { images, errors } = normalizeImages(rawImages);
+    for (const error of errors) {
+      this.pushNotice('warn', `Attachment skipped${error.name ? ` (${error.name})` : ''}: ${error.reason}`);
+      this.log.warn(`image attachment rejected: ${error.reason}`);
+    }
+    // An image on its own is a valid request ("what is wrong here?"), so only
+    // a turn with neither text nor images is ignored.
+    if (!text && images.length === 0) return;
     if (this.state.busy) {
       void vscode.window.showWarningMessage('Coding Harness is already running a task. Stop it first.');
       return;
@@ -406,16 +423,25 @@ export class HarnessController {
       return;
     }
 
-    const item = { id: this.id(), kind: 'user', text } as TranscriptItem;
+    if (images.length && this.state.provider === 'mock') {
+      this.pushNotice('warn', 'The offline mock planner cannot see images — switch codingHarness.provider to a vision-capable model.');
+    }
+
+    const item = {
+      id: this.id(),
+      kind: 'user',
+      text,
+      ...(images.length ? { images: images.map(toTranscriptImage) } : {}),
+    } as TranscriptItem;
     this.items.push(item);
     this.post({ type: 'item', item });
     const now = Date.now();
     this.activity = { ...this.activity, taskStartedAt: now, startedAt: now, step: 0, tool: null, detail: null };
     this.setStatus('thinking', true);
-    this.log.info(`task: ${text.slice(0, 200)}`);
+    this.log.info(`task: ${text.slice(0, 200)}${images.length ? ` [+${images.length} image(s)]` : ''}`);
 
     try {
-      const result = await session.runTask(text, (event) => this.handleEvent(event));
+      const result = await session.runTask(text, (event) => this.handleEvent(event), { images });
       this.cumulativeUsage = result.usage;
       this.lastTokensPerSecond = result.tokensPerSecond || 0;
       this.state = {
@@ -922,4 +948,13 @@ function describeToolCall(name: string, rawArgs: string): string | null {
   } catch {
     return null;
   }
+}
+
+function toTranscriptImage(image: ImageAttachment): TranscriptImage {
+  return {
+    ...(image.name ? { name: image.name } : {}),
+    mediaType: image.mediaType,
+    dataUrl: toDataUrl(image),
+    bytes: image.bytes,
+  };
 }

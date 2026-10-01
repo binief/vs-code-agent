@@ -15,7 +15,8 @@ import { HarnessSession } from '../core/agent';
 import { apiKeyFromEnv, createProvider } from '../core/providers';
 import { createDefaultTools, ToolRegistry } from '../core/tools';
 import { McpManager } from '../core/tools/mcp';
-import { DEFAULT_CONFIG, type ApprovalRequest, type HarnessConfig, type HarnessEvent, type HarnessHost, type ProviderId } from '../core/types';
+import { normalizeImage } from '../core/images';
+import { DEFAULT_CONFIG, type ApprovalRequest, type ImageAttachment, type HarnessConfig, type HarnessEvent, type HarnessHost, type ProviderId } from '../core/types';
 
 const COLOR = !process.env.NO_COLOR;
 const c = {
@@ -39,10 +40,12 @@ interface Args {
   noStream: boolean;
   mcp?: string;
   compactThreshold?: number;
+  /** Image files to attach to the prompt (repeatable). */
+  images: string[];
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { prompt: '', dir: process.cwd(), auto: false, verbose: false, noStream: false };
+  const args: Args = { prompt: '', dir: process.cwd(), auto: false, verbose: false, noStream: false, images: [] };
   const words: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -58,6 +61,7 @@ function parseArgs(argv: string[]): Args {
       case '--verbose': args.verbose = true; break;
       case '--mcp': args.mcp = value(); break;
       case '--compact-threshold': args.compactThreshold = Number(value()); break;
+      case '--image': args.images.push(value()); break;
       case '--help':
       case '-h':
         printHelp();
@@ -86,6 +90,7 @@ Options:
   --verbose             Print full tool output
   --mcp <json>          MCP servers JSON, e.g. '{"my-server":{"command":"node","args":["./mcp.js"]}}'
   --compact-threshold <n> Context threshold 0-1 for auto-compaction (default 0.75)
+  --image <path>        Attach an image to the prompt (repeatable, needs a vision model)
 `);
 }
 
@@ -279,9 +284,44 @@ async function main(): Promise<void> {
     }
   };
 
-  const result = await session.runTask(args.prompt, render);
+  const images = loadImages(args.images);
+  const result = await session.runTask(args.prompt, render, { images });
   if (mcpManager) await mcpManager.stopAll();
   process.exitCode = result.outcome === 'complete' ? 0 : 1;
+}
+
+/** Read `--image` files from disk into base64 attachments. */
+function loadImages(paths: string[]): ImageAttachment[] {
+  const out: ImageAttachment[] = [];
+  for (const file of paths) {
+    const mediaType = mediaTypeFor(file);
+    if (!mediaType) {
+      console.error(c.yellow(`skipping ${file}: unsupported image extension`));
+      continue;
+    }
+    let data: string;
+    try {
+      data = fs.readFileSync(file).toString('base64');
+    } catch (err) {
+      console.error(c.yellow(`skipping ${file}: ${(err as Error).message}`));
+      continue;
+    }
+    const { image, reason } = normalizeImage({ name: path.basename(file), mediaType, data });
+    if (image) out.push(image);
+    else console.error(c.yellow(`skipping ${file}: ${reason}`));
+  }
+  return out;
+}
+
+function mediaTypeFor(file: string): string | undefined {
+  switch (path.extname(file).toLowerCase()) {
+    case '.png': return 'image/png';
+    case '.jpg':
+    case '.jpeg': return 'image/jpeg';
+    case '.gif': return 'image/gif';
+    case '.webp': return 'image/webp';
+    default: return undefined;
+  }
 }
 
 void os;

@@ -36,6 +36,9 @@
   const compactText = document.getElementById('compact-text');
   const btnCompactBanner = document.getElementById('btn-compact-banner');
   const btnCompactDismiss = document.getElementById('btn-compact-dismiss');
+  const attachments = document.getElementById('attachments');
+  const btnAttach = document.getElementById('btn-attach');
+  const fileInput = document.getElementById('file-input');
 
   /** @type {Map<string, any>} */
   const items = new Map();
@@ -56,6 +59,13 @@
   let contextTokens = 0;
   let contextPercent = 0;
   const streamTrackers = new Map(); // id -> { start, chars, tokens }
+
+  /* Images staged for the next message: { id, name, mediaType, dataUrl, bytes }. */
+  const pending = [];
+  let attachmentSeq = 0;
+  const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+  const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+  const MAX_IMAGES = 8;
 
   /* ------------------------------------------------------------ helpers */
 
@@ -331,8 +341,12 @@
 
   function renderItem(item) {
     switch (item.kind) {
-      case 'user':
-        return el('div', 'msg user', item.text);
+      case 'user': {
+        const node = el('div', 'msg user');
+        if (item.text) node.appendChild(el('div', 'msg-text', item.text));
+        if (item.images && item.images.length) node.appendChild(renderUserImages(item.images));
+        return node;
+      }
       case 'assistant': {
         const node = el('div', 'msg assistant' + (item.final ? ' final' : '') + (item.streaming ? ' streaming' : ''));
         node.innerHTML = renderMarkdown(item.text) + '<span class="caret"></span>';
@@ -547,6 +561,98 @@
     return Math.round(ms / 60000) + 'm';
   }
 
+  /* -------------------------------------------------------- attachments */
+
+  function formatBytes(bytes) {
+    if (!bytes && bytes !== 0) return '';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+
+  function attachmentNotice(text) {
+    addItem({ id: 'attach-note-' + ++attachmentSeq, kind: 'notice', level: 'warn', message: text });
+  }
+
+  /** Read one File/Blob into a data URL and stage it for the next message. */
+  function stageFile(file) {
+    if (!file) return;
+    const type = (file.type || '').toLowerCase();
+    if (IMAGE_TYPES.indexOf(type) === -1) {
+      attachmentNotice('Only PNG, JPEG, GIF and WebP images can be attached' + (type ? ' (got ' + type + ')' : '') + '.');
+      return;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      attachmentNotice('Image is ' + formatBytes(file.size) + ', over the ' + formatBytes(MAX_IMAGE_BYTES) + ' limit.');
+      return;
+    }
+    if (pending.length >= MAX_IMAGES) {
+      attachmentNotice('At most ' + MAX_IMAGES + ' images can be attached to one message.');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') return;
+      pending.push({
+        id: 'img-' + ++attachmentSeq,
+        name: file.name || 'pasted image',
+        mediaType: type,
+        dataUrl: reader.result,
+        bytes: file.size,
+      });
+      renderAttachments();
+    };
+    reader.onerror = () => attachmentNotice('Could not read the pasted image.');
+    reader.readAsDataURL(file);
+  }
+
+  function removeAttachment(id) {
+    const index = pending.findIndex((p) => p.id === id);
+    if (index >= 0) pending.splice(index, 1);
+    renderAttachments();
+  }
+
+  function clearAttachments() {
+    pending.length = 0;
+    renderAttachments();
+  }
+
+  /** The strip of thumbnails above the composer. */
+  function renderAttachments() {
+    if (!attachments) return;
+    attachments.innerHTML = '';
+    attachments.hidden = pending.length === 0;
+    for (const item of pending) {
+      const chip = el('div', 'attachment');
+      const img = document.createElement('img');
+      img.src = item.dataUrl;
+      img.alt = item.name;
+      chip.appendChild(img);
+      const label = el('span', 'attachment-name', item.name);
+      label.title = item.name + ' · ' + item.mediaType + ' · ' + formatBytes(item.bytes);
+      chip.appendChild(label);
+      const remove = el('button', 'attachment-remove', '\u2715');
+      remove.title = 'Remove attachment';
+      remove.addEventListener('click', () => removeAttachment(item.id));
+      chip.appendChild(remove);
+      attachments.appendChild(chip);
+    }
+  }
+
+  /** Thumbnails shown inside a sent user message. */
+  function renderUserImages(images) {
+    const row = el('div', 'msg-images');
+    for (const image of images) {
+      const img = document.createElement('img');
+      img.src = image.dataUrl;
+      img.alt = image.name || 'attached image';
+      img.title = (image.name || 'attached image') + (image.bytes ? ' · ' + formatBytes(image.bytes) : '');
+      img.addEventListener('click', () => img.classList.toggle('zoom'));
+      row.appendChild(img);
+    }
+    return row;
+  }
+
   /* --------------------------------------------------------- item plumbing */
 
   function addItem(item, position) {
@@ -614,10 +720,65 @@
     input.style.height = Math.min(220, input.scrollHeight) + 'px';
   });
 
+  /* Pasting a screenshot: the clipboard carries it as an image/* item, which we
+     stage as an attachment instead of letting the textarea swallow the event. */
+  function imagesFromDataTransfer(data) {
+    const files = [];
+    if (!data) return files;
+    for (const item of data.items || []) {
+      if (item.kind === 'file' && (item.type || '').indexOf('image/') === 0) {
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    }
+    if (files.length === 0) {
+      for (const file of data.files || []) {
+        if ((file.type || '').indexOf('image/') === 0) files.push(file);
+      }
+    }
+    return files;
+  }
+
+  input.addEventListener('paste', (event) => {
+    const files = imagesFromDataTransfer(event.clipboardData);
+    if (files.length === 0) return;
+    event.preventDefault();
+    for (const file of files) stageFile(file);
+  });
+
+  for (const target of [input, document.body]) {
+    target.addEventListener('dragover', (event) => {
+      if (!event.dataTransfer) return;
+      const hasFiles = Array.prototype.some.call(event.dataTransfer.types || [], (t) => t === 'Files');
+      if (!hasFiles) return;
+      event.preventDefault();
+      document.body.classList.add('dragging');
+    });
+    target.addEventListener('dragleave', () => document.body.classList.remove('dragging'));
+    target.addEventListener('drop', (event) => {
+      const files = imagesFromDataTransfer(event.dataTransfer);
+      document.body.classList.remove('dragging');
+      if (files.length === 0) return;
+      event.preventDefault();
+      for (const file of files) stageFile(file);
+    });
+  }
+
+  if (btnAttach && fileInput) {
+    btnAttach.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      for (const file of fileInput.files || []) stageFile(file);
+      fileInput.value = '';
+    });
+  }
+
   function submit(text) {
     const value = (text !== undefined ? text : input.value).trim();
-    if (!value || busy) return;
-    vscode.postMessage({ type: 'submit', text: value });
+    // An image on its own is a valid prompt ("what is wrong in this screenshot?").
+    if ((!value && pending.length === 0) || busy) return;
+    const images = pending.map((p) => ({ name: p.name, mediaType: p.mediaType, dataUrl: p.dataUrl }));
+    vscode.postMessage({ type: 'submit', text: value, images });
+    clearAttachments();
     if (text === undefined) {
       input.value = '';
       input.style.height = 'auto';
@@ -756,6 +917,7 @@
       case 'reset':
         items.clear();
         elements.clear();
+        clearAttachments();
         stream.innerHTML = '';
         if (empty) stream.appendChild(empty);
         hintUsage.textContent = '';

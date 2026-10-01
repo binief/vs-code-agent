@@ -73,7 +73,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         });
         break;
       case 'submit':
-        await this.controller.run(String(message.text ?? ''));
+        await this.controller.run(String(message.text ?? ''), Array.isArray(message.images) ? message.images : undefined);
         break;
       case 'cancel':
         this.controller.cancel();
@@ -204,8 +204,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     </div>
 
     <footer class="composer">
+      <div class="attachments" id="attachments" hidden></div>
       <div class="composer-row">
-        <textarea id="input" rows="1" placeholder="Ask for a change, a fix, an explanation…" spellcheck="false"></textarea>
+        <textarea id="input" rows="1" placeholder="Ask for a change, a fix, an explanation… (paste or drop an image)" spellcheck="false"></textarea>
         <div class="composer-buttons">
           <button class="primary" id="btn-send" title="Run the task (Enter)">Run</button>
           <button class="danger" id="btn-stop" title="Stop the running task" hidden>Stop</button>
@@ -214,6 +215,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <div class="composer-hint">
         <span id="hint-usage"></span>
         <button class="linklike" id="btn-selection" title="Insert the current editor selection">insert selection</button>
+        <button class="linklike" id="btn-attach" title="Attach an image (or paste one with Ctrl/Cmd+V)">attach image</button>
+        <input type="file" id="file-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden />
       </div>
     </footer>
   </div>

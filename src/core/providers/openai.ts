@@ -1,3 +1,4 @@
+import { toDataUrl } from '../images';
 import {
   DEFAULT_CONFIG,
   type ChatMessage,
@@ -311,6 +312,19 @@ export function toOpenAiMessages(messages: ChatMessage[]): unknown[] {
     }
     if (m.role === 'tool') {
       out.push({ role: 'tool', tool_call_id: m.toolCallId, name: m.name, content: m.content || '(no output)' });
+      continue;
+    }
+    // Vision: a user turn with attachments becomes the multipart content form
+    // (`image_url` with an inline data URL), which every OpenAI-compatible
+    // vision endpoint accepts. Text-only turns keep the plain string form so
+    // older/simpler servers are unaffected.
+    if (m.role === 'user' && m.images?.length) {
+      const parts: unknown[] = [];
+      if (m.content) parts.push({ type: 'text', text: m.content });
+      for (const image of m.images) {
+        parts.push({ type: 'image_url', image_url: { url: toDataUrl(image), detail: 'auto' } });
+      }
+      out.push({ role: 'user', content: parts });
       continue;
     }
     out.push({ role: m.role, content: m.content });

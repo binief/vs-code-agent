@@ -208,6 +208,18 @@ are pinned with `flex: 0 0 auto`. Children of a column flex container shrink by 
 compress every bubble as the transcript grew instead of scrolling. Auto-follow also yields: scroll up
 to read earlier output and the view stays put, with a **Jump to latest** button to re-stick.
 
+### Images
+
+Paste a screenshot straight into the composer (`Ctrl`/`Cmd`+`V`), drop an image file onto the panel, or
+use **attach image**. Thumbnails stage above the input box and can be removed before sending; an image
+on its own is a valid prompt, so you can paste an error dialog and hit Run.
+
+Attachments are inlined as base64 in the next user turn — `image_url` parts for OpenAI-compatible
+endpoints, `image` blocks for Anthropic — so the model needs vision support (`gpt-4o`, `gpt-4.1`,
+Claude 3+, Llava-class local models, …). PNG, JPEG, GIF and WebP are accepted, up to 5 MB and 8 images
+per message; anything else is rejected in the panel with a reason. Each image is budgeted at roughly
+800 tokens in the context meter, which keeps auto-compaction honest about what a screenshot costs.
+
 ## Headless use (no editor)
 
 The whole agent lives in `src/core` with no `vscode` import, so you can drive it from a terminal:
@@ -216,10 +228,13 @@ The whole agent lives in `src/core` with no `vscode` import, so you can drive it
 npm run compile
 node out/demo/cli.js "create a python script called fib.py that prints fibonacci" --provider mock --auto --dir ./playground
 node out/demo/cli.js "fix the failing test" --provider openai --model gpt-4o-mini --dir .
+node out/demo/cli.js "why does this screenshot look wrong?" --provider openai --model gpt-4o --image ./shot.png
 ```
 
 `--auto` approves everything (good for CI smoke tests), otherwise it prompts on stdin and prints the
 diff before asking. Model text streams to the terminal as it arrives; `--no-stream` waits per turn.
+`--image <path>` attaches a PNG/JPEG/GIF/WebP to the prompt (repeat it for several), using the same
+validation as the panel.
 
 ## Development
 
@@ -293,6 +308,8 @@ in `createProvider()` (`src/core/providers/index.ts`). `mock.ts` is a compact re
 - Writes go through a `WorkspaceEdit` so `Ctrl+Z` works. If a file is open with unsaved manual edits,
   an agent write will replace them — save first if that matters.
 - Approval prompts appear in the panel when it is visible, otherwise as a modal dialog.
+- **Images need a vision model.** Attachments are sent to the configured backend as-is; a text-only
+  model (or the mock planner) will ignore them, and the panel warns when the mock is selected.
 
 ## License
 

@@ -311,6 +311,18 @@ export function toAnthropicMessages(messages: ChatMessage[]): { system: string; 
       continue;
     }
 
+    // Vision: images ride along as base64 blocks before the prompt text, the
+    // order Anthropic recommends for "look at this, then do X" prompts.
+    if (m.images?.length) {
+      const content: Array<Record<string, unknown>> = m.images.map((image) => ({
+        type: 'image',
+        source: { type: 'base64', media_type: image.mediaType, data: image.data },
+      }));
+      if (m.content) content.push({ type: 'text', text: m.content });
+      out.push({ role: 'user', content });
+      continue;
+    }
+
     out.push({ role: 'user', content: m.content });
   }
 

@@ -27,9 +27,27 @@ export interface ToolCall {
   arguments: string;
 }
 
+/**
+ * An image the user attached to a message (pasted or dropped into the panel).
+ * Stored as base64 because that is what both the OpenAI and Anthropic wire
+ * formats want, and what a webview can hand over without touching disk.
+ */
+export interface ImageAttachment {
+  /** MIME type, e.g. `image/png`. */
+  mediaType: string;
+  /** Base64 payload, without the `data:` prefix. */
+  data: string;
+  /** Optional display name (file name, or "pasted image"). */
+  name?: string;
+  /** Decoded size in bytes, when known. */
+  bytes?: number;
+}
+
 export interface ChatMessage {
   role: Role;
   content: string;
+  /** user only: images attached to the message, for vision-capable models. */
+  images?: ImageAttachment[];
   /** assistant only */
   toolCalls?: ToolCall[];
   /** tool only */
