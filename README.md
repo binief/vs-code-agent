@@ -1,29 +1,33 @@
-# Coding Harness — a coding agent for VS Code
+# Coding Harness — tools for coding, in VS Code
 
-A self-contained coding-agent extension. You give it a prompt; it plans, inspects your workspace,
-edits files and runs commands through a small, sandboxed tool set — asking for approval on anything
-that changes state.
+Coding Harness is a **tool harness**, not a packaged assistant. It gives a model a small, sandboxed
+set of coding tools — create, read, search and edit files, run shell commands, query the editor's
+diagnostics and call MCP servers — plus a factual snapshot of the environment, the workspace and the
+files you have open.
 
-It ships with three interchangeable model backends (any OpenAI-compatible endpoint, Anthropic, and an
-offline rule-based planner) so it works with a cloud API, a local model through Ollama/LM Studio, or
-with no API key at all.
+It ships **no built-in prompt**. Every instruction the model receives comes from instruction files
+in your workspace (or an optional user-level file) — `AGENTS.md`, `agent.md`, or any Markdown file
+you put in `.agents/` (for example `code-review.md`, `test.md`). Edit those files to change how the
+agent behaves; there is no hidden personality or rule set to fight.
+
+It works with any OpenAI-compatible endpoint, Anthropic, or the offline planner, so you can use a
+cloud API, a local model through Ollama/LM Studio, or no API key at all.
 
 Model output **streams token by token** into the panel, and a live activity strip always shows the
-current phase - thinking, which tool is running, what it is touching, and for how long. When the
-backend exposes a reasoning stream it renders in its own **thinking lane** above each answer: expanded
-and following along while it is written, then collapsed to a one-line summary once the answer lands.
+current phase — thinking, which tool is running, what it is touching, and for how long. When the
+backend exposes a reasoning stream it renders in its own **thinking lane** above each answer.
 
 ```
  ┌──────────────┐   prompt    ┌──────────────────────────────────────────────┐
  │  Agent panel │ ──────────► │  HarnessSession (core/agent.ts)              │
- │  (webview)   │ ◄────────── │   build prompt → model → tool calls → repeat │
+ │  (webview)   │ ◄────────── │   context + agent files → model → tools     │
  └──────┬───────┘   events    └───────────────┬──────────────────────────────┘
         │                                     │ ToolContext
         │ approval cards                      ▼
  ┌──────▼───────┐                    ┌─────────────────────────┐
- │ ApprovalSvc  │ ◄──── ctx.approval │ tools: list/read/search │
- │ (diff modal) │                    │ write/replace/delete    │
- └──────────────┘                    │ run_command/diagnostics │
+ │ ApprovalSvc  │ ◄──── ctx.approval │ create / read / search  │
+ │ (diff modal) │                    │ edit / delete / command │
+ └──────────────┘                    │ diagnostics + MCP tools │
                                      └─────────────────────────┘
 ```
 
@@ -46,15 +50,11 @@ and following along while it is written, then collapsed to a one-line summary on
    code --install-extension coding-harness.vsix
    ```
 
-   > The repository holds source only; the packaged extension is attached to each release by
-   > `.github/workflows/release.yml` (push a `v*` tag, or run the workflow manually). Building it
-   > yourself always works too — that is the same command the release workflow runs.
-
    Or press **F5** in this folder to launch an Extension Development Host (it opens
    `playground/`, a scratch project made for experimenting).
 
-2. **Point it at a model** — run the command *Coding Harness: Set API Key* (value goes to VS Code
-   secret storage, never to `settings.json`), or edit settings:
+2. **Point it at a model** — run *Coding Harness: Set API Key* (the value goes to VS Code secret
+   storage, never to `settings.json`), or edit settings:
 
    | Backend | `codingHarness.provider` | `codingHarness.baseUrl` | `codingHarness.model` |
    | --- | --- | --- | --- |
@@ -66,8 +66,155 @@ and following along while it is written, then collapsed to a one-line summary on
 
    Environment fallbacks: `HARNESS_API_KEY`, then `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`.
 
-3. **Open the panel**: click the *Coding Harness* icon in the activity bar (or `Ctrl+Alt+K`, or
+3. **Write `agent.md`** (or `AGENTS.md`) in the workspace root. This is where the instructions live:
+
+   ```markdown
+   # Project instructions
+
+   - Use TypeScript and the existing `pnpm` scripts.
+   - Run `pnpm test -- <file>` after changing a source file.
+   - Keep comments in the imperative mood; do not reformat unrelated code.
+   - Never edit `generated/` by hand — run `pnpm generate` instead.
+   ```
+
+   Click **Agents** in the panel (or run *Coding Harness: Open Agent Instructions*) to open the
+   files that are currently loaded; if none exist it offers to create one.
+
+4. **Open the panel**: click the *Coding Harness* icon in the activity bar (or `Ctrl+Alt+K`, or
    *Coding Harness: Open Agent Panel*) and describe a task.
+
+## Agent instruction files
+
+This is the only source of behavioural instructions. There is no built-in prompt to fall back on:
+if no agent file is found, the model receives context and tools but no instructions, and the panel
+shows an `agents: none` chip. The extension still works — it is simply waiting for you to say how.
+
+### Discovery rules
+
+Every task re-reads the files, so edits take effect on the next prompt without a reload. **The name
+is never fixed** — `code-review.md` and `test.md` are just as valid as `agent.md`, as long as the
+file is found one of the ways below.
+
+1. **A known name, anywhere we look** — `AGENTS.md`, `agent.md`, `agents.md` and
+   `copilot-instructions.md` by default, matched case-insensitively (`Agents.MD` works). Configure
+   with `codingHarness.agentFiles.names`.
+2. **Any name, in an instruction folder** — every `.md` file inside `.agents/`, `.agent/`,
+   `.github/instructions/` or `.vscode/instructions/` is loaded, recursively, whatever it is called:
+
+   ```
+   .agents/code-review.md
+   .agents/test.md
+   .agents/workflows/release.md
+   .github/instructions/go-style.md
+   ```
+
+   This is the recommended way to use your own names: nothing to configure, and ordinary Markdown
+   elsewhere in the repo (`README.md`, `.github/PULL_REQUEST_TEMPLATE.md`) is left alone.
+3. **A glob pattern, anywhere** — `codingHarness.agentFiles.patterns` (default
+   `["*.instructions.md"]`) matches workspace-relative paths. Add your own:
+
+   ```jsonc
+   "codingHarness.agentFiles.patterns": [
+     "*.instructions.md",
+     "docs/rules/*.md",        // one directory
+     "**/code-review.md",      // any depth
+     "*.md"                    // every Markdown file at the workspace root
+   ]
+   ```
+
+4. **An explicit path** — anything listed in `codingHarness.agentFiles.extraPaths` is loaded as-is,
+   even with a name no rule matches and even from outside the workspace.
+
+Where files are looked for:
+
+- **Root and config directories** — the workspace root, then `.github/`, `.vscode/`, `.agents/` and
+  `.agent/`.
+- **Open editors** — any instruction file in the ancestor chain of an open editor is loaded, at any
+  depth. Opening `packages/api/src/index.ts` pulls in `packages/api/agent.md`. This keeps unrelated
+  subprojects out of the prompt.
+- **Scan everything (optional)** — set `codingHarness.agentFiles.scanNested` to `true` to walk every
+  subdirectory down to `codingHarness.agentFiles.maxDepth` (default `2`). Dependency and build
+  directories (`node_modules`, `dist`, `.git`, `target`, `vendor`, …) are never scanned.
+- **Outside the workspace** — `codingHarness.agentFiles.extraPaths` accepts absolute paths
+  (`/srv/shared/agent.md`), `~/` paths and `../` paths relative to the workspace root. Those files
+  come last in the prompt and are labelled "explicit file outside the workspace".
+- **User-level file** — enable `codingHarness.agentFiles.includeUser` to load
+  `~/.coding-harness/agent.md` (path configurable) into every workspace. It is rendered first.
+
+How the files are used:
+
+- **Order** — user-level file, then the workspace from the root outwards, then external files. More
+  specific files come later, so a `src/` rule can refine a root rule.
+- **Scope** — a file at the root, or in a top-level config/instruction folder, applies to the whole
+  workspace; a file in an ordinary directory applies to that subtree. A package that keeps its own
+  `.agents/` scopes those rules to the package (`packages/api/.agents/review.md` → `packages/api`).
+  The prompt labels each file, e.g. `## .agents/code-review.md — applies to the whole workspace`.
+- **Front matter (optional)** — a leading `---` block may carry `description` and `applyTo`. It is
+  used as a label in the prompt and is *not* sent as instruction text, so a tool that reads those
+  keys (like Copilot's `applyTo`) stays compatible:
+
+  ```markdown
+  ---
+  description: Review checklist
+  applyTo: "**/*.ts"
+  ---
+  Review every TypeScript change for error handling.
+  ```
+
+  A file with no recognised keys is sent verbatim — a Markdown horizontal rule is never stripped.
+- **Budgets** — `maxBytes` (default 64 KB per file) truncates a large file; `maxTotalBytes`
+  (default 128 KB) skips files that would not fit whole. Nothing is cut off mid-instruction.
+
+Agent files are read as UTF-8 text and line endings are normalized for the prompt. A symlink inside
+the workspace that resolves to a file outside it is refused (reported in the log), because otherwise
+`agent.md` could silently pull in instructions from anywhere on disk; the refusal does not apply to
+paths you added to `extraPaths` yourself.
+
+### Naming examples
+
+| You have | How it loads |
+| --- | --- |
+| `AGENTS.md`, `agent.md`, `agents.md` | default names, root or any scanned directory |
+| `.agents/code-review.md` | instruction folder — any `.md`, no config |
+| `.agents/test.md` | instruction folder — any `.md`, no config |
+| `.github/instructions/go-style.md` | instruction folder — any `.md`, no config |
+| `docs/rules/api.md` | set `agentFiles.patterns` to `docs/rules/*.md` |
+| `code-review.instructions.md` (root) | default pattern `*.instructions.md` |
+| `handbook.md` (root) | add `*.md` to `agentFiles.patterns`, or set it as `extraPaths` |
+| `../shared/agent.md` | `agentFiles.extraPaths` |
+| `~/team/agent.md` | `agentFiles.includeUser` + `userPath`, or `extraPaths` |
+
+### Commands
+
+| Command | What it does |
+| --- | --- |
+| *Coding Harness: Open Agent Instructions* | Opens a loaded file (quick pick when several), or offers to create `agent.md` |
+| *Coding Harness: Reload Agent Instructions* | Rediscovers the files and shows how many bytes were loaded |
+| *Coding Harness: Preview System Context* | Opens the system message that will be sent with the next task (the tool catalogue follows the live session when one exists) |
+
+The **Agents** header button and the `agents:` chip do the same as the first command. Click the
+`ctx` chip to preview the context.
+
+## What the model receives
+
+For each task the extension builds a system message with five factual sections, followed by the
+instructions:
+
+| Section | Contents | Setting |
+| --- | --- | --- |
+| `# Environment` | OS, release, architecture, shell, Node.js version, editor version, local time, git branch/HEAD and uncommitted changes, workspace trust, approval policies, line-ending policy and workspace confinement | `codingHarness.context.environment` |
+| `# Workspace` | Top-level layout plus manifest facts: `package.json` name/package manager/scripts/dependencies, and the head of `pyproject.toml`, `Cargo.toml`, `go.mod`, `Makefile`, … | `codingHarness.context.workspace` |
+| `# Files` | Active file (language, line count, unsaved state, selection line range), other open editors, current diagnostics, file-size limit | `codingHarness.context.files`, `codingHarness.context.diagnostics` |
+| `# Tools` | Tool names and descriptions, edit/command policies | `codingHarness.context.tools` |
+| `# Agent instructions` | The contents of every loaded agent file, labelled with path and scope | `codingHarness.agentFiles.enabled` |
+
+Tool JSON schemas are always sent to the provider as the API's `tools` parameter; the `# Tools`
+section is a readable catalogue on top of that. Turn individual context sections off when a model
+does not need them — for example `context.workspace: false` for a tiny local model with a small
+context window.
+
+Nothing in this message is an instruction except the agent files. The extension does not inject a
+persona, workflow rules, tone guidance or a response format.
 
 ## Tools the agent can use
 
@@ -76,7 +223,8 @@ and following along while it is written, then collapsed to a one-line summary on
 | `list_files` | List files/dirs, glob filters, skips `node_modules`, `dist`, `.git`, … | never |
 | `read_file` | Line-numbered reads (slices, size/binary guards, directory listing); displays CRLF/CR files as LF | never |
 | `search_text` | Ripgrep-style content search with `path:line:` results | never |
-| `write_file` | Create/overwrite/append a whole file; preserves existing line endings | per `editPolicy` |
+| `create_file` | Create a new file; fails if the path already exists | per `editPolicy` |
+| `write_file` | Overwrite or append a whole file; preserves existing line endings | per `editPolicy` |
 | `replace_in_file` | Exact-snippet replacement with line-ending-aware matching; preserves the file style | per `editPolicy` |
 | `delete_file` | Remove one file | always |
 | `run_command` | Shell command in the workspace, with timeout and exit-code capture | per `commandPolicy` |
@@ -85,81 +233,113 @@ and following along while it is written, then collapsed to a one-line summary on
 
 Every write shows a diff — inline in the chat card and, on request, in VS Code's native diff editor.
 
-Tools from configured MCP servers join this set, prefixed `mcp_<server>_<tool>` (see
+Tools from MCP servers join this set, prefixed `mcp_<server>_<tool>` (see
 [MCP servers](#mcp-servers-model-context-protocol)).
 
 ### Cross-platform line endings
 
-The file tools use a canonical LF representation for model matching and display. A CRLF or CR file can
-therefore be edited with the LF snippet returned by `read_file`; `replace_in_file` accepts either LF or
-CRLF or CR in `old_text` and writes the replacement back using the file's dominant existing style. `write_file`
-also preserves the existing style when overwriting or appending. New files use the host OS style by default.
-Use `codingHarness.lineEndings` to force `lf`, `crlf`, `cr`, or `native` when a project requires a specific
-format.
+The file tools use a canonical LF representation for model matching and display. A CRLF or CR file
+can therefore be edited with the LF snippet returned by `read_file`; `replace_in_file` accepts either
+LF or CRLF or CR in `old_text` and writes the replacement back using the file's dominant existing
+style. `write_file` also preserves the existing style when overwriting or appending. New files use the
+host OS style by default. Use `codingHarness.lineEndings` to force `lf`, `crlf`, `cr`, or `native`
+when a project requires a specific format.
 
 ## MCP servers (Model Context Protocol)
 
-The agent can take on tools from external MCP servers — local ones it spawns as processes
-(**stdio**) and remote ones it reaches over the network (**http** / **sse**). Each server's tools
-join the agent's tool set prefixed `mcp_<server>_<tool>`, so prompts and the panel always show
-where a tool came from.
+MCP servers add tools to the same loop — local ones spawned as processes (**stdio**) and remote ones
+reached over the network (**http** / **sse**). Their tools are prefixed `mcp_<server>_<tool>` so the
+prompt and panel always show where a tool came from.
 
-Supported transports:
+### Configure from workspace files
 
-- **stdio** — the server is spawned as a child process and spoken to over stdin/stdout.
-- **http** — *Streamable HTTP* (spec 2025-03-26): JSON-RPC POSTed to one endpoint; replies come
-  back as JSON or an SSE stream, and session ids plus the negotiated protocol version are echoed
-  on later requests. If the endpoint rejects POSTs with a 4xx, the client automatically falls
-  back to the legacy transport.
-- **sse** — the legacy HTTP+SSE transport (spec 2024-11-05), for older servers; selected
-  automatically on fallback or forced with `"type": "sse"`.
+MCP servers are read from these files by default (set `codingHarness.mcp.configFiles` to change it):
 
-### Configure from the panel
+- `.vscode/mcp.json` — the VS Code shape, `{ "servers": { … }, "inputs": [ … ] }`
+- `.mcp.json` — the Claude/Cursor shape, `{ "mcpServers": { … } }`
+- `mcp.json` — either shape
 
-Click **MCP** in the panel header (or the `mcp:` status chip) to open the server dialog: enable
-MCP, add/edit/disable/remove servers with their transport-specific fields (command + args + env,
-or URL + headers), pick whether to save to **User** or **Workspace** settings, and watch each
-server's live state — connected tool count, or the start error when one fails. Saving applies to
-settings and reconnects immediately; **Reload** restarts every server from the stored settings.
+```jsonc
+// .vscode/mcp.json
+{
+  "servers": {
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "${workspaceFolder}"]
+    },
+    "remote-tools": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${env:MCP_TOKEN}" }
+    }
+  }
+}
+```
 
-### Configure via settings.json
+Placeholders: `${workspaceFolder}`, `${workspaceFolderBasename}`, `${userHome}`, `${env:VAR}` and
+`${input:id}`.
+
+`${input:…}` values are collected from the file's `inputs` array and prompted in the editor. A value
+entered once is reused for the session, so a token is never written to disk:
+
+```jsonc
+{
+  "servers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "${input:github-token}" }
+    }
+  },
+  "inputs": [{ "id": "github-token", "description": "GitHub token", "password": true }]
+}
+```
+
+Later files override earlier ones, and `codingHarness.mcp.servers` overrides every file with the same
+server id. That makes the shared project file the default and your user settings the local override.
+The MCP dialog shows file-defined servers as read-only and lets you edit the settings ones.
+
+### Configure via settings.json or the panel
 
 ```jsonc
 "codingHarness.mcp.enabled": true,
 "codingHarness.mcp.timeoutMs": 10000,
 "codingHarness.mcp.servers": {
-  // Local stdio server: spawned as a child process, spoken over stdin/stdout.
   "filesystem": {
     "command": "npx",
     "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
-    // optional: "env": { "KEY": "value" }, "cwd": "relative/to/workspace",
-    //           "disabled": false, "timeoutMs": 15000
   },
-  // Remote HTTP server (Streamable HTTP, with automatic fallback to legacy SSE).
   "remote-tools": {
     "url": "https://mcp.example.com/mcp",
     "headers": { "Authorization": "Bearer <token>" }
-    // optional: "type": "http" | "sse", "disabled", "timeoutMs"
   }
 }
 ```
 
+Click **MCP** in the panel header (or the `mcp:` chip) to open the dialog: enable MCP, add/edit/
+disable/remove settings-based servers, pick **User** or **Workspace** settings, and watch each
+server's live state. Saving reconnects immediately; **Reload** re-reads both settings and config
+files and restarts every server.
+
+### Transports
+
+- **stdio** — the server is spawned as a child process and spoken to over stdin/stdout.
+- **http** — *Streamable HTTP* (spec 2025-03-26): JSON-RPC POSTed to one endpoint; replies come back
+  as JSON or an SSE stream, and session ids plus the negotiated protocol version are echoed on later
+  requests. If the endpoint rejects POSTs with a 4xx, the client falls back to the legacy transport.
+- **sse** — the legacy HTTP+SSE transport (spec 2024-11-05), forced with `"type": "sse"` or used on
+  fallback.
+
 Notes:
 
-- stdio servers need a `command`; http/sse servers need an `http(s)://` `url`. An entry with
-  neither fails with a clear error and never blocks the other servers.
-- Servers (re)connect when settings change, on save from the dialog, and via
-  *Coding Harness: Reload MCP Servers*.
-- A server that fails to start never breaks the agent run: you get a panel notice, a `failed`
-  badge in the dialog, and a log entry; the run continues with the tools that did load.
-- Headers live in plain settings files, so treat bearer tokens the way you would in any other
-  editor setting (short-lived tokens, or bridge through a local proxy for OAuth-style servers).
-- From the terminal, the CLI accepts the same shape via `--mcp`:
-
-  ```bash
-  node out/demo/cli.js "what tools can you use?" --provider mock --auto \
-    --mcp '{"remote":{"url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer …"}}}'
-  ```
+- stdio servers need a `command`; http/sse servers need an `http(s)://` `url`. An entry with neither
+  fails with a clear error and never blocks the other servers.
+- A server that fails to start never breaks the agent run: you get a panel notice, a `failed` badge
+  in the dialog, and a log entry; the run continues with the tools that did load.
+- Headers and env values live in plain files, so treat bearer tokens the way you would in any other
+  project config (use `${input:…}` or `${env:…}` to keep them out of Git).
+- The CLI reads the same config files; `--mcp '<json>'` merges an extra server map on top.
 
 ## Safety model
 
@@ -176,7 +356,8 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 - **Checkpoints.** The original content of every touched file is captured before the first write, so
   *Coding Harness: Revert Changes From Last Task* (or the **Revert** button) undoes a whole task,
   including deleting files it created.
-- **Secrets.** API keys live in VS Code's secret storage, not in workspace settings.
+- **Secrets.** API keys live in VS Code's secret storage, not in workspace settings. MCP inputs are
+  prompted and kept in memory.
 - **No hidden network.** The only outbound calls are to the model endpoint and, when MCP is enabled,
   the MCP servers you configure; tools never reach the network except through `run_command`, where
   you can see and gate the exact command line.
@@ -198,13 +379,33 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.allowOutsideWorkspace` | `false` | Let the file tools leave the workspace |
 | `codingHarness.maxFileBytes` | `262144` | Skip files larger than this |
 | `codingHarness.lineEndings` | `auto` | Preserve existing style; `lf` \| `crlf` \| `cr` \| `native` override it |
-| `codingHarness.includeDiagnosticsInPrompt` | `true` | Send current errors with each task |
 | `codingHarness.stream` | `true` | Render output token by token; off = one response per turn |
 | `codingHarness.showThinking` | `true` | Show the model's reasoning lane when the backend provides one |
-| `codingHarness.systemPromptExtra` | `""` | Project conventions appended to the system prompt |
-| `codingHarness.mcp.enabled` | `false` | Load tools from configured MCP servers |
-| `codingHarness.mcp.servers` | `{}` | Server map — stdio `{ id: { command, args, env, cwd } }` or http/sse `{ id: { url, headers, type } }`; see [MCP servers](#mcp-servers-model-context-protocol) |
+| `codingHarness.agentFiles.enabled` | `true` | Load instructions from agent files (no built-in prompt) |
+| `codingHarness.agentFiles.names` | `["AGENTS.md","agent.md","agents.md","copilot-instructions.md"]` | Exact names searched (case-insensitive) |
+| `codingHarness.agentFiles.patterns` | `["*.instructions.md"]` | Workspace-relative globs, so files can have any name |
+| `codingHarness.agentFiles.includeUser` | `false` | Load a user-level agent file in every workspace |
+| `codingHarness.agentFiles.userPath` | `~/.coding-harness/agent.md` | Path of that file |
+| `codingHarness.agentFiles.scanNested` | `false` | Walk every subdirectory, not just open-editor ancestors |
+| `codingHarness.agentFiles.maxDepth` | `2` | Directory levels scanned below the root when `scanNested` is on, and how deep a pattern directory is walked |
+| `codingHarness.agentFiles.maxBytes` | `65536` | Per-file cap |
+| `codingHarness.agentFiles.maxTotalBytes` | `131072` | Total instruction budget per prompt |
+| `codingHarness.agentFiles.extraPaths` | `[]` | Extra files or directories to load |
+| `codingHarness.context.environment` | `true` | Include OS/shell/runtime/editor/git/policy facts |
+| `codingHarness.context.workspace` | `true` | Include layout and manifest facts |
+| `codingHarness.context.files` | `true` | Include open editors, active file and selection |
+| `codingHarness.context.diagnostics` | `true` | Include current editor problems |
+| `codingHarness.context.tools` | `true` | Include the tool catalogue |
+| `codingHarness.mcp.enabled` | `true` | Load tools from MCP servers |
+| `codingHarness.mcp.servers` | `{}` | Settings-based server map; see [MCP servers](#mcp-servers-model-context-protocol) |
 | `codingHarness.mcp.timeoutMs` | `10000` | Default timeout for MCP tool calls |
+| `codingHarness.mcp.loadFromFiles` | `true` | Read servers from workspace config files |
+| `codingHarness.mcp.configFiles` | `[".vscode/mcp.json",".mcp.json","mcp.json"]` | Files scanned for servers |
+| `codingHarness.compaction.enabled` | `true` | Enable conversation compaction |
+| `codingHarness.compaction.autoCompact` | `true` | Compact automatically near the context limit |
+| `codingHarness.compaction.threshold` | `0.75` | Utilisation that triggers auto-compaction |
+| `codingHarness.compaction.contextWindowTokens` | `128000` | Context window estimate for the meter |
+| `codingHarness.compaction.keepLastMessages` | `10` | Recent messages kept intact |
 
 ## Commands
 
@@ -217,21 +418,24 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | *Coding Harness: Revert Changes From Last Task* | Restores files, deletes ones it created |
 | *Coding Harness: Set API Key* | Secret storage; empty value clears it |
 | *Coding Harness: Show Log* | Output channel with the full session log |
-| *Coding Harness: Reload MCP Servers* | Reconnect every configured MCP server; the **MCP** header button opens the settings dialog instead |
+| *Coding Harness: Open Agent Instructions* | Opens the loaded agent files or creates `agent.md` |
+| *Coding Harness: Reload Agent Instructions* | Rediscovers instruction files now |
+| *Coding Harness: Preview System Context* | Inspect the next system message (context + agent files) |
+| *Coding Harness: Reload MCP Servers* | Re-reads config files + settings and reconnects |
 
 ## How a task runs
 
 1. `HarnessController.run(prompt)` creates/reuses a `HarnessSession` (history persists across prompts).
 2. `CheckpointStore.begin()` marks the start; every file written thereafter is captured first.
-3. `buildSystemPrompt()` assembles the rules, a project snapshot (manifests, scripts, deps, git
-   branch), the tool catalogue and current diagnostics.
+3. `buildSystemPrompt()` assembles the five context sections and appends the agent files. It
+   contains no behavioural fallback.
 4. The provider is called with the transcript + tool JSON schemas.
 5. Text arrives through `onDelta` and is rendered as it is produced (repaints are throttled to about
    16/second); the activity strip switches to the running tool with a live elapsed timer.
 6. Each requested tool call is parsed (tolerant JSON), executed with a `ToolContext`, and its result
    is appended to the transcript. Mutating tools call `ctx.approval()` first.
 7. Repeat until the model stops calling tools or `maxSteps` is hit — on the last turn tools are
-   withheld so the model must summarise.
+   withheld and the model is told that the step budget is exhausted.
 8. Events stream to the panel; `done` reports the outcome and the files changed.
 
 A run is only ended by the model finishing, by the user cancelling, by the step ceiling, or by an
@@ -241,12 +445,11 @@ error the provider will not accept twice. Everything that used to stop a task ea
   `Retry-After`) and tries again up to three times, with a notice in the panel; only definitive
   failures (401/403/404/400) end the run.
 - **A reply cut off by `maxOutputTokens` is continued** instead of being reported as the final answer:
-  the partial text stays on screen and the model is asked to carry on from where it stopped.
+  the partial text stays on screen and the model is told the message was truncated.
 - **The transcript is always valid.** Every requested tool call gets a result — including calls
-  skipped because the task was cancelled — and `repairToolMessages()` drops any orphaned half (a
-  result with no request, a request with no result) before the list is sent. Providers reject a
-  transcript with a dangling `tool_calls` entry, so one aborted turn used to make the *next* task
-  fail with HTTP 400 before it could run a single tool.
+  skipped because the task was cancelled — and `repairToolMessages()` drops any orphaned half before
+  the list is sent. Providers reject a transcript with a dangling `tool_calls` entry, so one aborted
+  turn used to make the *next* task fail with HTTP 400 before it could run a single tool.
 - **Compaction cuts on tool-call boundaries.** The kept tail never starts with a tool result whose
   request was summarised away, the summary is a user turn (Anthropic rejects a conversation that
   starts with the assistant), and a mid-task compaction rebuilds the prompt instead of splicing the
@@ -303,6 +506,10 @@ node out/demo/cli.js "fix the failing test" --provider openai --model gpt-4o-min
 node out/demo/cli.js "why does this screenshot look wrong?" --provider openai --model gpt-4o --image ./shot.png
 ```
 
+The CLI reads `AGENTS.md`/`agent.md` from the target directory and MCP servers from the same config
+files as the extension (`.vscode/mcp.json`, `.mcp.json`, `mcp.json`). `--mcp '<json>'` merges a server
+map from the command line.
+
 `--auto` approves everything (good for CI smoke tests), otherwise it prompts on stdin and prints the
 diff before asking. Model text streams to the terminal as it arrives; `--no-stream` waits per turn.
 `--image <path>` attaches a PNG/JPEG/GIF/WebP to the prompt (repeat it for several), using the same
@@ -323,19 +530,21 @@ Layout:
 ```
 src/core/            no vscode imports — unit-testable, reusable
   agent.ts           the loop (HarnessSession), retries, transcript trimming
+  prompt.ts          context-only system message (environment/workspace/files/tools)
+  agentFiles.ts      agent.md discovery, scoping, budgets and rendering
   transcript.ts      tool-call/result pairing repair
   compaction.ts      context-window summaries that keep tool groups intact
-  prompt.ts          system prompt + project snapshot
   paths.ts           workspace confinement / globbing
   policy.ts          command classification (safe / ask / deny)
   checkpoints.ts     revert support + diff previews
-  tools/             the 9 built-in tools plus the MCP client (mcp.ts)
+  tools/             the 10 built-in tools plus the MCP client (mcp.ts)
+                     and workspace MCP config loading (mcpConfig.ts)
   providers/         openai.ts, anthropic.ts, mock.ts, errors.ts (HTTP status
                      and which failures are worth retrying)
 src/vscode/          the editor integration
-  controller.ts      session + transcript items + settings/keys
+  controller.ts      session + transcript items + settings/keys/agent files
   chatView.ts        webview view (HTML/CSP) and message handling
-  host.ts            HarnessHost impl + approval service
+  host.ts            HarnessHost impl + approval service + workspace context
   proposals.ts       virtual documents for diff previews
 media/               chat.css / chat.js (no bundler)
 src/test/            node --test suites (paths, policy, tools, loop, SSE
@@ -359,8 +568,9 @@ export const wordCountTool: Tool<{ path: string }> = {
 };
 ```
 
-Register it in `createDefaultTools()` (`src/core/tools/index.ts`) — the prompt, the provider schemas
-and the panel pick it up automatically. Call `await ctx.approval({...})` before any side effect.
+Register it in `createDefaultTools()` (`src/core/tools/index.ts`) — the tool catalogue, the provider
+schemas and the panel pick it up automatically. Call `await ctx.approval({...})` before any side
+effect.
 
 ### Adding a provider
 
@@ -369,11 +579,12 @@ in `createProvider()` (`src/core/providers/index.ts`). `mock.ts` is a compact re
 
 ## Limitations worth knowing
 
-- **Vague prompts pull vague work.** "Improve the UI" names the area but not the goal. The system prompt
-  pushes the agent to survey the code and implement concrete improvements instead of replying with
-  suggestions, but naming the page, the symptom and what "better" means gets you much better first drafts.
-  And if the answer ever reads like "the offline planner summarised…", the provider is `mock` — open-ended
-  work needs a real model backend.
+- **No built-in prompt means no default behaviour.** An empty workspace with no `agent.md` gives the
+  model tools and context but no guidance on how to use them. Write a short `agent.md` first; it is
+  the highest-leverage file in the project.
+- **Agent file size matters.** Instructions are sent on every turn. Keep them focused (a few KB is
+  usually plenty); the budgets are there to protect the context window, but a 100 KB instruction file
+  will crowd out code.
 - **Single workspace folder.** The first folder of a multi-root workspace is the sandbox root.
 - **The mock provider is not a model.** It pattern-matches the prompt, writes sensible starter files
   and narrates a canned rationale; it exists to demo and test the harness, not to write production

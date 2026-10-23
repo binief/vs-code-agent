@@ -1131,3 +1131,57 @@ body.dragging .composer {
 .chip.mcp {
   cursor: pointer;
 }
+
+.chip.agents {
+  cursor: pointer;
+}
+
+.empty-note {
+  font-size: 11px;
+  line-height: 1.5;
+  opacity: 0.8;
+}
+
+.mcp-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 8px;
+  border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35));
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.mcp-file-server {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.mcp-file-name {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--vscode-foreground);
+}
+
+.mcp-file-detail {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 10px;
+}
+
+.mcp-file-note {
+  margin: 0 0 2px;
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+.mcp-file-error {
+  margin: 0;
+  color: var(--vscode-errorForeground);
+  font-size: 10px;
+}

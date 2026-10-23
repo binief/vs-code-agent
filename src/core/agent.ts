@@ -1,3 +1,4 @@
+import { agentFilesSummary, discoverAgentFiles } from './agentFiles';
 import { CheckpointStore, type RevertReport } from './checkpoints';
 import { compactHistory, estimateMessagesTokens, estimateTokens, shouldCompact } from './compaction';
 import { isRetryableProviderError, retryDelayMs } from './providers/errors';
@@ -21,7 +22,9 @@ import {
   type ToolCall,
   type ToolContext,
   type ToolResult,
+  type ToolSpec,
   type Usage,
+  type WorkspaceContext,
 } from './types';
 
 /** Extra input for a single task, beyond the prompt text. */
@@ -48,9 +51,8 @@ const MAX_HISTORY_CHARS = 140_000;
  * are retried with backoff instead of ending the task where it stands.
  */
 const MAX_PROVIDER_ATTEMPTS = 3;
-/** Text handed back to the model when a turn was cut off by the output limit. */
-const CONTINUE_AFTER_TRUNCATION =
-  'Your previous message was cut off by the output token limit. Continue from exactly where it stopped — do not repeat what you already wrote.';
+/** Operational note sent when a turn was cut off by the output limit. */
+const CONTINUE_AFTER_TRUNCATION = 'Your previous message was cut off by the output token limit.';
 /** Result recorded for tool calls the user cancelled before they could run. */
 const CANCELLED_TOOL_RESULT = 'Skipped: the task was cancelled before this tool ran.';
 
@@ -77,6 +79,11 @@ export class HarnessSession {
 
   get toolNames(): string[] {
     return this.registry.names();
+  }
+
+  /** Tool schemas handed to the provider (used by the context preview). */
+  get toolSpecs(): ToolSpec[] {
+    return this.registry.specs();
   }
 
   get isRunning(): boolean {
@@ -174,12 +181,61 @@ export class HarnessSession {
     let lastTokensPerSecond = 0;
 
     try {
-      const diagnostics = this.deps.config.includeDiagnosticsInPrompt ? await this.collectDiagnostics() : undefined;
+      const workspace = await this.collectWorkspaceContext();
+      const diagnostics = this.deps.config.context.diagnostics ? await this.collectDiagnostics() : undefined;
+      // Instructions are re-read for every task, so editing an agent file is
+      // picked up by the next prompt without restarting the extension.
+      let agentFiles: ReturnType<typeof discoverAgentFiles>;
+      try {
+        agentFiles = discoverAgentFiles({
+          root: host.workspaceRoot,
+          config: this.deps.config.agentFiles,
+          focusPaths: (workspace?.openFiles ?? []).map((file) => file.path),
+        });
+      } catch (err) {
+        // A broken instruction file must not take the whole task down; the
+        // prompt simply gets no instructions this time.
+        host.log('warn', `agent instruction discovery failed: ${(err as Error).message}`);
+        agentFiles = {
+          enabled: this.deps.config.agentFiles.enabled,
+          root: host.workspaceRoot,
+          names: this.deps.config.agentFiles.names,
+          patterns: this.deps.config.agentFiles.patterns,
+          scanNested: this.deps.config.agentFiles.scanNested,
+          maxDepth: this.deps.config.agentFiles.maxDepth,
+          includeUser: this.deps.config.agentFiles.includeUser,
+          userPath: this.deps.config.agentFiles.userPath,
+          files: [],
+          skipped: [{ path: '(discovery)', reason: (err as Error).message }],
+          totalBytes: 0,
+        };
+      }
+      onEvent({
+        type: 'agent-files',
+        enabled: agentFiles.enabled,
+        files: agentFiles.files.map((file) => ({
+          displayPath: file.displayPath,
+          absolutePath: file.path,
+          scope: file.scope,
+          origin: file.origin,
+          bytes: file.bytes,
+          truncated: file.truncated,
+        })),
+        totalBytes: agentFiles.totalBytes,
+        skipped: agentFiles.skipped.length,
+      });
+      host.log(
+        'info',
+        `agent instructions: ${agentFilesSummary(agentFiles)}` +
+          (agentFiles.skipped.length ? ` (${agentFiles.skipped.length} skipped)` : ''),
+      );
       const system = buildSystemPrompt({
         root: host.workspaceRoot,
         config: this.deps.config,
         tools: this.registry.specs(),
         diagnostics,
+        workspace,
+        agentFiles,
       });
 
       // Check if we should compact before starting
@@ -229,8 +285,7 @@ export class HarnessSession {
           if (isFinalStep) {
             list.push({
               role: 'user',
-              content:
-                'Step budget reached: reply now WITHOUT calling any tools. Summarise what you changed, how it was verified, and what is still left to do.',
+              content: `Step budget reached: ${maxSteps} step(s) used. No further tool calls are available in this task.`,
             });
           }
           return repairToolMessages(list);
@@ -583,6 +638,16 @@ export class HarnessSession {
       if (!diags?.length) return undefined;
       return summarizeDiagnostics(diags);
     } catch {
+      return undefined;
+    }
+  }
+
+  /** Editor facts (open files, version, trust) supplied by the host, if any. */
+  private async collectWorkspaceContext(): Promise<WorkspaceContext | undefined> {
+    try {
+      return await this.deps.host.getWorkspaceContext?.();
+    } catch (err) {
+      this.deps.host.log('warn', `workspace context unavailable: ${(err as Error).message}`);
       return undefined;
     }
   }

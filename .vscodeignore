@@ -13,3 +13,6 @@ out/test/**
 out/demo/**
 test-*
 *.vsix
+
+# Development-only agent instructions
+agent.md

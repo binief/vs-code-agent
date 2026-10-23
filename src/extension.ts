@@ -161,6 +161,19 @@ function registerCommands(
       await chatView.reveal();
       await controller.reloadMcpServers();
     }),
+
+    vscode.commands.registerCommand('codingHarness.openAgentFiles', async () => {
+      await chatView.reveal();
+      await controller.openAgentInstructions();
+    }),
+
+    vscode.commands.registerCommand('codingHarness.reloadAgentFiles', async () => {
+      await controller.refreshAgentFiles(true);
+    }),
+
+    vscode.commands.registerCommand('codingHarness.previewContext', async () => {
+      await controller.previewContext();
+    }),
   );
 }
 

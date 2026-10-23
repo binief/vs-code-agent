@@ -1,8 +1,8 @@
 {
   "name": "coding-harness",
   "displayName": "Coding Harness",
-  "description": "An in-editor coding agent. Give it a prompt and it plans, reads, searches, edits files and runs commands in your workspace using a sandboxed tool set.",
-  "version": "0.1.6",
+  "description": "A tool harness for VS Code: file create/edit/search, shell commands and MCP tools, with context about the environment and workspace. Instructions come from your agent.md files — no built-in prompt.",
+  "version": "0.2.0",
   "publisher": "binief",
   "license": "MIT",
   "repository": {
@@ -39,7 +39,10 @@
     "onCommand:codingHarness.showLog",
     "onCommand:codingHarness.askAboutSelection",
     "onCommand:codingHarness.compactConversation",
-    "onCommand:codingHarness.reloadMcpServers"
+    "onCommand:codingHarness.reloadMcpServers",
+    "onCommand:codingHarness.openAgentFiles",
+    "onCommand:codingHarness.reloadAgentFiles",
+    "onCommand:codingHarness.previewContext"
   ],
   "contributes": {
     "viewsContainers": {
@@ -102,10 +105,30 @@
         "command": "codingHarness.reloadMcpServers",
         "title": "Coding Harness: Reload MCP Servers",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "codingHarness.openAgentFiles",
+        "title": "Coding Harness: Open Agent Instructions",
+        "icon": "$(file-text)"
+      },
+      {
+        "command": "codingHarness.reloadAgentFiles",
+        "title": "Coding Harness: Reload Agent Instructions",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "codingHarness.previewContext",
+        "title": "Coding Harness: Preview System Context",
+        "icon": "$(eye)"
       }
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "codingHarness.openAgentFiles",
+          "when": "view == codingHarness.chat",
+          "group": "navigation@0"
+        },
         {
           "command": "codingHarness.compactConversation",
           "when": "view == codingHarness.chat",
@@ -122,9 +145,14 @@
           "group": "navigation@3"
         },
         {
-          "command": "codingHarness.showLog",
+          "command": "codingHarness.previewContext",
           "when": "view == codingHarness.chat",
           "group": "navigation@4"
+        },
+        {
+          "command": "codingHarness.showLog",
+          "when": "view == codingHarness.chat",
+          "group": "navigation@5"
         }
       ],
       "editor/context": [
@@ -259,11 +287,6 @@
           "default": "auto",
           "markdownDescription": "Line-ending policy for files written by the agent. `auto` is recommended: it preserves CRLF files on Windows and LF files on Unix/macOS."
         },
-        "codingHarness.includeDiagnosticsInPrompt": {
-          "type": "boolean",
-          "default": true,
-          "markdownDescription": "Send a compact snapshot of current workspace problems (VS Code diagnostics) with each task, so the agent knows what is already broken."
-        },
         "codingHarness.stream": {
           "type": "boolean",
           "default": true,
@@ -274,15 +297,103 @@
           "default": true,
           "markdownDescription": "Show the model's reasoning stream in its own lane when the backend provides one (DeepSeek `reasoning_content`, OpenRouter `reasoning`, OpenAI-compatible reasoning models, Anthropic extended thinking). The reasoning is displayed only — it is never sent back to the model as conversation content."
         },
-        "codingHarness.systemPromptExtra": {
+        "codingHarness.agentFiles.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Load behavioural instructions from agent files. The extension has **no built-in prompt**, so when this is off the model receives only environment, workspace, file and tool context."
+        },
+        "codingHarness.agentFiles.names": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["AGENTS.md", "agent.md", "agents.md", "copilot-instructions.md"],
+          "markdownDescription": "Exact file names searched in the workspace root and its subdirectories (case-insensitive). Use `codingHarness.agentFiles.patterns` for names that vary, or put the file in `.agents/`."
+        },
+        "codingHarness.agentFiles.patterns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["*.instructions.md"],
+          "markdownDescription": "Glob patterns matched against the workspace-relative path, so instruction files can have any name (`code-review.md`, `test.md`, `**/rules/*.md`, …). Files inside `.agents/`, `.agent/`, `.github/instructions/` and `.vscode/instructions/` are loaded whatever they are called, without a pattern."
+        },
+        "codingHarness.agentFiles.includeUser": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Also load a user-level agent file that applies to every workspace."
+        },
+        "codingHarness.agentFiles.userPath": {
           "type": "string",
-          "default": "",
-          "markdownDescription": "Extra instructions appended to the system prompt (project conventions, preferred commands, style rules, …)."
+          "default": "~/.coding-harness/agent.md",
+          "markdownDescription": "Path of the user-level agent file. `~` is expanded to the home directory."
+        },
+        "codingHarness.agentFiles.scanNested": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Scan every subdirectory up to `codingHarness.agentFiles.maxDepth` for agent files. When off, only the workspace root, its config directories (`.github`, `.vscode`, `.agents`) and the ancestor chain of each open editor are searched."
+        },
+        "codingHarness.agentFiles.maxDepth": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "maximum": 12,
+          "markdownDescription": "How many directory levels below the workspace root are scanned when `codingHarness.agentFiles.scanNested` is on. Agent files above an open editor are always loaded, regardless of depth."
+        },
+        "codingHarness.agentFiles.maxBytes": {
+          "type": "number",
+          "default": 65536,
+          "minimum": 1024,
+          "markdownDescription": "Per-file size cap in bytes. Larger agent files are truncated."
+        },
+        "codingHarness.agentFiles.maxTotalBytes": {
+          "type": "number",
+          "default": 131072,
+          "minimum": 1024,
+          "markdownDescription": "Total instruction budget per prompt. Files that do not fit are skipped."
+        },
+        "codingHarness.agentFiles.extraPaths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "markdownDescription": "Additional agent files to load, as workspace-relative, `~/` or absolute paths. Paths may point outside the workspace (e.g. `../shared/agent.md`), which is the way to share instructions between repositories. A directory is scanned for the configured names."
+        },
+        "codingHarness.context.environment": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Include OS, shell, Node.js, editor version, time, git state and approval policies in the system message."
+        },
+        "codingHarness.context.workspace": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Include the workspace layout and manifest summaries (package.json scripts/dependencies, pyproject.toml, …)."
+        },
+        "codingHarness.context.files": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Include open editors, the active file and the current selection."
+        },
+        "codingHarness.context.diagnostics": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Include a snapshot of current workspace problems (VS Code diagnostics)."
+        },
+        "codingHarness.context.tools": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Include the catalogue of available tools (including MCP tools) in the system message. Tool schemas are always sent to the provider either way."
         },
         "codingHarness.mcp.enabled": {
           "type": "boolean",
-          "default": false,
-          "markdownDescription": "Enable Model Context Protocol (MCP) servers. When enabled, tools from configured MCP servers are added to the agent's tool set."
+          "default": true,
+          "markdownDescription": "Enable Model Context Protocol (MCP) servers. When enabled, tools from servers configured in settings or workspace config files are added to the agent's tool set."
+        },
+        "codingHarness.mcp.loadFromFiles": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Read MCP server definitions from workspace config files (`.vscode/mcp.json`, `.mcp.json`, `mcp.json`) in addition to `codingHarness.mcp.servers`. Settings override file definitions with the same server id."
+        },
+        "codingHarness.mcp.configFiles": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [".vscode/mcp.json", ".mcp.json", "mcp.json"],
+          "markdownDescription": "Config files scanned for MCP servers, relative to the workspace root or absolute. Supports the VS Code shape (`servers`) and the Claude/Cursor shape (`mcpServers`), plus `${env:VAR}`, `${workspaceFolder}`, `${userHome}` and `${input:id}` placeholders."
         },
         "codingHarness.mcp.servers": {
           "type": "object",

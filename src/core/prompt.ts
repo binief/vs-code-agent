@@ -1,8 +1,19 @@
+/**
+ * System-message builder.
+ *
+ * This module deliberately contains **no behavioural instructions**. It only
+ * describes the environment, the workspace, the files the editor has open and
+ * the tools that are available, then appends the agent instruction files
+ * verbatim. Every instruction the model acts on comes from those files.
+ */
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+import { formatAgentInstructions, type AgentFilesResult } from './agentFiles';
 import { normalizeEol } from './lineEndings';
 import { formatBytes, toPosix } from './paths';
-import type { HarnessConfig, ToolSpec } from './types';
+import type { HarnessConfig, ToolSpec, WorkspaceContext } from './types';
 
 const INTERESTING_TOP_LEVEL = [
   'package.json',
@@ -21,16 +32,149 @@ const INTERESTING_TOP_LEVEL = [
   'tsconfig.json',
 ];
 
-/** Cheap, synchronous project snapshot so the model does not need to ask for it. */
-export function workspaceSnapshot(root: string, config: HarnessConfig): string {
-  const lines: string[] = [`Workspace root: ${toPosix(root)}`];
+const TOP_LEVEL_SKIP = new Set([
+  'node_modules',
+  '.git',
+  '.hg',
+  '.svn',
+  'dist',
+  'out',
+  'build',
+  'coverage',
+  '__pycache__',
+  '.venv',
+  'venv',
+  '.next',
+  'target',
+]);
+
+export interface GitSnapshot {
+  branch?: string;
+  head?: string;
+  changes?: string[];
+  changeCount?: number;
+}
+
+function gitDir(root: string): string | undefined {
+  const dotGit = path.join(root, '.git');
+  try {
+    const stat = fs.statSync(dotGit);
+    if (stat.isDirectory()) return dotGit;
+    if (stat.isFile()) {
+      const text = fs.readFileSync(dotGit, 'utf8').trim();
+      const match = /^gitdir:\s*(.+)$/m.exec(text);
+      if (match) return path.resolve(root, match[1].trim());
+    }
+  } catch {
+    /* not a git checkout */
+  }
+  return undefined;
+}
+
+function readRef(dir: string, ref: string): string | undefined {
+  try {
+    return fs.readFileSync(path.join(dir, ref), 'utf8').trim();
+  } catch {
+    /* try packed-refs */
+  }
+  try {
+    const packed = fs.readFileSync(path.join(dir, 'packed-refs'), 'utf8');
+    for (const line of packed.split('\n')) {
+      if (!line || line.startsWith('#')) continue;
+      const [sha, name] = line.trim().split(/\s+/);
+      if (name === ref) return sha;
+    }
+  } catch {
+    /* no packed refs */
+  }
+  return undefined;
+}
+
+/** Cheap, read-only git facts: branch, HEAD and a bounded status list. */
+export function readGitSnapshot(root: string): GitSnapshot | undefined {
+  const dir = gitDir(root);
+  if (!dir) return undefined;
+  const out: GitSnapshot = {};
+  try {
+    const head = fs.readFileSync(path.join(dir, 'HEAD'), 'utf8').trim();
+    if (head.startsWith('ref: ')) {
+      const ref = head.slice(5).trim();
+      out.branch = ref.replace(/^refs\/heads\//, '');
+      out.head = readRef(dir, ref)?.slice(0, 8);
+    } else {
+      out.head = head.slice(0, 8);
+    }
+  } catch {
+    return out;
+  }
+  try {
+    const status = execFileSync('git', ['status', '--porcelain'], {
+      cwd: root,
+      timeout: 1500,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const lines = status.split('\n').filter((line) => line.trim());
+    out.changeCount = lines.length;
+    out.changes = lines.slice(0, 12).map((line) => line.replace(/\s+$/, ''));
+  } catch {
+    /* git is absent, slow, or refused to run: the rest of the context still works */
+  }
+  return out;
+}
+
+function toolDescription(description: string): string {
+  const oneLine = description.replace(/\s+/g, ' ').trim();
+  return oneLine.length > 320 ? `${oneLine.slice(0, 317)}…` : oneLine;
+}
+
+function environmentSection(root: string, config: HarnessConfig, workspace?: WorkspaceContext): string {
+  const git = readGitSnapshot(root);
+  const folders = workspace?.folders?.length ? workspace.folders : [root];
+  const shell =
+    process.platform === 'win32' ? process.env.ComSpec || 'cmd.exe' : process.env.SHELL || '/bin/sh';
+  const lines = [
+    `- Workspace root: ${toPosix(root)}`,
+    ...(folders.length > 1 ? [`- Workspace folders: ${folders.map((f) => toPosix(f)).join(', ')}`] : []),
+    `- Extension: Coding Harness (VS Code extension)`,
+    `- Platform: ${process.platform} ${os.release()} (${process.arch})`,
+    `- Shell: ${shell}`,
+    `- Node.js: ${process.version}`,
+    `- Editor: ${workspace?.editor ? `${workspace.editor.name} ${workspace.editor.version}` : 'unknown'}`,
+    `- Time: ${new Date().toISOString()} (${Intl.DateTimeFormat().resolvedOptions().timeZone || 'local time'})`,
+    `- Line-ending policy: ${config.lineEndings}`,
+    `- Workspace confinement: ${config.allowOutsideWorkspace ? 'off' : 'on (paths outside the workspace are refused)'}`,
+    `- Edit approval: ${config.editPolicy}; command approval: ${config.commandPolicy}; command timeout: ${config.commandTimeoutMs} ms`,
+  ];
+  if (git?.branch) {
+    lines.push(`- Git branch: ${git.branch}${git.head ? ` at ${git.head}` : ''}`);
+  } else if (git?.head) {
+    lines.push(`- Git HEAD: ${git.head} (detached)`);
+  } else {
+    lines.push('- Git: not a git checkout');
+  }
+  if (git?.changeCount !== undefined) {
+    lines.push(
+      `- Uncommitted changes: ${git.changeCount}` +
+        (git.changes?.length ? `\n${git.changes.map((line) => `    ${line}`).join('\n')}` : ''),
+    );
+  }
+  for (const [key, value] of Object.entries(workspace?.environment ?? {})) {
+    if (value) lines.push(`- ${key}: ${value}`);
+  }
+  return lines.join('\n');
+}
+
+/** Project layout and manifest facts so the model does not have to ask for them. */
+export function workspaceSnapshot(root: string): string {
+  const lines: string[] = [];
 
   let topLevel: string[] = [];
   try {
     topLevel = fs
       .readdirSync(root, { withFileTypes: true })
-      .filter((d) => !['node_modules', '.git', 'dist', 'out', 'build', '__pycache__', '.venv', 'venv'].includes(d.name))
-      .slice(0, 40)
+      .filter((d) => !TOP_LEVEL_SKIP.has(d.name))
+      .slice(0, 60)
       .map((d) => (d.isDirectory() ? `${d.name}/` : d.name));
   } catch {
     /* unreadable root: not fatal */
@@ -74,18 +218,63 @@ export function workspaceSnapshot(root: string, config: HarnessConfig): string {
       continue;
     }
     const head = text.split('\n').slice(0, 25).join('\n').trim();
-    lines.push(`${manifest} (first ${Math.min(25, head.split('\n').length)} lines):\n${head}`);
+    if (head) lines.push(`${manifest} (first ${Math.min(25, head.split('\n').length)} lines):\n${head}`);
   }
 
-  try {
-    const head = fs.readFileSync(path.join(root, '.git', 'HEAD'), 'utf8').trim();
-    const branch = head.startsWith('ref: refs/heads/') ? head.slice('ref: refs/heads/'.length) : head.slice(0, 12);
-    lines.push(`git branch: ${branch}`);
-  } catch {
-    /* not a git repo */
-  }
+  return lines.join('\n') || 'The workspace root could not be read.';
+}
 
-  lines.push(`Platform: ${process.platform} \u2014 shell tool uses ${process.platform === 'win32' ? 'cmd.exe' : '/bin/sh'}.`);
+function describeOpenFile(file: { path: string; languageId?: string; dirty?: boolean; lineCount?: number }): string {
+  const bits: string[] = [];
+  if (file.languageId) bits.push(file.languageId);
+  if (file.lineCount !== undefined) bits.push(`${file.lineCount} lines`);
+  if (file.dirty) bits.push('unsaved changes');
+  return `${toPosix(file.path)}${bits.length ? ` (${bits.join(', ')})` : ''}`;
+}
+
+function openEditorsSection(workspace: WorkspaceContext | undefined, config: HarnessConfig): string {
+  const lines: string[] = [];
+  const active = workspace?.activeFile;
+  const open = workspace?.openFiles ?? [];
+
+  if (active) {
+    lines.push(`- Active file: ${describeOpenFile(active)}`);
+    if (active.selection) {
+      lines.push(`- Selection in the active file: lines ${active.selection.startLine}-${active.selection.endLine}`);
+    }
+  }
+  const others = open.filter((file) => !file.active && file.path !== active?.path);
+  if (others.length) {
+    lines.push(`- Other open editors (${others.length}):`);
+    for (const file of others.slice(0, 25)) lines.push(`    ${describeOpenFile(file)}`);
+    if (others.length > 25) lines.push(`    … ${others.length - 25} more`);
+  }
+  if (!active && open.length === 0) {
+    lines.push('- No editor tabs were open when this task started.');
+  }
+  const limit = config.maxFileBytes > 0 ? formatBytes(config.maxFileBytes) : 'no limit';
+  lines.push(`- File size limit for tools: ${limit} (codingHarness.maxFileBytes)`);
+  return lines.join('\n');
+}
+
+function diagnosticsSection(diagnostics: string[] | undefined): string {
+  if (!diagnostics?.length) return '- Current editor problems: none reported.';
+  const lines = [
+    `- Current editor problems (snapshot, may be stale):`,
+    ...diagnostics.slice(0, 40).map((line) => `    ${line}`),
+  ];
+  if (diagnostics.length > 40) lines.push(`    … ${diagnostics.length - 40} more`);
+  return lines.join('\n');
+}
+
+function toolsSection(config: HarnessConfig, tools: ToolSpec[]): string {
+  const lines = [`Available tools (${tools.length}):`];
+  for (const tool of tools) lines.push(`- \`${tool.name}\` — ${toolDescription(tool.description)}`);
+  lines.push(
+    '',
+    'Tool behaviour comes from the extension, not from this message: edits are checkpointed and can be reverted; ' +
+      `writes follow editPolicy=${config.editPolicy}; shell commands follow commandPolicy=${config.commandPolicy}.`,
+  );
   return lines.join('\n');
 }
 
@@ -95,108 +284,38 @@ export interface SystemPromptOptions {
   tools: ToolSpec[];
   /** Compact "file:line SEVERITY message" list of current editor problems. */
   diagnostics?: string[];
+  /** Editor/workspace facts gathered from the host. */
+  workspace?: WorkspaceContext;
+  /** Instruction files loaded for this task. */
+  agentFiles?: AgentFilesResult;
 }
 
-const BASE = `You are Coding Harness, an autonomous coding agent running inside a VS Code extension.
-You work only through the tools provided. You cannot see the user's screen or their editor state except
-through tool results, so verify with tools instead of guessing.
-
-## Work every prompt in three moves: gather, decide, act
-- GATHER before deciding. Locate the code the prompt touches (list_files, search_text, read_file) and
-  read enough of it — plus a sibling file for the project's conventions — that every decision is grounded
-  in the real files. Never act on assumed contents, APIs or paths.
-- DECIDE concretely. What exactly changes, in which files, in the project's idioms? State that decision in
-  one or two lines, then carry it out. A task prompt (create, change, fix, improve, refactor, clean up) is
-  a request to EDIT the workspace, so the decision names edits — never a menu of options. A vague ask
-  ("improve the UI", "clean this up") is still a task: locate the relevant code, pick the 2-4 most concrete
-  low-risk improvements you can see are needed, state your picks in a line, and implement them.
-- ACT and verify. Make the edits, then sanity-check with the project's own commands (rule 4). The task ends
-  with changed files plus proof. A reply that only surveys the code and suggests what could be done — however
-  smart — is a failed task.
-- PROSE-ONLY replies are for actual questions ("explain …", "how does …", "what is …") and for blocked work
-  with the obstacle stated. Deliver a plan or a suggestion list as the final answer ONLY when the user
-  explicitly asked for one ("propose", "plan only", "don't change anything").
-
-## Operating rules
-1. EXPLORE FIRST. Before editing, locate the relevant code with list_files / search_text and read the
-   files you are about to change (read_file), plus a nearby sibling that shows the project's conventions —
-   match its idioms, naming and structure rather than your defaults. Never invent file contents, APIs or paths.
-2. SMALL, FOCUSED CHANGES. Make the smallest edit that satisfies the request. Prefer replace_in_file with
-   an exact snippet over rewriting a whole file with write_file. Preserve existing formatting, quoting and
-   style; do not reformat unrelated code and do not delete unrelated code. File tools normalize line endings
-   for matching: read_file displays LF, replace_in_file matches LF or CRLF and writes the file's existing
-   style, and write_file uses the existing style (or the host OS style for a new file).
-3. CREATE ONLY WHAT IS NEEDED. Do not add dependencies, configs or scaffolding the user did not ask for.
-   If a dependency seems necessary, explain it and ask instead of silently changing manifests.
-4. VERIFY. After editing, sanity-check your work: use get_diagnostics, run the project's own test/build/lint
-   command when one exists in the snapshot below, or at minimum re-read the changed region. Fix what your
-   own change broke. Never claim something works if you did not check it.
-5. SCOPE THE CHECK. Tool output is truncated, so prefer the narrowest command that proves the point (one
-   test file while iterating, the full suite once at the end) and pass a path to get_diagnostics when you
-   only touched one file.
-6. STAY IN SCOPE. The tools are confined to the workspace. If a task needs something outside the workspace
-   or a command the safety layer refuses, say so plainly instead of working around it.
-7. PARALLELISE READS. Independent reads/searches can be requested in one turn; file writes are applied in order.
-8. ONE LINE OF INTENT. Start each turn with a single short sentence saying what you are about to do. No
-   preamble about being an AI, no restating the whole request.
-9. FINISH CLEARLY. When the task is done (or you are blocked), stop calling tools and reply with a short
-   summary: what changed, which files, how you verified it, and anything the user should decide next. The
-   summary reports work you did — it is never the substitute for doing it.
-10. ASK ONLY WHEN IT CHANGES WHAT YOU DO. One clarifying question is right when the answer decides which
-   files get touched or whether work is thrown away. Otherwise pick the conservative option, state the
-   assumption in one line and keep going — you have a finite step budget, so spend it on work.
-
-## Editing precisely
-- read_file output is line-numbered for orientation only. Never copy those numbers (or the gutter) into
-  old_text — match the file's real text, including indentation.
-- Make old_text unique: a bare \`}\` or a repeated call line will match the wrong place. Include a couple of
-  surrounding lines, or pass count when you genuinely mean several occurrences.
-- If replace_in_file reports the snippet was not found, re-read the region and widen the snippet. Do not
-  guess at line numbers, and do not fall back to rewriting the whole file with write_file.
-
-## When something fails
-- Change the approach between attempts; never repeat an identical failing call.
-- Separate your breakage from what was already broken: the editor-problems snapshot below is the "before"
-  picture, so a pre-existing error is context, not your bug to chase mid-task.
-- After two failed attempts at the same edit, stop and report what you tried and what the obstacle is
-  rather than making ever-larger speculative rewrites.
-
-## Risk and safety
-- Before anything destructive — deleting code or files, removing dependencies, renaming a public API,
-  touching generated or binary files — state the risk in one line. Deletes and side-effecting commands
-  route to the user for approval automatically; let that be the gate.
-- A rejected approval is a decision, not an error: adapt or explain why it mattered, never re-run the same
-  action with cosmetic changes to slip it past.
-- Never print, echo or commit secrets (API keys, tokens, .env contents), even when a file or command output
-  puts them in front of you.
-- Do not create commits, branches or tags unless the user explicitly asks, and never add generated or
-  ignored files to version control.`;
-
+/**
+ * Build the system message: factual context first, instruction files last.
+ * There is no hard-coded prompt to fall back to when no agent file exists.
+ */
 export function buildSystemPrompt(opts: SystemPromptOptions): string {
-  const { root, config, tools, diagnostics } = opts;
-  const parts: string[] = [BASE];
+  const { root, config, tools, diagnostics, workspace, agentFiles } = opts;
+  const parts: string[] = [];
 
-  parts.push(`## Environment\n${workspaceSnapshot(root, config)}`);
-
+  if (config.context.environment) {
+    parts.push(`# Environment\n${environmentSection(root, config, workspace)}`);
+  }
+  if (config.context.workspace) {
+    parts.push(`# Workspace\n${workspaceSnapshot(root)}`);
+  }
+  if (config.context.files || config.context.diagnostics) {
+    const fileLines: string[] = [];
+    if (config.context.files) fileLines.push(openEditorsSection(workspace, config));
+    if (config.context.diagnostics) fileLines.push(diagnosticsSection(diagnostics));
+    parts.push(`# Files\n${fileLines.join('\n')}`);
+  }
+  if (config.context.tools) {
+    parts.push(`# Tools\n${toolsSection(config, tools)}`);
+  }
   parts.push(
-    `## Tools\n` +
-      tools.map((t) => `- \`${t.name}\`: ${t.description}`).join('\n') +
-      `\nEdits and side-effecting commands may require user approval; a rejection comes back as a failed tool\n` +
-      `result and you should adapt rather than repeat. Current policies: editPolicy=${config.editPolicy}, ` +
-      `commandPolicy=${config.commandPolicy}, line endings=${config.lineEndings}, workspace confinement=${config.allowOutsideWorkspace ? 'off' : 'on'}.`,
+    `# Agent instructions\n${agentFiles ? formatAgentInstructions(agentFiles) : 'No agent instruction files were loaded for this task.'}`,
   );
-
-  if (diagnostics && diagnostics.length) {
-    parts.push(
-      `## Current editor problems (snapshot, may be stale)\n` +
-        diagnostics.slice(0, 40).join('\n') +
-        (diagnostics.length > 40 ? `\n\u2026 ${diagnostics.length - 40} more` : ''),
-    );
-  }
-
-  if (config.systemPromptExtra?.trim()) {
-    parts.push(`## Project-specific instructions (from the user's settings)\n${config.systemPromptExtra.trim()}`);
-  }
 
   return parts.join('\n\n');
 }

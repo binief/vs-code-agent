@@ -15,6 +15,7 @@ import { HarnessSession } from '../core/agent';
 import { apiKeyFromEnv, createProvider } from '../core/providers';
 import { createDefaultTools, ToolRegistry } from '../core/tools';
 import { McpManager, sanitizeMcpServers } from '../core/tools/mcp';
+import { loadMcpConfigFiles, mergeMcpServers } from '../core/tools/mcpConfig';
 import { normalizeImage } from '../core/images';
 import { DEFAULT_CONFIG, type ApprovalRequest, type ImageAttachment, type HarnessConfig, type HarnessEvent, type HarnessHost, type ProviderId } from '../core/types';
 
@@ -92,6 +93,9 @@ Options:
                         http:   '{"remote":{"url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer …"}}}'
   --compact-threshold <n> Context threshold 0-1 for auto-compaction (default 0.75)
   --image <path>        Attach an image to the prompt (repeatable, needs a vision model)
+
+Agent instructions: AGENTS.md / agent.md, or any .md under .agents/ — in the target directory.
+MCP servers: .vscode/mcp.json, .mcp.json and mcp.json are read automatically.
 `);
 }
 
@@ -166,9 +170,9 @@ async function main(): Promise<void> {
     try {
       const servers = sanitizeMcpServers(JSON.parse(args.mcp));
       config.mcp = {
+        ...DEFAULT_CONFIG.mcp,
         enabled: true,
         servers,
-        timeoutMs: 10000,
       };
       if (Object.keys(servers).length === 0) {
         console.error(c.yellow('Warning: --mcp JSON contained no usable server definitions.'));
@@ -179,14 +183,27 @@ async function main(): Promise<void> {
     }
   }
 
+  // Merge MCP servers from `.vscode/mcp.json` / `.mcp.json` / `mcp.json`.
+  if (config.mcp.enabled && config.mcp.loadFromFiles && config.mcp.configFiles.length > 0) {
+    const fileConfig = await loadMcpConfigFiles(root, config.mcp.configFiles);
+    if (fileConfig.sources.length) {
+      console.log(
+        c.dim(`MCP config: ${fileConfig.sources.map((source) => `${source.path} (${source.serverIds.length})`).join(', ')}`),
+      );
+    }
+    for (const error of fileConfig.errors) console.error(c.yellow(`MCP config ${error.path}: ${error.message}`));
+    const merged = mergeMcpServers(fileConfig, config.mcp.servers);
+    config.mcp = { ...config.mcp, servers: merged.servers };
+  }
+
   const apiKey = apiKeyFromEnv(config.provider);
   const provider = createProvider({ config, apiKey });
   const host = new CliHost(root, args.auto, args.verbose);
 
   console.log(c.bold(`\nCoding Harness — ${provider.label} (${config.model})`));
   console.log(c.dim(`workspace: ${root}\nprompt:    ${args.prompt}\n`));
-  if (config.mcp.enabled) {
-    console.log(c.dim(`MCP: enabled with ${Object.keys(config.mcp.servers).length} server(s)\n`));
+  if (config.mcp.enabled && Object.keys(config.mcp.servers).length > 0) {
+    console.log(c.dim(`MCP: ${Object.keys(config.mcp.servers).length} server(s) configured\n`));
   }
 
   let mcpManager: McpManager | undefined;
@@ -268,6 +285,15 @@ async function main(): Promise<void> {
         break;
       case 'mcp-status':
         console.log(c.dim(`  MCP: ${event.servers} server(s), ${event.tools} tool(s)`));
+        break;
+      case 'agent-files':
+        console.log(
+          c.dim(
+            event.files.length
+              ? `  agent files: ${event.files.map((file) => file.displayPath).join(', ')}`
+              : `  agent files: none found${event.enabled ? '' : ' (disabled)'}`,
+          ),
+        );
         break;
       case 'done':
         console.log(

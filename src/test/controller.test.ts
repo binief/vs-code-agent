@@ -30,8 +30,6 @@ const settings: Record<string, unknown> = {
   commandTimeoutMs: 10_000,
   allowOutsideWorkspace: false,
   maxFileBytes: 262_144,
-  includeDiagnosticsInPrompt: false,
-  systemPromptExtra: '',
   stream: true,
 };
 

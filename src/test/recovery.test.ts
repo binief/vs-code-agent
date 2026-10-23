@@ -46,7 +46,7 @@ class FakeHost implements HarnessHost {
 }
 
 function config(overrides: Partial<HarnessConfig> = {}): HarnessConfig {
-  return { ...DEFAULT_CONFIG, provider: 'openai', includeDiagnosticsInPrompt: false, ...overrides };
+  return { ...DEFAULT_CONFIG, provider: 'openai', context: { ...DEFAULT_CONFIG.context, diagnostics: false }, ...overrides };
 }
 
 const writeCall = (id: string, file: string): { id: string; name: string; arguments: string } => ({

@@ -7,6 +7,8 @@ import type {
   ApprovalRequest,
   Diagnostic,
   HarnessHost,
+  OpenFileContext,
+  WorkspaceContext,
 } from '../core/types';
 import type { Logger } from './log';
 
@@ -175,6 +177,60 @@ export class VsCodeHost implements HarnessHost {
     }
     out.sort((a, b) => (a.severity === b.severity ? a.file.localeCompare(b.file) : a.severity === 'error' ? -1 : 1));
     return out.slice(0, 500);
+  }
+
+  /**
+   * Editor facts for the context section of the prompt: open files, the active
+   * editor, the current selection, the editor version and workspace trust.
+   * Everything is best-effort — a missing API degrades to less context.
+   */
+  getWorkspaceContext(): WorkspaceContext {
+    const folders = (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath);
+    const activeEditor = vscode.window.activeTextEditor;
+    const toContext = (doc: vscode.TextDocument, active: boolean): OpenFileContext | undefined => {
+      if (doc.uri.scheme !== 'file') return undefined;
+      const abs = doc.uri.fsPath;
+      const rel = vscode.workspace.asRelativePath(doc.uri, false);
+      const file: OpenFileContext = {
+        path: (rel || abs).split(path.sep).join('/'),
+        languageId: doc.languageId,
+        dirty: doc.isDirty,
+        lineCount: doc.lineCount,
+      };
+      if (active) file.active = true;
+      if (active && activeEditor && !activeEditor.selection.isEmpty) {
+        file.selection = {
+          startLine: activeEditor.selection.start.line + 1,
+          endLine: activeEditor.selection.end.line + 1,
+        };
+      }
+      return file;
+    };
+
+    const openFiles: OpenFileContext[] = [];
+    const seen = new Set<string>();
+    for (const doc of vscode.workspace.textDocuments ?? []) {
+      const file = toContext(doc, doc === activeEditor?.document);
+      if (!file || seen.has(file.path)) continue;
+      seen.add(file.path);
+      openFiles.push(file);
+    }
+
+    const activeFile = activeEditor ? toContext(activeEditor.document, true) : undefined;
+    const environment: Record<string, string> = {};
+    if (typeof vscode.workspace.isTrusted === 'boolean') {
+      environment['Workspace trust'] = vscode.workspace.isTrusted ? 'trusted' : 'restricted';
+    }
+    const remoteName = vscode.env?.remoteName;
+    if (remoteName) environment['Remote'] = remoteName;
+
+    return {
+      editor: { name: 'Visual Studio Code', version: vscode.version || 'unknown' },
+      folders,
+      activeFile,
+      openFiles: openFiles.slice(0, 30),
+      environment,
+    };
   }
 
   async openFile(absPath: string, line?: number): Promise<void> {
