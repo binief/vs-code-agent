@@ -15,6 +15,7 @@
   const btnSelection = document.getElementById('btn-selection');
   const btnCompact = document.getElementById('btn-compact');
   const btnMcp = document.getElementById('btn-mcp');
+  const btnAgents = document.getElementById('btn-agents');
   const statusDot = document.getElementById('status-dot');
   const statusText = document.getElementById('status-text');
   const chipProvider = document.getElementById('chip-provider');
@@ -24,6 +25,7 @@
   const chipSpeed = document.getElementById('chip-speed');
   const chipContext = document.getElementById('chip-context');
   const chipMcp = document.getElementById('chip-mcp');
+  const chipAgents = document.getElementById('chip-agents');
   const hintUsage = document.getElementById('hint-usage');
   const activityBox = document.getElementById('activity');
   const activityText = document.getElementById('activity-text');
@@ -187,6 +189,23 @@
     else chipProvider.classList.remove('warn');
 
     chipPolicy.textContent = 'edits: ' + state.editPolicy + ' · shell: ' + state.commandPolicy;
+    if (chipAgents) {
+      const files = Array.isArray(state.agentFiles) ? state.agentFiles : [];
+      const enabled = state.agentFilesEnabled !== false;
+      if (!enabled) {
+        chipAgents.textContent = 'agents: off';
+        chipAgents.classList.add('warn');
+        chipAgents.title = 'Agent instruction loading is disabled (codingHarness.agentFiles.enabled)';
+      } else if (files.length === 0) {
+        chipAgents.textContent = 'agents: none';
+        chipAgents.classList.add('warn');
+        chipAgents.title = 'No instruction files found — click to create one, or add any .md file under .agents/. The extension has no built-in prompt.';
+      } else {
+        chipAgents.textContent = 'agents: ' + files.length;
+        chipAgents.classList.remove('warn');
+        chipAgents.title = files.map((file) => file.displayPath).join('\n');
+      }
+    }
     streamEnabled = state.stream !== false;
     chipStream.textContent = 'stream: ' + (streamEnabled ? 'on' : 'off');
     chipStream.title = streamEnabled
@@ -223,12 +242,19 @@
 
     // MCP
     if (chipMcp) {
+      const configured = state.mcpConfigured || 0;
+      const running = state.mcpServers || 0;
+      const tools = state.mcpToolCount || 0;
       if (state.mcpEnabled) {
-        const count = state.mcpToolCount || 0;
-        const servers = state.mcpServers || 0;
-        chipMcp.textContent = `mcp: ${servers} srv, ${count} tools`;
-        chipMcp.title = `MCP enabled: ${servers} server(s), ${count} tool(s)`;
+        chipMcp.textContent = `mcp: ${running} srv, ${tools} tools`;
+        chipMcp.title = `MCP enabled: ${running} connected server(s), ${tools} tool(s), ${configured} configured`;
+        chipMcp.hidden = configured === 0 && running === 0 && tools === 0;
+        chipMcp.classList.remove('warn');
+      } else if (configured > 0) {
+        chipMcp.textContent = 'mcp: off';
+        chipMcp.title = 'MCP is disabled (codingHarness.mcp.enabled)';
         chipMcp.hidden = false;
+        chipMcp.classList.add('warn');
       } else {
         chipMcp.hidden = true;
       }
@@ -792,6 +818,9 @@
   btnSelection.addEventListener('click', () => vscode.postMessage({ type: 'insert-selection' }));
   if (btnCompact) btnCompact.addEventListener('click', () => vscode.postMessage({ type: 'compact' }));
   if (btnMcp) btnMcp.addEventListener('click', openMcpModal);
+  if (btnAgents) btnAgents.addEventListener('click', () => vscode.postMessage({ type: 'open-agents' }));
+  if (chipAgents) chipAgents.addEventListener('click', () => vscode.postMessage({ type: 'open-agents' }));
+  if (chipContext) chipContext.addEventListener('click', () => vscode.postMessage({ type: 'preview-context' }));
   if (btnCompactBanner) btnCompactBanner.addEventListener('click', () => vscode.postMessage({ type: 'compact' }));
   if (btnCompactDismiss) btnCompactDismiss.addEventListener('click', () => {
     if (compactBanner) compactBanner.hidden = true;
@@ -810,6 +839,7 @@
   const mcpEnabled = document.getElementById('mcp-enabled');
   const mcpTimeout = document.getElementById('mcp-timeout');
   const mcpServerList = document.getElementById('mcp-server-list');
+  const mcpFileServers = document.getElementById('mcp-file-servers');
   const mcpAddServer = document.getElementById('mcp-add');
   const mcpTarget = document.getElementById('mcp-target');
   const mcpModalStatus = document.getElementById('mcp-modal-status');
@@ -1026,6 +1056,44 @@
     }
     mcpEnabled.checked = Boolean(data.enabled);
     mcpTimeout.value = data.timeoutMs ? String(data.timeoutMs) : '';
+    if (mcpFileServers) {
+      mcpFileServers.innerHTML = '';
+      const fileServers = data.fileServers || {};
+      const fileIds = Object.keys(fileServers);
+      const sources = Array.isArray(data.sources) ? data.sources : [];
+      if (fileIds.length > 0 || sources.length > 0 || (data.errors || []).length > 0) {
+        mcpFileServers.hidden = false;
+        if (sources.length) {
+          mcpFileServers.appendChild(
+            el('p', 'mcp-file-note', 'Read-only servers from config files: ' + sources.map((s) => s.path).join(', ')),
+          );
+        }
+        for (const id of fileIds) {
+          const cfg = fileServers[id] || {};
+          const row = el('div', 'mcp-file-server');
+          const name = el('span', 'mcp-file-name', id);
+          const detail = el(
+            'span',
+            'mcp-file-detail',
+            cfg.url ? 'http · ' + cfg.url : 'stdio · ' + (cfg.command || '?') + ' ' + ((cfg.args || []).join(' ')),
+          );
+          const badge = el('span', 'mcp-badge', 'config file');
+          const info = mcpServerStatus[id];
+          badge.classList.add(info && info.running ? 'ok' : info && info.error ? 'error' : 'off');
+          badge.title = info && info.error ? info.error : info && info.running ? (info.tools || 0) + ' tool(s)' : 'not running';
+          if (cfg.disabled) badge.title = 'disabled in the config file';
+          row.appendChild(name);
+          row.appendChild(detail);
+          row.appendChild(badge);
+          mcpFileServers.appendChild(row);
+        }
+        for (const error of data.errors || []) {
+          mcpFileServers.appendChild(el('p', 'mcp-file-error', error.path + ': ' + error.message));
+        }
+      } else {
+        mcpFileServers.hidden = true;
+      }
+    }
     mcpServerList.innerHTML = '';
     const servers = data.servers || {};
     const ids = Object.keys(servers);

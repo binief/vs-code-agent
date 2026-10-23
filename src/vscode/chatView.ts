@@ -91,7 +91,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this.controller.reloadMcpServers();
         break;
       case 'get-mcp-settings':
-        this.post({ type: 'mcp-settings', ...this.controller.getMcpSettings() });
+        this.post({ type: 'mcp-settings', ...(await this.controller.getMcpSettings()) });
+        break;
+      case 'open-agents':
+        await this.controller.openAgentInstructions();
+        break;
+      case 'preview-context':
+        await this.controller.previewContext();
         break;
       case 'save-mcp-settings':
         await this.controller.saveMcpSettings({
@@ -162,6 +168,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <span class="headline-text" id="status-text">Idle</span>
       </div>
       <div class="headline-actions">
+        <button class="icon-btn" id="btn-agents" title="Open the agent instruction files">Agents</button>
         <button class="icon-btn" id="btn-compact" title="Compact conversation to free context">Compact</button>
         <button class="icon-btn" id="btn-mcp" title="MCP servers — configure and reload">MCP</button>
         <button class="icon-btn" id="btn-revert" title="Undo the file changes from the last task">Revert</button>
@@ -173,11 +180,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <div class="meta">
       <span class="chip" id="chip-provider">provider</span>
       <span class="chip" id="chip-policy">policy</span>
+      <span class="chip agents" id="chip-agents" title="Agent instruction files">agents: –</span>
       <span class="chip" id="chip-stream" title="Token-by-token rendering of model output">stream</span>
       <span class="chip" id="chip-thinking" title="The model's reasoning stream, when the backend provides one">thinking</span>
       <span class="chip tokens" id="chip-tokens" title="Total tokens used (input + output)">0 tokens</span>
       <span class="chip speed" id="chip-speed" title="Current generation speed" hidden>0 tok/s</span>
-      <span class="chip context" id="chip-context" title="Context window utilisation">ctx 0%</span>
+      <span class="chip context" id="chip-context" title="Context window utilisation — click to preview the system context">ctx 0%</span>
       <span class="chip mcp" id="chip-mcp" title="MCP servers" hidden>mcp: off</span>
       <span class="chip" id="chip-workspace" title=""></span>
     </div>
@@ -202,8 +210,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <main class="stream" id="stream">
       <div class="empty" id="empty">
         <h2>Coding Harness</h2>
-        <p>Describe a coding task and the agent will explore the workspace, edit files and run commands through
-        its sandboxed tool set. Every change is checkpointed and can be reverted.</p>
+        <p>Describe a coding task and the agent will work through its tool set — read, search, create, edit files
+        and run commands — with every change checkpointed and revertable.</p>
+        <p class="empty-note">Instructions come from your <code>AGENTS.md</code> / <code>agent.md</code> files.
+        The extension ships no built-in prompt; open <strong>Agents</strong> to add one.</p>
         <ul class="examples" id="examples">
           <li data-prompt="Explain the structure of this project and list the main entry points.">Explain this project</li>
           <li data-prompt="Find the function that handles configuration loading and summarise what it does.">Find a function</li>
@@ -246,6 +256,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             <label for="mcp-timeout">Tool call timeout (ms)</label>
             <input type="number" id="mcp-timeout" min="1000" step="500" />
           </div>
+          <div class="mcp-file-list" id="mcp-file-servers" hidden></div>
           <div class="server-list" id="mcp-server-list"></div>
           <button class="linklike" id="mcp-add">+ Add server</button>
           <div class="mcp-help">
@@ -262,7 +273,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               <code>Authorization: Bearer …</code>
             </p>
             <p>
-              Saved to <code>codingHarness.mcp.*</code>; servers (re)connect on save or via Reload.
+              These settings live in <code>codingHarness.mcp.*</code>. Servers are also read from
+              <code>.vscode/mcp.json</code>, <code>.mcp.json</code> and <code>mcp.json</code>; those appear
+              read-only above and settings override a file entry with the same name. Servers (re)connect on
+              save or via Reload.
             </p>
           </div>
         </div>

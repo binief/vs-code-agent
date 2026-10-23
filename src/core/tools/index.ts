@@ -1,4 +1,4 @@
-import { deleteFileTool, listFilesTool, readFileTool, replaceInFileTool, writeFileTool } from './fsTools';
+import { createFileTool, deleteFileTool, listFilesTool, readFileTool, replaceInFileTool, writeFileTool } from './fsTools';
 import { getDiagnosticsTool, openFileTool } from './hostTools';
 import { searchTextTool } from './searchTools';
 import { runCommandTool, runShellCommand } from './shellTool';
@@ -13,6 +13,7 @@ export function createDefaultTools(): Tool[] {
     listFilesTool as Tool,
     readFileTool as Tool,
     searchTextTool as Tool,
+    createFileTool as Tool,
     writeFileTool as Tool,
     replaceInFileTool as Tool,
     deleteFileTool as Tool,
@@ -66,7 +67,7 @@ export class ToolRegistry {
   }
 }
 
-export { deleteFileTool, listFilesTool, readFileTool, replaceInFileTool, writeFileTool };
+export { createFileTool, deleteFileTool, listFilesTool, readFileTool, replaceInFileTool, writeFileTool };
 export { getDiagnosticsTool, openFileTool };
 export { searchTextTool };
 export { runCommandTool, runShellCommand };

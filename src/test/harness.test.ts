@@ -11,7 +11,7 @@ import { evaluateCommand } from '../core/policy';
 import { MockPlannerProvider } from '../core/providers/mock';
 import { ToolRegistry } from '../core/tools';
 import { listFilesTool } from '../core/tools/fsTools';
-import { deleteFileTool, readFileTool, replaceInFileTool, writeFileTool } from '../core/tools/fsTools';
+import { createFileTool, deleteFileTool, readFileTool, replaceInFileTool, writeFileTool } from '../core/tools/fsTools';
 import { searchTextTool } from '../core/tools/searchTools';
 import { runCommandTool } from '../core/tools/shellTool';
 import {
@@ -199,6 +199,23 @@ test('write_file creates files with the right content and checkpoints them', asy
 
   await ctx.checkpoints.revertAll();
   assert.ok(!fs.existsSync(path.join(root, 'src/hello.py')));
+});
+
+test('create_file creates without overwriting and defaults to empty content', async () => {
+  const root = makeTempWorkspace();
+  const ctx = makeContext(root, new FakeHost(root));
+
+  const created = await createFileTool.run({ path: 'notes.txt', content: 'hello\n' }, ctx);
+  assert.equal(created.ok, true);
+  assert.equal(fs.readFileSync(path.join(root, 'notes.txt'), 'utf8'), 'hello\n');
+
+  const again = await createFileTool.run({ path: 'notes.txt', content: 'replaced' }, ctx);
+  assert.equal(again.ok, false, 'create_file must not overwrite an existing file');
+  assert.equal(fs.readFileSync(path.join(root, 'notes.txt'), 'utf8'), 'hello\n');
+
+  const empty = await createFileTool.run({ path: 'empty.txt' }, ctx);
+  assert.equal(empty.ok, true);
+  assert.equal(fs.readFileSync(path.join(root, 'empty.txt'), 'utf8'), '');
 });
 
 test('write_file is skipped when the user rejects it', async () => {
@@ -452,7 +469,7 @@ test('editPolicy=auto applies edits without prompting', async () => {
   const host = new FakeHost(root, { decision: 'reject' });
   const session = new HarnessSession({
     host,
-    config: { ...DEFAULT_CONFIG, provider: 'mock', editPolicy: 'auto', maxSteps: 8, includeDiagnosticsInPrompt: false },
+    config: { ...DEFAULT_CONFIG, provider: 'mock', editPolicy: 'auto', maxSteps: 8, context: { ...DEFAULT_CONFIG.context, diagnostics: false } },
     provider: new MockPlannerProvider(),
   });
 
@@ -469,6 +486,7 @@ test('the default registry exposes the documented tools', () => {
     'list_files',
     'read_file',
     'search_text',
+    'create_file',
     'write_file',
     'replace_in_file',
     'delete_file',

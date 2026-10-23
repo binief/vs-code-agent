@@ -17,6 +17,7 @@ import { toAnthropicMessages, toOpenAiMessages } from '../core/providers';
 import { MockPlannerProvider } from '../core/providers/mock';
 import { ToolRegistry } from '../core/tools';
 import {
+  DEFAULT_CONFIG,
   resolveConfig,
   type ChatMessage,
   type ChatRequest,
@@ -145,7 +146,7 @@ test('runTask attaches images to the user turn and keeps them in history', async
   const provider = new CapturingProvider();
   const session = new HarnessSession({
     host: stubHost(fs.realpathSync(path.resolve('.'))),
-    config: resolveConfig({ provider: 'mock', maxSteps: 1, stream: false, includeDiagnosticsInPrompt: false }),
+    config: resolveConfig({ provider: 'mock', maxSteps: 1, stream: false, context: { ...DEFAULT_CONFIG.context, diagnostics: false } }),
     provider,
     registry: new ToolRegistry([]),
   });
@@ -162,7 +163,7 @@ test('an image with no prompt text still gets an instruction', async () => {
   const provider = new CapturingProvider();
   const session = new HarnessSession({
     host: stubHost(fs.realpathSync(path.resolve('.'))),
-    config: resolveConfig({ provider: 'mock', maxSteps: 1, stream: false, includeDiagnosticsInPrompt: false }),
+    config: resolveConfig({ provider: 'mock', maxSteps: 1, stream: false, context: { ...DEFAULT_CONFIG.context, diagnostics: false } }),
     provider,
     registry: new ToolRegistry([]),
   });

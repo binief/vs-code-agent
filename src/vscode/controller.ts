@@ -1,20 +1,33 @@
+import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { HarnessSession } from '../core/agent';
+import { agentFilesSummary, discoverAgentFiles, type AgentFilesResult } from '../core/agentFiles';
+import { buildSystemPrompt, summarizeDiagnostics } from '../core/prompt';
 import { apiKeyFromEnv, createProvider } from '../core/providers';
 import { createDefaultTools, ToolRegistry } from '../core/tools';
 import { McpManager, sanitizeMcpServers } from '../core/tools/mcp';
+import {
+  loadMcpConfigFiles,
+  mergeMcpServers,
+  type McpConfigError,
+  type McpConfigSource,
+  type McpFileConfig,
+  type McpInputSpec,
+} from '../core/tools/mcpConfig';
 import { normalizeImages, toDataUrl, type RawImageInput } from '../core/images';
 import {
   DEFAULT_CONFIG,
   resolveConfig,
   type ApprovalRequest,
+  type AgentInstructionFile,
   type ImageAttachment,
   type HarnessConfig,
   type McpServerConfig,
   type HarnessEvent,
   type TaskOutcome,
   type Usage,
+  type WorkspaceContext,
 } from '../core/types';
 import type { ApprovalService } from './host';
 import { VsCodeHost } from './host';
@@ -100,6 +113,12 @@ export interface UiState {
   mcpEnabled?: boolean;
   mcpServers?: number;
   mcpToolCount?: number;
+  mcpConfigured?: number;
+  mcpSources?: McpConfigSource[];
+  /** Agent instruction files loaded for the most recent task. */
+  agentFiles?: AgentInstructionFile[];
+  agentFilesEnabled?: boolean;
+  agentFilesCount?: number;
 }
 
 /** Live status of one configured MCP server, shown in the settings dialog. */
@@ -113,9 +132,15 @@ export interface McpServerStatus {
 export interface McpSettingsSnapshot {
   enabled: boolean;
   timeoutMs: number;
+  /** Servers stored in `codingHarness.mcp.servers` (editable in the dialog). */
   servers: Record<string, McpServerConfig>;
   status: Record<string, McpServerStatus>;
   supportsWorkspace: boolean;
+  /** Servers defined by config files; read-only in the dialog. */
+  fileServers?: Record<string, McpServerConfig>;
+  sources?: McpConfigSource[];
+  errors?: McpConfigError[];
+  loadFromFiles?: boolean;
 }
 
 const MAX_ITEMS = 400;
@@ -129,6 +154,16 @@ export class HarnessController {
   private session?: HarnessSession;
   private host?: VsCodeHost;
   private mcpManager?: McpManager;
+  /** Last loaded MCP config files (kept for the dialog and state). */
+  private mcpFileConfig?: McpFileConfig;
+  /** Signature of the servers the running manager was started with. */
+  private mcpSignature?: string;
+  private configuredMcpServers: Record<string, McpServerConfig> = {};
+  /** Instruction files discovered for the most recent task/refresh. */
+  private lastAgentFiles?: AgentFilesResult;
+  /** Values already entered for `${input:…}` MCP placeholders (per session). */
+  private readonly mcpInputCache = new Map<string, string>();
+  private agentNoticeShown = false;
   private items: TranscriptItem[] = [];
   private readonly listeners = new Set<(message: unknown) => void>();
   private counter = 0;
@@ -166,6 +201,11 @@ export class HarnessController {
     mcpEnabled: false,
     mcpServers: 0,
     mcpToolCount: 0,
+    mcpConfigured: 0,
+    mcpSources: [],
+    agentFiles: [],
+    agentFilesEnabled: true,
+    agentFilesCount: 0,
   };
   private cumulativeUsage: Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
   private lastTokensPerSecond = 0;
@@ -217,11 +257,37 @@ export class HarnessController {
     return folder ? folder.uri.fsPath : '';
   }
 
+  private static arrayOfStrings(value: unknown): string[] | undefined {
+    if (!Array.isArray(value)) return undefined;
+    return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim());
+  }
+
   readConfig(): HarnessConfig {
     const c = vscode.workspace.getConfiguration('codingHarness');
     const mcpConfig = c.get<Record<string, any>>('mcp.servers') ?? c.get('mcpServers') ?? {};
-    const mcpEnabled = c.get<boolean>('mcp.enabled') ?? c.get('mcpEnabled') ?? false;
-    const mcpTimeout = c.get<number>('mcp.timeoutMs') ?? c.get('mcpTimeoutMs') ?? 10000;
+    const mcpEnabled = c.get<boolean>('mcp.enabled') ?? c.get('mcpEnabled') ?? DEFAULT_CONFIG.mcp.enabled;
+    const mcpTimeout = c.get<number>('mcp.timeoutMs') ?? c.get('mcpTimeoutMs') ?? DEFAULT_CONFIG.mcp.timeoutMs;
+    const mcpLoadFromFiles = c.get<boolean>('mcp.loadFromFiles') ?? DEFAULT_CONFIG.mcp.loadFromFiles;
+    const mcpConfigFiles = HarnessController.arrayOfStrings(c.get('mcp.configFiles')) ?? DEFAULT_CONFIG.mcp.configFiles;
+
+    // Agent instruction files: there is no built-in prompt, so this config is
+    // the only source of behavioural instructions.
+    const agentEnabled = c.get<boolean>('agentFiles.enabled') ?? DEFAULT_CONFIG.agentFiles.enabled;
+    const agentNames = HarnessController.arrayOfStrings(c.get('agentFiles.names')) ?? DEFAULT_CONFIG.agentFiles.names;
+    const agentPatterns = HarnessController.arrayOfStrings(c.get('agentFiles.patterns')) ?? DEFAULT_CONFIG.agentFiles.patterns;
+    const agentIncludeUser = c.get<boolean>('agentFiles.includeUser') ?? DEFAULT_CONFIG.agentFiles.includeUser;
+    const agentUserPath = c.get<string>('agentFiles.userPath') || DEFAULT_CONFIG.agentFiles.userPath;
+    const agentScanNested = c.get<boolean>('agentFiles.scanNested') ?? DEFAULT_CONFIG.agentFiles.scanNested;
+    const agentMaxDepth = c.get<number>('agentFiles.maxDepth') ?? DEFAULT_CONFIG.agentFiles.maxDepth;
+    const agentMaxBytes = c.get<number>('agentFiles.maxBytes') ?? DEFAULT_CONFIG.agentFiles.maxBytes;
+    const agentMaxTotal = c.get<number>('agentFiles.maxTotalBytes') ?? DEFAULT_CONFIG.agentFiles.maxTotalBytes;
+    const agentExtraPaths = HarnessController.arrayOfStrings(c.get('agentFiles.extraPaths')) ?? DEFAULT_CONFIG.agentFiles.extraPaths;
+
+    const contextEnvironment = c.get<boolean>('context.environment') ?? DEFAULT_CONFIG.context.environment;
+    const contextWorkspace = c.get<boolean>('context.workspace') ?? DEFAULT_CONFIG.context.workspace;
+    const contextFiles = c.get<boolean>('context.files') ?? DEFAULT_CONFIG.context.files;
+    const contextDiagnostics = c.get<boolean>('context.diagnostics') ?? DEFAULT_CONFIG.context.diagnostics;
+    const contextTools = c.get<boolean>('context.tools') ?? DEFAULT_CONFIG.context.tools;
 
     // Support both new and legacy compaction settings
     const compactionEnabled = c.get<boolean>('compaction.enabled') ?? c.get('autoCompact') ?? true;
@@ -245,14 +311,33 @@ export class HarnessController {
       allowOutsideWorkspace: c.get('allowOutsideWorkspace'),
       maxFileBytes: c.get('maxFileBytes'),
       lineEndings: c.get('lineEndings'),
-      includeDiagnosticsInPrompt: c.get('includeDiagnosticsInPrompt'),
-      systemPromptExtra: c.get('systemPromptExtra'),
       stream: c.get('stream'),
       showThinking: c.get('showThinking'),
+      agentFiles: {
+        enabled: Boolean(agentEnabled),
+        names: agentNames,
+        patterns: agentPatterns,
+        includeUser: Boolean(agentIncludeUser),
+        userPath: agentUserPath,
+        scanNested: Boolean(agentScanNested),
+        maxDepth: typeof agentMaxDepth === 'number' ? agentMaxDepth : DEFAULT_CONFIG.agentFiles.maxDepth,
+        maxBytes: typeof agentMaxBytes === 'number' ? agentMaxBytes : DEFAULT_CONFIG.agentFiles.maxBytes,
+        maxTotalBytes: typeof agentMaxTotal === 'number' ? agentMaxTotal : DEFAULT_CONFIG.agentFiles.maxTotalBytes,
+        extraPaths: agentExtraPaths,
+      },
+      context: {
+        environment: Boolean(contextEnvironment),
+        workspace: Boolean(contextWorkspace),
+        files: Boolean(contextFiles),
+        diagnostics: Boolean(contextDiagnostics),
+        tools: Boolean(contextTools),
+      },
       mcp: {
         enabled: Boolean(mcpEnabled),
         servers: (mcpConfig as Record<string, any>) || {},
-        timeoutMs: typeof mcpTimeout === 'number' ? mcpTimeout : 10000,
+        timeoutMs: typeof mcpTimeout === 'number' ? mcpTimeout : DEFAULT_CONFIG.mcp.timeoutMs,
+        loadFromFiles: Boolean(mcpLoadFromFiles),
+        configFiles: mcpConfigFiles,
       },
       compaction: {
         enabled: Boolean(compactionEnabled),
@@ -303,29 +388,36 @@ export class HarnessController {
       });
     }
 
-    // Handle MCP servers
-    let toolRegistry: ToolRegistry | undefined;
-    if (config.mcp.enabled && Object.keys(config.mcp.servers).length > 0) {
+    // MCP servers come from workspace config files and settings; both are
+    // re-read here so editing `.mcp.json` is picked up on the next task.
+    const mcp = await this.resolveMcpServers(config, root);
+    let toolRegistry: ToolRegistry;
+    const signature = JSON.stringify({ servers: mcp.servers, timeout: config.mcp.timeoutMs });
+    if (config.mcp.enabled && Object.keys(mcp.servers).length > 0) {
       try {
-        if (this.mcpManager) {
-          await this.mcpManager.stopAll();
-        }
-        this.mcpManager = new McpManager(root, config.mcp.timeoutMs);
-        const { started, failed } = await this.mcpManager.startServers(config.mcp.servers);
-        if (started.length > 0) {
-          this.log.info(`MCP: started ${started.length} server(s): ${started.join(', ')}`);
-          this.post({ type: 'mcp-status', enabled: true, servers: started.length, tools: this.mcpManager.toolCount });
-        }
-        if (failed.length > 0) {
-          for (const f of failed) {
-            this.log.warn(`MCP server ${f.id} failed: ${f.error}`);
-            this.pushNotice('warn', `MCP server "${f.id}" failed to start: ${f.error}`);
+        if (this.mcpManager && this.mcpSignature === signature) {
+          // Same servers as the running manager: keep its live connections.
+          toolRegistry = new ToolRegistry([...createDefaultTools(), ...this.mcpManager.getTools()]);
+        } else {
+          if (this.mcpManager) {
+            await this.mcpManager.stopAll();
           }
+          this.mcpManager = new McpManager(root, config.mcp.timeoutMs);
+          const { started, failed } = await this.mcpManager.startServers(mcp.servers);
+          this.mcpSignature = signature;
+          if (started.length > 0) {
+            this.log.info(`MCP: started ${started.length} server(s): ${started.join(', ')}`);
+            this.post({ type: 'mcp-status', enabled: true, servers: started.length, tools: this.mcpManager.toolCount });
+          }
+          if (failed.length > 0) {
+            for (const f of failed) {
+              this.log.warn(`MCP server ${f.id} failed: ${f.error}`);
+              this.pushNotice('warn', `MCP server "${f.id}" failed to start: ${f.error}`);
+            }
+          }
+          toolRegistry = new ToolRegistry([...createDefaultTools(), ...this.mcpManager.getTools()]);
+          this.log.info(`MCP: loaded ${this.mcpManager.toolCount} tool(s) from ${started.length} server(s)`);
         }
-        const defaultTools = createDefaultTools();
-        const mcpTools = this.mcpManager.getTools();
-        toolRegistry = new ToolRegistry([...defaultTools, ...mcpTools]);
-        this.log.info(`MCP: loaded ${mcpTools.length} tools from ${started.length} servers`);
       } catch (err) {
         this.log.warn(`MCP initialization failed: ${(err as Error).message}`);
         this.pushNotice('warn', `MCP initialization failed: ${(err as Error).message}`);
@@ -336,6 +428,7 @@ export class HarnessController {
         await this.mcpManager.stopAll();
         this.mcpManager = undefined;
       }
+      this.mcpSignature = undefined;
       toolRegistry = new ToolRegistry(createDefaultTools());
     }
 
@@ -376,10 +469,61 @@ export class HarnessController {
       mcpEnabled: config.mcp.enabled,
       mcpServers: this.mcpManager?.serverCount ?? 0,
       mcpToolCount: this.mcpManager?.toolCount ?? 0,
+      mcpConfigured: Object.keys(mcp.servers).length,
+      mcpSources: mcp.sources,
       cumulativeUsage: this.cumulativeUsage,
       tokensPerSecond: this.lastTokensPerSecond,
     };
     return this.session;
+  }
+
+  /* -------------------------------------------------------- mcp config */
+
+  /**
+   * Merge MCP servers from workspace config files with the ones stored in
+   * settings. Settings win. `${input:…}` placeholders are resolved through an
+   * editor input box so `.vscode/mcp.json` can keep secrets out of the file.
+   */
+  private async resolveMcpServers(
+    config: HarnessConfig,
+    root: string,
+  ): Promise<{ servers: Record<string, McpServerConfig>; sources: McpConfigSource[] }> {
+    let fileConfig: McpFileConfig | undefined;
+    if (config.mcp.enabled && config.mcp.loadFromFiles && config.mcp.configFiles.length > 0) {
+      fileConfig = await loadMcpConfigFiles(root, config.mcp.configFiles, {
+        resolveInput: (input) => this.promptForMcpInput(input),
+      });
+      this.mcpFileConfig = fileConfig;
+      for (const error of fileConfig.errors) {
+        this.log.warn(`MCP config ${error.path}: ${error.message}`);
+        this.pushNotice('warn', `MCP config ${error.path}: ${error.message}`);
+      }
+      if (fileConfig.sources.length > 0) {
+        this.log.info(
+          `MCP config files: ${fileConfig.sources
+            .map((source) => `${source.path} (${source.serverIds.length} server(s))`)
+            .join(', ')}`,
+        );
+      }
+    } else {
+      this.mcpFileConfig = undefined;
+    }
+    const merged = mergeMcpServers(fileConfig, config.mcp.servers);
+    this.configuredMcpServers = merged.servers;
+    return { servers: merged.servers, sources: fileConfig?.sources ?? [] };
+  }
+
+  private async promptForMcpInput(input: McpInputSpec): Promise<string | undefined> {
+    const cached = this.mcpInputCache.get(input.id);
+    if (cached !== undefined) return cached;
+    const value = await vscode.window.showInputBox({
+      title: `MCP input: ${input.id}`,
+      prompt: input.description ?? `Value for ${input.id}`,
+      password: input.password === true,
+      ignoreFocusOut: true,
+    });
+    if (value !== undefined) this.mcpInputCache.set(input.id, value);
+    return value;
   }
 
   /** Re-read settings (called on configuration change). */
@@ -402,6 +546,9 @@ export class HarnessController {
         mcpEnabled: config.mcp.enabled,
         mcpServers: this.mcpManager?.serverCount ?? 0,
         mcpToolCount: this.mcpManager?.toolCount ?? 0,
+        mcpConfigured: Object.keys(this.configuredMcpServers).length,
+        mcpSources: this.mcpFileConfig?.sources ?? [],
+        agentFilesEnabled: config.agentFiles.enabled,
         cumulativeUsage: this.cumulativeUsage,
         tokensPerSecond: this.lastTokensPerSecond,
       };
@@ -523,43 +670,60 @@ export class HarnessController {
     const root = this.workspaceRoot();
     if (!root) {
       void vscode.window.showErrorMessage('Open a folder first.');
-      this.postMcpSettings();
+      void this.postMcpSettings();
       return;
     }
     const config = this.readConfig();
     if (!config.mcp.enabled) {
       void vscode.window.showInformationMessage('MCP is disabled. Enable codingHarness.mcp.enabled in settings.');
-      this.postMcpSettings();
+      void this.postMcpSettings();
       return;
     }
     try {
+      const mcp = await this.resolveMcpServers(config, root);
       if (this.mcpManager) await this.mcpManager.stopAll();
-      this.mcpManager = new McpManager(root, config.mcp.timeoutMs);
-      const { started, failed } = await this.mcpManager.startServers(config.mcp.servers);
+      let started = 0;
+      let failed: { id: string; error: string }[] = [];
+      if (Object.keys(mcp.servers).length > 0) {
+        this.mcpManager = new McpManager(root, config.mcp.timeoutMs);
+        const result = await this.mcpManager.startServers(mcp.servers);
+        started = result.started.length;
+        failed = result.failed;
+      } else {
+        this.mcpManager = undefined;
+      }
+      this.mcpSignature = JSON.stringify({ servers: mcp.servers, timeout: config.mcp.timeoutMs });
+      const toolCount = this.mcpManager?.toolCount ?? 0;
       this.state = {
         ...this.state,
-        mcpServers: started.length,
-        mcpToolCount: this.mcpManager.toolCount,
+        mcpServers: started,
+        mcpToolCount: toolCount,
+        mcpConfigured: Object.keys(mcp.servers).length,
+        mcpSources: mcp.sources,
       };
       this.post({ type: 'state', state: this.state });
-      this.post({ type: 'mcp-status', enabled: true, servers: started.length, tools: this.mcpManager.toolCount });
+      this.post({ type: 'mcp-status', enabled: true, servers: started, tools: toolCount });
 
-      if (started.length > 0) {
-        void vscode.window.showInformationMessage(`MCP: started ${started.length} server(s) with ${this.mcpManager.toolCount} tools.`);
-        this.log.info(`MCP reload: ${started.length} servers, ${this.mcpManager.toolCount} tools`);
+      if (started > 0) {
+        void vscode.window.showInformationMessage(`MCP: started ${started} server(s) with ${toolCount} tool(s).`);
+        this.log.info(`MCP reload: ${started} server(s), ${toolCount} tool(s)`);
       }
       if (failed.length > 0) {
-        for (const f of failed) {
-          this.pushNotice('warn', `MCP server "${f.id}" failed: ${f.error}`);
+        for (const failure of failed) {
+          this.pushNotice('warn', `MCP server "${failure.id}" failed: ${failure.error}`);
         }
       }
-      // Recreate session with new tools
+      // Recreate the session so it picks up the new tool registry while
+      // keeping the conversation intact.
       if (this.session && this.host) {
-        const defaultTools = createDefaultTools();
-        const mcpTools = this.mcpManager.getTools();
-        const registry = new ToolRegistry([...defaultTools, ...mcpTools]);
+        const registry = new ToolRegistry([...createDefaultTools(), ...(this.mcpManager?.getTools() ?? [])]);
         const oldHistory = this.session.transcript;
-        this.session = new HarnessSession({ host: this.host, config, provider: createProvider({ config, apiKey: await this.resolveApiKey(config) }), registry });
+        this.session = new HarnessSession({
+          host: this.host,
+          config,
+          provider: createProvider({ config, apiKey: await this.resolveApiKey(config) }),
+          registry,
+        });
         (this.session as any).history = [...oldHistory];
         (this.session as any).cumulativeUsage = { ...this.cumulativeUsage };
         this.state = { ...this.state, toolCount: registry.size };
@@ -569,17 +733,22 @@ export class HarnessController {
       void vscode.window.showErrorMessage(`MCP reload failed: ${(err as Error).message}`);
       this.log.error(`MCP reload failed: ${(err as Error).message}`);
     }
-    this.postMcpSettings();
+    void this.postMcpSettings();
   }
 
   /* MCP settings dialog ---------------------------------------------------- */
 
   /** Editable MCP settings plus live per-server status, for the panel dialog. */
-  getMcpSettings(): McpSettingsSnapshot {
+  async getMcpSettings(): Promise<McpSettingsSnapshot> {
     const config = this.readConfig();
+    const root = this.workspaceRoot();
+    const fileConfig = await this.ensureMcpFileConfig(config, root);
+    const fileServers: Record<string, McpServerConfig> = { ...(fileConfig?.servers ?? {}) };
+    // Servers also present in settings are edited there; the settings value wins.
+    for (const id of Object.keys(config.mcp.servers)) delete fileServers[id];
     const status: Record<string, McpServerStatus> = {};
     const running = new Set(this.mcpManager?.serverIds ?? []);
-    for (const id of Object.keys(config.mcp.servers)) {
+    for (const id of new Set([...Object.keys(config.mcp.servers), ...Object.keys(fileServers)])) {
       status[id] = {
         running: running.has(id),
         tools: running.has(id) ? (this.mcpManager?.toolsOf(id) ?? 0) : 0,
@@ -591,12 +760,26 @@ export class HarnessController {
       timeoutMs: config.mcp.timeoutMs,
       servers: config.mcp.servers,
       status,
-      supportsWorkspace: Boolean(this.workspaceRoot()),
+      supportsWorkspace: Boolean(root),
+      fileServers,
+      sources: fileConfig?.sources ?? [],
+      errors: fileConfig?.errors ?? [],
+      loadFromFiles: config.mcp.loadFromFiles,
     };
   }
 
-  private postMcpSettings(): void {
-    this.post({ type: 'mcp-settings', ...this.getMcpSettings() });
+  /** Load the file-based server map once for the dialog without prompting twice. */
+  private async ensureMcpFileConfig(config: HarnessConfig, root: string): Promise<McpFileConfig | undefined> {
+    if (!root || !config.mcp.enabled || !config.mcp.loadFromFiles) return undefined;
+    if (this.mcpFileConfig) return this.mcpFileConfig;
+    this.mcpFileConfig = await loadMcpConfigFiles(root, config.mcp.configFiles, {
+      resolveInput: (input) => this.promptForMcpInput(input),
+    });
+    return this.mcpFileConfig;
+  }
+
+  private async postMcpSettings(): Promise<void> {
+    this.post({ type: 'mcp-settings', ...(await this.getMcpSettings()) });
   }
 
   /** Persist the dialog payload to settings, then (re)connect the servers. */
@@ -634,7 +817,10 @@ export class HarnessController {
         await this.mcpManager.stopAll();
         this.mcpManager = undefined;
       }
-      this.state = { ...this.state, mcpEnabled: false, mcpServers: 0, mcpToolCount: 0 };
+      this.mcpFileConfig = undefined;
+      this.mcpSignature = undefined;
+      this.configuredMcpServers = {};
+      this.state = { ...this.state, mcpEnabled: false, mcpServers: 0, mcpToolCount: 0, mcpConfigured: 0 };
       this.post({ type: 'state', state: this.state });
       this.post({ type: 'mcp-status', enabled: false, servers: 0, tools: 0 });
       // Swap a live session back to the built-in tools so disabled servers go quiet.
@@ -656,7 +842,190 @@ export class HarnessController {
     }
     this.pushNotice('info', `MCP settings saved (${toWorkspace ? 'workspace' : 'user'}): ${Object.keys(servers).length} server(s) configured.`);
     this.post({ type: 'mcp-settings-saved', ok: true });
-    this.postMcpSettings();
+    await this.postMcpSettings();
+  }
+
+  /* ------------------------------------------------------ agent instructions */
+
+  private async collectWorkspaceContext(): Promise<WorkspaceContext | undefined> {
+    if (this.host) {
+      try {
+        return await this.host.getWorkspaceContext?.();
+      } catch (err) {
+        this.log.warn(`workspace context unavailable: ${(err as Error).message}`);
+        return undefined;
+      }
+    }
+    // Before the first task there is no host yet; the editor itself still
+    // knows which files are open, and those decide which nested agent files
+    // apply.
+    try {
+      const openFiles = (vscode.workspace.textDocuments ?? [])
+        .filter((doc) => doc.uri.scheme === 'file')
+        .map((doc) => ({ path: vscode.workspace.asRelativePath(doc.uri, false) }))
+        .slice(0, 30);
+      return { openFiles, folders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath) };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Re-read the agent files and publish the result to the panel. */
+  async refreshAgentFiles(notify = false): Promise<AgentFilesResult | undefined> {
+    const root = this.workspaceRoot();
+    const config = this.readConfig();
+    if (!root) {
+      this.lastAgentFiles = undefined;
+      this.state = { ...this.state, agentFiles: [], agentFilesCount: 0, agentFilesEnabled: config.agentFiles.enabled };
+      this.post({ type: 'state', state: this.state });
+      return undefined;
+    }
+    const workspace = await this.collectWorkspaceContext();
+    const result = discoverAgentFiles({
+      root,
+      config: config.agentFiles,
+      focusPaths: (workspace?.openFiles ?? []).map((file) => file.path),
+    });
+    this.lastAgentFiles = result;
+    this.state = {
+      ...this.state,
+      agentFiles: result.files.map((file) => ({
+        displayPath: file.displayPath,
+        absolutePath: file.path,
+        scope: file.scope,
+        origin: file.origin,
+        bytes: file.bytes,
+        truncated: file.truncated,
+      })),
+      agentFilesCount: result.files.length,
+      agentFilesEnabled: result.enabled,
+    };
+    this.post({ type: 'state', state: this.state });
+    this.log.info(`agent files: ${agentFilesSummary(result)}${result.skipped.length ? ` (${result.skipped.length} skipped)` : ''}`);
+    if (notify) {
+      const skipped = result.skipped.length ? ` ${result.skipped.length} path(s) skipped.` : '';
+      void vscode.window.showInformationMessage(
+        `Coding Harness: ${agentFilesSummary(result)} (${result.totalBytes} bytes loaded).${skipped}`,
+      );
+    }
+    return result;
+  }
+
+  /** Open one of the loaded agent files, or offer to create one. */
+  async openAgentInstructions(): Promise<void> {
+    const result = await this.refreshAgentFiles();
+    const root = this.workspaceRoot();
+    if (!root) {
+      void vscode.window.showErrorMessage('Open a folder first.');
+      return;
+    }
+    if (!result || !result.enabled) {
+      const enable = await vscode.window.showInformationMessage(
+        'Agent instructions are disabled. Enable codingHarness.agentFiles.enabled to load agent.md files.',
+        'Open Settings',
+      );
+      if (enable === 'Open Settings') {
+        await vscode.commands.executeCommand('workbench.action.openSettings', 'codingHarness.agentFiles');
+      }
+      return;
+    }
+    if (result.files.length === 0) {
+      const create = await vscode.window.showInformationMessage(
+        'No instruction files were found. The extension has no built-in prompt — instructions come from these files (any .md file under .agents/ works).',
+        'Create agent.md',
+      );
+      if (create === 'Create agent.md') await this.createAgentFile();
+      return;
+    }
+    if (result.files.length === 1) {
+      await this.openFile(result.files[0].path);
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      result.files.map((file) => ({
+        label: file.displayPath,
+        description: file.origin === 'user' ? 'user-level' : file.scope ? `applies to ${file.scope}/**` : 'workspace root',
+        detail: `${file.bytes} bytes${file.truncated ? ' (truncated)' : ''}`,
+        file,
+      })),
+      { title: 'Coding Harness — agent instruction files', placeHolder: 'Open an instruction file' },
+    );
+    if (picked) await this.openFile(picked.file.path);
+  }
+
+  /** Create a starter `agent.md` at the workspace root (user-initiated only). */
+  async createAgentFile(): Promise<void> {
+    const root = this.workspaceRoot();
+    if (!root) {
+      void vscode.window.showErrorMessage('Open a folder first.');
+      return;
+    }
+    const abs = path.join(root, 'agent.md');
+    if (fs.existsSync(abs)) {
+      await this.openFile(abs);
+      return;
+    }
+    const template = [
+      '# Agent instructions',
+      '',
+      '<!-- Everything below is sent with every task; the extension has no built-in prompt. -->',
+      '<!-- Add project conventions, commands to run, style rules and things to avoid. -->',
+      '',
+      '## Project',
+      '',
+      '## Commands',
+      '',
+      '## Conventions',
+      '',
+    ].join('\n');
+    try {
+      fs.writeFileSync(abs, template, 'utf8');
+    } catch (err) {
+      void vscode.window.showErrorMessage(`Could not create agent.md: ${(err as Error).message}`);
+      return;
+    }
+    await this.openFile(abs);
+    await this.refreshAgentFiles();
+    // Any .md under .agents/ is loaded too, so code-review.md / test.md work
+    // without touching settings; mention it where the user sees the template.
+    this.pushNotice(
+      'info',
+      'Created agent.md. Any .md file under .agents/ is also loaded as instructions (code-review.md, test.md, …).',
+    );
+  }
+
+  /**
+   * Show the exact system context that would be sent with the next task:
+   * environment, workspace, files, tool catalogue and the agent files.
+   */
+  async previewContext(): Promise<void> {
+    const root = this.workspaceRoot();
+    if (!root) {
+      void vscode.window.showErrorMessage('Open a folder first.');
+      return;
+    }
+    const config = this.readConfig();
+    const workspace = await this.collectWorkspaceContext();
+    const agentFiles = discoverAgentFiles({
+      root,
+      config: config.agentFiles,
+      focusPaths: (workspace?.openFiles ?? []).map((file) => file.path),
+    });
+    let diagnostics: string[] | undefined;
+    if (config.context.diagnostics) {
+      try {
+        const host = this.host ?? new VsCodeHost({ root, log: this.log, approvals: this.approvals });
+        const diags = await host.getDiagnostics();
+        if (diags.length) diagnostics = summarizeDiagnostics(diags);
+      } catch {
+        /* no diagnostics available */
+      }
+    }
+    const tools = this.session?.toolSpecs ?? new ToolRegistry(createDefaultTools()).specs();
+    const prompt = buildSystemPrompt({ root, config, tools, diagnostics, workspace, agentFiles });
+    const doc = await vscode.workspace.openTextDocument({ content: prompt, language: 'markdown' });
+    await vscode.window.showTextDocument(doc, { preview: false });
+    this.log.info(`context preview: ${prompt.length} chars, ${agentFiles.files.length} agent file(s)`);
   }
 
   /** Undo every file change made during the last task. */
@@ -700,7 +1069,7 @@ export class HarnessController {
   async openFile(relPath: string): Promise<void> {
     const root = this.workspaceRoot();
     if (!root) return;
-    const abs = path.join(root, relPath);
+    const abs = path.isAbsolute(relPath) ? relPath : path.join(root, relPath);
     void vscode.window.showTextDocument(vscode.Uri.file(abs), { preview: false, preserveFocus: false });
   }
 
@@ -859,6 +1228,29 @@ export class HarnessController {
         };
         this.post({ type: 'state', state: this.state });
         this.post({ type: 'context', contextTokens: event.contextTokens, contextWindow: event.contextWindow, contextPercent: event.contextPercent });
+        break;
+      }
+      case 'agent-files': {
+        this.state = {
+          ...this.state,
+          agentFiles: event.files,
+          agentFilesCount: event.files.length,
+          agentFilesEnabled: event.enabled,
+        };
+        this.post({ type: 'state', state: this.state });
+        if (event.enabled && event.files.length === 0 && !this.agentNoticeShown) {
+          this.agentNoticeShown = true;
+          this.pushNotice(
+            'info',
+            'No instruction files found. This extension has no built-in prompt — add AGENTS.md / agent.md, or any .md file under .agents/, to tell the agent how to work in this workspace.',
+          );
+        }
+        if (event.files.length > 0) {
+          this.log.info(
+            `agent files: ${event.files.map((file) => file.displayPath).join(', ')} (${event.totalBytes} bytes)` +
+              (event.skipped ? `, ${event.skipped} skipped` : ''),
+          );
+        }
         break;
       }
       case 'mcp-status': {

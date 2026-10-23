@@ -76,6 +76,32 @@ test('every contributed setting is actually read by the controller', () => {
   }
 });
 
+test('there is no built-in prompt setting; instructions come from agent files', () => {
+  const properties = Object.keys(manifest.contributes?.configuration?.properties ?? {});
+  assert.ok(!properties.includes('codingHarness.systemPromptExtra'), 'systemPromptExtra is a built-in prompt backdoor');
+  assert.ok(!properties.includes('codingHarness.includeDiagnosticsInPrompt'), 'diagnostics moved under codingHarness.context.*');
+  for (const key of [
+    'codingHarness.agentFiles.enabled',
+    'codingHarness.agentFiles.names',
+    'codingHarness.agentFiles.patterns',
+    'codingHarness.agentFiles.includeUser',
+    'codingHarness.agentFiles.userPath',
+    'codingHarness.agentFiles.maxDepth',
+    'codingHarness.agentFiles.maxBytes',
+    'codingHarness.agentFiles.maxTotalBytes',
+    'codingHarness.agentFiles.extraPaths',
+    'codingHarness.context.environment',
+    'codingHarness.context.workspace',
+    'codingHarness.context.files',
+    'codingHarness.context.diagnostics',
+    'codingHarness.context.tools',
+    'codingHarness.mcp.loadFromFiles',
+    'codingHarness.mcp.configFiles',
+  ]) {
+    assert.ok(properties.includes(key), `missing setting ${key}`);
+  }
+});
+
 test('the packaged file list keeps the runtime pieces', () => {
   const ignore = fs.readFileSync(path.join(repoRoot, '.vscodeignore'), 'utf8');
   assert.ok(!/^\s*out\/\*\*\s*$/m.test(ignore), '.vscodeignore must not exclude the compiled output');
@@ -94,6 +120,7 @@ test('tool documentation in the manifest matches the tool registry', () => {
     'list_files',
     'read_file',
     'search_text',
+    'create_file',
     'write_file',
     'replace_in_file',
     'delete_file',

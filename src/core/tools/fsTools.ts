@@ -252,6 +252,31 @@ export const writeFileTool: Tool<{
   },
 };
 
+/* ----------------------------------------------------------- create_file */
+
+/**
+ * Focused "make a new file" tool. It is the same write pipeline as
+ * {@link writeFileTool} with `mode: "create"`, so a model that reaches for
+ * "create" cannot silently clobber an existing file by accident.
+ */
+export const createFileTool: Tool<{ path: string; content?: string }> = {
+  name: 'create_file',
+  description:
+    'Create a new file (intermediate directories are created). Fails if the path already exists, so it is safe ' +
+    'against accidental overwrites. Use write_file to overwrite a whole file, or replace_in_file to edit one.',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: 'File path, workspace-relative.' },
+      content: { type: 'string', description: 'Initial file content. Defaults to an empty file.' },
+    },
+    required: ['path'],
+  },
+  async run(args, ctx): Promise<ToolResult> {
+    return writeFileTool.run({ path: args.path, content: args.content ?? '', mode: 'create' }, ctx);
+  },
+};
+
 /* ------------------------------------------------------- replace_in_file */
 
 export const replaceInFileTool: Tool<{

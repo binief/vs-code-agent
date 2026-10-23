@@ -140,6 +140,36 @@ export interface Diagnostic {
 }
 
 /**
+ * A file that is open in the editor, as the core sees it through the host.
+ * `path` is workspace-relative when the file lives inside the workspace.
+ */
+export interface OpenFileContext {
+  path: string;
+  languageId?: string;
+  dirty?: boolean;
+  lineCount?: number;
+  /** 1-based inclusive range, present when the user has a selection. */
+  selection?: { startLine: number; endLine: number };
+  /** True for the editor the user is currently focused on. */
+  active?: boolean;
+}
+
+/**
+ * Environment/workspace facts the editor can see but a plain Node process
+ * cannot. Everything here is rendered as context, never as instructions.
+ */
+export interface WorkspaceContext {
+  /** e.g. `Visual Studio Code 1.95.2`. */
+  editor?: { name: string; version: string };
+  /** Every folder of the workspace (the first one is the sandbox root). */
+  folders?: string[];
+  activeFile?: OpenFileContext;
+  openFiles?: OpenFileContext[];
+  /** Extra factual notes supplied by the host, e.g. workspace trust state. */
+  environment?: Record<string, string>;
+}
+
+/**
  * The editor surface the core needs. Only `workspaceRoot`, `log` and
  * `requestApproval` are required; the rest degrade gracefully.
  */
@@ -152,6 +182,8 @@ export interface HarnessHost {
   getDiagnostics?(relPath?: string): Promise<Diagnostic[]>;
   openFile?(absPath: string, line?: number): Promise<void>;
   notify?(message: string, kind?: 'info' | 'warn' | 'error'): void;
+  /** Editor/workspace facts used to build the context section of the prompt. */
+  getWorkspaceContext?(): WorkspaceContext | Promise<WorkspaceContext>;
 }
 
 /* --------------------------------------------------------------- config */
@@ -193,6 +225,47 @@ export interface McpConfig {
   enabled: boolean;
   servers: Record<string, McpServerConfig>;
   timeoutMs: number;
+  /** Also read server definitions from workspace config files (`.vscode/mcp.json`, `.mcp.json`, …). */
+  loadFromFiles: boolean;
+  /** Config files to read, relative to the workspace root or absolute. */
+  configFiles: string[];
+}
+
+export interface AgentFilesConfig {
+  /** Master switch for loading instructions. When off, the prompt contains context only. */
+  enabled: boolean;
+  /** Exact filenames searched in the workspace root and its subdirectories (case-insensitive). */
+  names: string[];
+  /** Glob patterns matched against the workspace-relative path, so `code-review.md`, `test.md`, … load too. */
+  patterns: string[];
+  /** Also read a user-level agent file that applies to every workspace. */
+  includeUser: boolean;
+  /** User-level agent file. `~` is expanded; a relative path is resolved against the home directory. */
+  userPath: string;
+  /** Scan every subdirectory up to `maxDepth`. When off, only the root, its config directories and the ancestors of open editors are loaded. */
+  scanNested: boolean;
+  /** How many directory levels below the workspace root are scanned when `scanNested` is on. */
+  maxDepth: number;
+  /** Per-file cap; larger files are truncated. */
+  maxBytes: number;
+  /** Total budget for all instructions in one prompt. Files that do not fit are skipped. */
+  maxTotalBytes: number;
+  /** Extra files to load (workspace-relative or absolute paths). */
+  extraPaths: string[];
+}
+
+/** Which context sections are appended to the system message. */
+export interface ContextConfig {
+  /** OS, shell, runtime, editor version, time, git state. */
+  environment: boolean;
+  /** Workspace layout and manifest summaries. */
+  workspace: boolean;
+  /** Open editors, active file and selection. */
+  files: boolean;
+  /** Current language-server problems. */
+  diagnostics: boolean;
+  /** The catalogue of available tool names and descriptions. */
+  tools: boolean;
 }
 
 export interface CompactionConfig {
@@ -225,13 +298,15 @@ export interface HarnessConfig {
   maxFileBytes: number;
   /** Newline style for files written by the agent; auto preserves existing files. */
   lineEndings: LineEndingPreference;
-  includeDiagnosticsInPrompt: boolean;
-  systemPromptExtra?: string;
   /** Stream model output token by token into the panel. */
   stream: boolean;
   /** Show the model's reasoning stream, when the backend provides one. */
   showThinking: boolean;
-  /** MCP servers configuration */
+  /** Instructions loaded from agent.md/AGENTS.md files. There is no built-in prompt. */
+  agentFiles: AgentFilesConfig;
+  /** Which factual context is included in the system message. */
+  context: ContextConfig;
+  /** MCP servers configuration (settings + workspace config files) */
   mcp: McpConfig;
   /** Conversation compaction configuration */
   compaction: CompactionConfig;
@@ -251,13 +326,33 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   allowOutsideWorkspace: false,
   maxFileBytes: 256 * 1024,
   lineEndings: 'auto',
-  includeDiagnosticsInPrompt: true,
   stream: true,
   showThinking: true,
+  agentFiles: {
+    enabled: true,
+    names: ['AGENTS.md', 'agent.md', 'agents.md', 'copilot-instructions.md'],
+    patterns: ['*.instructions.md'],
+    includeUser: false,
+    userPath: '~/.coding-harness/agent.md',
+    scanNested: false,
+    maxDepth: 2,
+    maxBytes: 64 * 1024,
+    maxTotalBytes: 128 * 1024,
+    extraPaths: [],
+  },
+  context: {
+    environment: true,
+    workspace: true,
+    files: true,
+    diagnostics: true,
+    tools: true,
+  },
   mcp: {
-    enabled: false,
+    enabled: true,
     servers: {},
     timeoutMs: 10_000,
+    loadFromFiles: true,
+    configFiles: ['.vscode/mcp.json', '.mcp.json', 'mcp.json'],
   },
   compaction: {
     enabled: true,
@@ -271,21 +366,49 @@ export const DEFAULT_CONFIG: HarnessConfig = {
 export function resolveConfig(partial: Partial<HarnessConfig> | undefined): HarnessConfig {
   const merged: HarnessConfig = {
     ...DEFAULT_CONFIG,
+    agentFiles: { ...DEFAULT_CONFIG.agentFiles, ...(partial?.agentFiles ?? {}) },
+    context: { ...DEFAULT_CONFIG.context, ...(partial?.context ?? {}) },
     mcp: { ...DEFAULT_CONFIG.mcp, ...(partial?.mcp ?? {}) },
     compaction: { ...DEFAULT_CONFIG.compaction, ...(partial?.compaction ?? {}) },
   };
   for (const [key, value] of Object.entries(partial ?? {})) {
-    if (key === 'mcp' || key === 'compaction') continue;
+    if (key === 'mcp' || key === 'compaction' || key === 'agentFiles' || key === 'context') continue;
     // Values explicitly set to undefined must not clobber a default: a settings
     // lookup that returns nothing would otherwise disable that feature.
     if (value !== undefined) (merged as unknown as Record<string, unknown>)[key] = value;
   }
-  // Deep merge for nested configs that might be partial
+  // Nested configs are resolved field by field so a partial object from the
+  // host cannot silently drop a default.
+  if (partial?.agentFiles) {
+    merged.agentFiles = {
+      enabled: partial.agentFiles.enabled ?? DEFAULT_CONFIG.agentFiles.enabled,
+      names: partial.agentFiles.names ?? DEFAULT_CONFIG.agentFiles.names,
+      patterns: partial.agentFiles.patterns ?? DEFAULT_CONFIG.agentFiles.patterns,
+      includeUser: partial.agentFiles.includeUser ?? DEFAULT_CONFIG.agentFiles.includeUser,
+      userPath: partial.agentFiles.userPath ?? DEFAULT_CONFIG.agentFiles.userPath,
+      scanNested: partial.agentFiles.scanNested ?? DEFAULT_CONFIG.agentFiles.scanNested,
+      maxDepth: partial.agentFiles.maxDepth ?? DEFAULT_CONFIG.agentFiles.maxDepth,
+      maxBytes: partial.agentFiles.maxBytes ?? DEFAULT_CONFIG.agentFiles.maxBytes,
+      maxTotalBytes: partial.agentFiles.maxTotalBytes ?? DEFAULT_CONFIG.agentFiles.maxTotalBytes,
+      extraPaths: partial.agentFiles.extraPaths ?? DEFAULT_CONFIG.agentFiles.extraPaths,
+    };
+  }
+  if (partial?.context) {
+    merged.context = {
+      environment: partial.context.environment ?? DEFAULT_CONFIG.context.environment,
+      workspace: partial.context.workspace ?? DEFAULT_CONFIG.context.workspace,
+      files: partial.context.files ?? DEFAULT_CONFIG.context.files,
+      diagnostics: partial.context.diagnostics ?? DEFAULT_CONFIG.context.diagnostics,
+      tools: partial.context.tools ?? DEFAULT_CONFIG.context.tools,
+    };
+  }
   if (partial?.mcp) {
     merged.mcp = {
       enabled: partial.mcp.enabled ?? DEFAULT_CONFIG.mcp.enabled,
       servers: partial.mcp.servers ?? DEFAULT_CONFIG.mcp.servers,
       timeoutMs: partial.mcp.timeoutMs ?? DEFAULT_CONFIG.mcp.timeoutMs,
+      loadFromFiles: partial.mcp.loadFromFiles ?? DEFAULT_CONFIG.mcp.loadFromFiles,
+      configFiles: partial.mcp.configFiles ?? DEFAULT_CONFIG.mcp.configFiles,
     };
   }
   if (partial?.compaction) {
@@ -302,6 +425,18 @@ export function resolveConfig(partial: Partial<HarnessConfig> | undefined): Harn
 }
 
 /* --------------------------------------------------------------- events */
+
+/** One instruction file that was loaded for a task, for display in the UI. */
+export interface AgentInstructionFile {
+  /** Path as shown to the user (workspace-relative, `~/…`, or absolute). */
+  displayPath: string;
+  absolutePath: string;
+  /** Workspace-relative directory the file governs; empty for the root. */
+  scope: string;
+  origin: 'user' | 'workspace';
+  bytes: number;
+  truncated: boolean;
+}
 
 export type HarnessEvent =
   | { type: 'status'; status: 'idle' | 'thinking' | 'executing' | 'approval' }
@@ -325,6 +460,13 @@ export type HarnessEvent =
   | { type: 'approval'; id: string; phase: 'resolved'; request: ApprovalRequest; decision: ApprovalDecision }
   | { type: 'usage'; step: number; usage: Usage; durationMs?: number; tokensPerSecond?: number; contextTokens?: number; contextWindow?: number; contextPercent?: number; cumulative?: Usage }
   | { type: 'context'; contextTokens: number; contextWindow: number; contextPercent: number }
+  | {
+      type: 'agent-files';
+      enabled: boolean;
+      files: AgentInstructionFile[];
+      totalBytes: number;
+      skipped: number;
+    }
   | { type: 'mcp-status'; enabled: boolean; servers: number; tools: number }
   | { type: 'notice'; message: string; level: 'info' | 'warn' | 'error' }
   | { type: 'done'; reason: TaskOutcome; summary: string; filesChanged: string[]; usage?: Usage; tokensPerSecond?: number };
