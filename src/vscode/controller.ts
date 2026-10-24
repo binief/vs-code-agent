@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { HarnessSession } from '../core/agent';
-import { agentFilesSummary, discoverAgentFiles, type AgentFilesResult } from '../core/agentFiles';
+import { agentFilesSummary, discoverAgentFiles, selectAgentFiles, type AgentFilesResult } from '../core/agentFiles';
 import { buildSystemPrompt, summarizeDiagnostics } from '../core/prompt';
 import { apiKeyFromEnv, createProvider } from '../core/providers';
 import { createDefaultTools, ToolRegistry } from '../core/tools';
@@ -115,11 +115,40 @@ export interface UiState {
   mcpToolCount?: number;
   mcpConfigured?: number;
   mcpSources?: McpConfigSource[];
-  /** Agent instruction files loaded for the most recent task. */
+  /** Agent instruction files active for the next task (after any pinned selection). */
   agentFiles?: AgentInstructionFile[];
   agentFilesEnabled?: boolean;
+  /** Active file count (what the panel chip shows first). */
   agentFilesCount?: number;
+  /** Files discovery found, before the pinned selection was applied. */
+  agentFilesAvailable?: number;
+  /** Pinned display paths, or absent when every discovered file is used. */
+  agentSelection?: string[];
 }
+
+/** What the panel's agents dialog renders: every discovered file and the pin. */
+export interface AgentSettingsSnapshot {
+  enabled: boolean;
+  /** Pinned display paths, or null when everything discovered is used. */
+  selection: string[] | null;
+  /** Discovered files, in prompt order. */
+  files: Array<{
+    displayPath: string;
+    scope: string;
+    origin: 'user' | 'workspace';
+    bytes: number;
+    truncated: boolean;
+    /** True when this file is part of the current selection. */
+    active: boolean;
+  }>;
+  /** Number of files discovered. */
+  available: number;
+  /** Set when nothing was found, so the dialog can offer to create a file. */
+  root: string;
+}
+
+/** workspaceState key holding the pinned instruction files (per workspace). */
+const AGENT_SELECTION_KEY = 'codingHarness.agentSelection';
 
 /** Live status of one configured MCP server, shown in the settings dialog. */
 export interface McpServerStatus {
@@ -206,16 +235,24 @@ export class HarnessController {
     agentFiles: [],
     agentFilesEnabled: true,
     agentFilesCount: 0,
+    agentFilesAvailable: 0,
   };
   private cumulativeUsage: Usage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
   private lastTokensPerSecond = 0;
+  /** Pinned instruction files; absent means "everything discovered". */
+  private agentSelection?: string[];
 
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly log: Logger,
     private readonly approvals: ApprovalService,
     private readonly proposals: ProposalStore,
-  ) {}
+  ) {
+    // The pin is a workspace preference, so it survives a window reload but
+    // does not leak into other repositories the way a global setting would.
+    const stored = HarnessController.arrayOfStrings(this.context.workspaceState?.get(AGENT_SELECTION_KEY));
+    if (stored && stored.length > 0) this.agentSelection = stored;
+  }
 
   /* ------------------------------------------------------------- wiring */
 
@@ -434,7 +471,13 @@ export class HarnessController {
 
     if (!this.session || !this.host || this.host.workspaceRoot !== root) {
       this.host = new VsCodeHost({ root, log: this.log, approvals: this.approvals });
-      this.session = new HarnessSession({ host: this.host, config, provider, registry: toolRegistry });
+      this.session = new HarnessSession({
+        host: this.host,
+        config,
+        provider,
+        registry: toolRegistry,
+        agentSelection: this.agentSelection,
+      });
       this.log.info(`session created for ${root} using ${provider.label} with ${toolRegistry.size} tools`);
     } else {
       this.session.updateConfig(config);
@@ -444,7 +487,13 @@ export class HarnessController {
       if (toolRegistry && toolRegistry.size !== this.session.toolNames.length) {
         this.host = new VsCodeHost({ root, log: this.log, approvals: this.approvals });
         const oldHistory = this.session.transcript;
-        this.session = new HarnessSession({ host: this.host, config, provider, registry: toolRegistry });
+        this.session = new HarnessSession({
+          host: this.host,
+          config,
+          provider,
+          registry: toolRegistry,
+          agentSelection: this.agentSelection,
+        });
         // Restore history and cumulative usage
         // @ts-ignore - accessing private for restoration
         (this.session as any).history = [...oldHistory];
@@ -723,6 +772,7 @@ export class HarnessController {
           config,
           provider: createProvider({ config, apiKey: await this.resolveApiKey(config) }),
           registry,
+          agentSelection: this.agentSelection,
         });
         (this.session as any).history = [...oldHistory];
         (this.session as any).cumulativeUsage = { ...this.cumulativeUsage };
@@ -833,6 +883,7 @@ export class HarnessController {
           config,
           provider: createProvider({ config, apiKey: await this.resolveApiKey(config) }),
           registry,
+          agentSelection: this.agentSelection,
         });
         (this.session as any).history = [...oldHistory];
         (this.session as any).cumulativeUsage = { ...this.cumulativeUsage };
@@ -876,20 +927,31 @@ export class HarnessController {
     const config = this.readConfig();
     if (!root) {
       this.lastAgentFiles = undefined;
-      this.state = { ...this.state, agentFiles: [], agentFilesCount: 0, agentFilesEnabled: config.agentFiles.enabled };
+      this.state = {
+        ...this.state,
+        agentFiles: [],
+        agentFilesCount: 0,
+        agentFilesAvailable: 0,
+        agentFilesEnabled: config.agentFiles.enabled,
+      };
       this.post({ type: 'state', state: this.state });
       return undefined;
     }
     const workspace = await this.collectWorkspaceContext();
-    const result = discoverAgentFiles({
+    const discovered = discoverAgentFiles({
       root,
       config: config.agentFiles,
       focusPaths: (workspace?.openFiles ?? []).map((file) => file.path),
     });
-    this.lastAgentFiles = result;
+    // `lastAgentFiles` keeps the unfiltered result: the picker lists every
+    // discovered file, including the ones currently pinned out.
+    this.lastAgentFiles = discovered;
+    this.pruneStaleAgentSelection(discovered);
+
+    const active = selectAgentFiles(discovered, this.agentSelection);
     this.state = {
       ...this.state,
-      agentFiles: result.files.map((file) => ({
+      agentFiles: active.files.map((file) => ({
         displayPath: file.displayPath,
         absolutePath: file.path,
         scope: file.scope,
@@ -897,18 +959,126 @@ export class HarnessController {
         bytes: file.bytes,
         truncated: file.truncated,
       })),
-      agentFilesCount: result.files.length,
-      agentFilesEnabled: result.enabled,
+      agentFilesCount: active.files.length,
+      agentFilesAvailable: active.available,
+      agentFilesEnabled: active.enabled,
+      ...(this.agentSelection ? { agentSelection: [...this.agentSelection] } : { agentSelection: undefined }),
     };
     this.post({ type: 'state', state: this.state });
-    this.log.info(`agent files: ${agentFilesSummary(result)}${result.skipped.length ? ` (${result.skipped.length} skipped)` : ''}`);
+    this.log.info(
+      `agent files: ${agentFilesSummary(active)}` +
+        (active.selection ? ` (${active.files.length} of ${active.available} selected)` : '') +
+        (discovered.skipped.length ? ` (${discovered.skipped.length} skipped)` : ''),
+    );
     if (notify) {
-      const skipped = result.skipped.length ? ` ${result.skipped.length} path(s) skipped.` : '';
+      const skipped = discovered.skipped.length ? ` ${discovered.skipped.length} path(s) skipped.` : '';
+      const selected = active.selection ? ` ${active.files.length} of ${active.available} selected.` : '';
       void vscode.window.showInformationMessage(
-        `Coding Harness: ${agentFilesSummary(result)} (${result.totalBytes} bytes loaded).${skipped}`,
+        `Coding Harness: ${agentFilesSummary(active)} (${active.totalBytes} bytes loaded).${selected}${skipped}`,
       );
     }
-    return result;
+    return discovered;
+  }
+
+  /**
+   * Drop pinned paths that no longer exist. A selection silently shrinking to
+   * nothing would run the agent with no instructions at all, so an empty
+   * remainder falls back to "every discovered file" and says so.
+   */
+  private pruneStaleAgentSelection(discovered: AgentFilesResult): void {
+    if (!this.agentSelection) return;
+    const known = new Set(discovered.files.map((file) => file.displayPath));
+    const kept = this.agentSelection.filter((path) => known.has(path));
+    if (kept.length === this.agentSelection.length) return;
+
+    const dropped = this.agentSelection.filter((path) => !known.has(path));
+    this.log.warn(`agent selection: dropping ${dropped.length} missing file(s): ${dropped.join(', ')}`);
+    if (kept.length === 0) {
+      this.agentSelection = undefined;
+      void this.persistAgentSelection();
+      this.pushNotice(
+        'warn',
+        `The pinned instruction file(s) were not found (${dropped.join(', ')}). Using every discovered file again.`,
+      );
+      return;
+    }
+    this.agentSelection = kept;
+    void this.persistAgentSelection();
+    this.pushNotice('info', `Instruction file(s) no longer found and removed from the selection: ${dropped.join(', ')}.`);
+  }
+
+  /** Everything the agents dialog needs: discovered files plus the current pin. */
+  async getAgentSettings(): Promise<AgentSettingsSnapshot> {
+    const root = this.workspaceRoot();
+    const discovered = await this.refreshAgentFiles();
+    const files = discovered?.files ?? [];
+    const pinned = this.agentSelection ? new Set(this.agentSelection) : undefined;
+    return {
+      enabled: discovered?.enabled ?? this.readConfig().agentFiles.enabled,
+      selection: this.agentSelection ? [...this.agentSelection] : null,
+      files: files.map((file) => ({
+        displayPath: file.displayPath,
+        scope: file.scope,
+        origin: file.origin,
+        bytes: file.bytes,
+        truncated: file.truncated,
+        active: !pinned || pinned.has(file.displayPath),
+      })),
+      available: files.length,
+      root,
+    };
+  }
+
+  /**
+   * Pin the instruction files sent with each task. `null` (or an empty list)
+   * means "everything discovered"; anything else must name files that exist.
+   */
+  async saveAgentSelection(input: unknown): Promise<void> {
+    const requested = HarnessController.arrayOfStrings(input);
+    if (!requested || requested.length === 0) {
+      this.agentSelection = undefined;
+    } else {
+      const discovered = await this.refreshAgentFiles();
+      const known = new Set((discovered?.files ?? []).map((file) => file.displayPath));
+      const kept = requested.filter((path) => known.has(path));
+      const dropped = requested.filter((path) => !known.has(path));
+      if (kept.length === 0) {
+        this.post({
+          type: 'agent-settings-saved',
+          ok: false,
+          error: known.size === 0 ? 'No instruction files were found in this workspace.' : 'None of the selected files exist any more.',
+        });
+        return;
+      }
+      this.agentSelection = kept;
+      if (dropped.length > 0) {
+        this.log.warn(`agent selection: ignored ${dropped.length} unknown path(s): ${dropped.join(', ')}`);
+      }
+    }
+
+    await this.persistAgentSelection();
+    this.session?.setAgentSelection(this.agentSelection);
+    const discovered = await this.refreshAgentFiles();
+    this.post({
+      type: 'agent-settings-saved',
+      ok: true,
+      selection: this.agentSelection ? [...this.agentSelection] : null,
+    });
+    const available = discovered?.files.length ?? 0;
+    const label = this.agentSelection
+      ? `${this.agentSelection.length} of ${available} instruction file(s) active: ${this.agentSelection.join(', ')}`
+      : `all ${available} discovered instruction file(s) active`;
+    this.log.info(`agent selection saved: ${label}`);
+    this.pushNotice('info', `Agent instructions — ${label}.`);
+  }
+
+  /** Write the pin to workspaceState so it survives a window reload. */
+  private async persistAgentSelection(): Promise<void> {
+    try {
+      await this.context.workspaceState?.update(AGENT_SELECTION_KEY, this.agentSelection);
+    } catch (err) {
+      this.log.warn(`could not persist the agent selection: ${(err as Error).message}`);
+    }
   }
 
   /** Open one of the loaded agent files, or offer to create one. */
@@ -1006,11 +1176,14 @@ export class HarnessController {
     }
     const config = this.readConfig();
     const workspace = await this.collectWorkspaceContext();
-    const agentFiles = discoverAgentFiles({
-      root,
-      config: config.agentFiles,
-      focusPaths: (workspace?.openFiles ?? []).map((file) => file.path),
-    });
+    const agentFiles = selectAgentFiles(
+      discoverAgentFiles({
+        root,
+        config: config.agentFiles,
+        focusPaths: (workspace?.openFiles ?? []).map((file) => file.path),
+      }),
+      this.agentSelection,
+    );
     let diagnostics: string[] | undefined;
     if (config.context.diagnostics) {
       try {
@@ -1231,23 +1404,36 @@ export class HarnessController {
         break;
       }
       case 'agent-files': {
+        const available = event.available ?? event.files.length;
         this.state = {
           ...this.state,
           agentFiles: event.files,
           agentFilesCount: event.files.length,
+          agentFilesAvailable: available,
           agentFilesEnabled: event.enabled,
+          ...(this.agentSelection ? { agentSelection: [...this.agentSelection] } : { agentSelection: undefined }),
         };
         this.post({ type: 'state', state: this.state });
-        if (event.enabled && event.files.length === 0 && !this.agentNoticeShown) {
+        if (event.enabled && available === 0 && !this.agentNoticeShown) {
           this.agentNoticeShown = true;
           this.pushNotice(
             'info',
             'No instruction files found. This extension has no built-in prompt — add AGENTS.md / agent.md, or any .md file under .agents/, to tell the agent how to work in this workspace.',
           );
         }
+        // A pin that filtered everything out means the files it named are gone.
+        // Drop it here as well, so the next task is not silently instruction-free.
+        if (this.agentSelection && event.files.length === 0 && available > 0) {
+          this.log.warn('agent selection matched no discovered file; falling back to every file');
+          this.agentSelection = undefined;
+          void this.persistAgentSelection();
+          this.session?.setAgentSelection(undefined);
+          void this.refreshAgentFiles();
+        }
         if (event.files.length > 0) {
           this.log.info(
             `agent files: ${event.files.map((file) => file.displayPath).join(', ')} (${event.totalBytes} bytes)` +
+              (this.agentSelection ? ` — ${event.files.length} of ${available} selected` : '') +
               (event.skipped ? `, ${event.skipped} skipped` : ''),
           );
         }

@@ -100,6 +100,9 @@ after(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+/** Backing store for the stubbed `context.workspaceState`. */
+const workspaceStateStore = new Map<string, unknown>();
+
 function makeController() {
   const messages: any[] = [];
   const log = {
@@ -118,7 +121,16 @@ function makeController() {
     forgetAll: () => {},
   };
   const proposals = { add: () => ({ toString: () => 'stub' }), dispose: () => {} };
-  const context = { secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined } };
+  const context = {
+    secrets: { get: async () => undefined, store: async () => undefined, delete: async () => undefined },
+    workspaceState: {
+      get: (key: string) => workspaceStateStore.get(key),
+      update: async (key: string, value: unknown) => {
+        if (value === undefined) workspaceStateStore.delete(key);
+        else workspaceStateStore.set(key, value);
+      },
+    },
+  };
 
   const controller = new HarnessController(context as any, log as any, approvals as any, proposals as any);
   controller.onUiMessage((message) => messages.push(message));
@@ -288,4 +300,46 @@ test('streaming can be disabled and the panel still renders each turn', async ()
   } finally {
     settings.stream = true;
   }
+});
+
+/* ------------------------------------------------- agent file selection */
+
+test('the agents picker pins a subset, persists it and keeps the chip honest', async () => {
+  const { controller, messages } = makeController();
+  fs.writeFileSync(path.join(root, 'agent.md'), 'root rules\n');
+  fs.mkdirSync(path.join(root, '.agents'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.agents', 'code-review.md'), 'review rules\n');
+
+  // Default is "everything discovered".
+  const initial = await controller.getAgentSettings();
+  assert.equal(initial.selection, null);
+  assert.deepEqual(initial.files.map((file) => file.displayPath).sort(), ['.agents/code-review.md', 'agent.md']);
+  assert.ok(initial.files.every((file) => file.active));
+  assert.equal(controller.getState().agentFilesAvailable, 2);
+
+  await controller.saveAgentSelection(['agent.md']);
+  const saved = messages.filter((message) => message.type === 'agent-settings-saved').pop();
+  assert.equal(saved.ok, true);
+  assert.deepEqual(saved.selection, ['agent.md']);
+  assert.deepEqual(workspaceStateStore.get('codingHarness.agentSelection'), ['agent.md'], 'the pin is stored per workspace');
+
+  const state = controller.getState();
+  assert.deepEqual(state.agentFiles?.map((file) => file.displayPath), ['agent.md'], 'only the pinned file is active');
+  assert.equal(state.agentFilesCount, 1);
+  assert.equal(state.agentFilesAvailable, 2, 'the chip shows 1/2');
+
+  // A pin that names nothing that exists must be refused, not silently applied.
+  await controller.saveAgentSelection(['nope.md']);
+  const failed = messages.filter((message) => message.type === 'agent-settings-saved').pop();
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /exist|found/i);
+  assert.deepEqual(controller.getState().agentFiles?.map((file) => file.displayPath), ['agent.md'], 'the old pin survives');
+
+  // null restores every discovered file and clears the stored pin.
+  await controller.saveAgentSelection(null);
+  assert.equal(controller.getState().agentFiles?.length, 2);
+  assert.equal(workspaceStateStore.get('codingHarness.agentSelection'), undefined);
+
+  fs.rmSync(path.join(root, '.agents'), { recursive: true, force: true });
+  fs.rmSync(path.join(root, 'agent.md'), { force: true });
 });

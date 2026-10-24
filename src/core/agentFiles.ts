@@ -66,6 +66,15 @@ export interface AgentFilesResult {
   includeUser: boolean;
   userPath: string;
   totalBytes: number;
+  /** The pinned selection this result was filtered with, when there is one. */
+  selection?: string[];
+  /** Files found before the selection was applied (equal to `files.length` by default). */
+  available?: number;
+}
+
+/** A filtered result, plus the selected paths that no longer matched anything. */
+export interface SelectedAgentFiles extends AgentFilesResult {
+  missing: string[];
 }
 
 export interface DiscoverAgentFilesOptions {
@@ -638,6 +647,45 @@ export function discoverAgentFiles(options: DiscoverAgentFilesOptions): AgentFil
   return result;
 }
 
+/**
+ * Restrict a discovery result to the files the user pinned.
+ *
+ * This is the manual switch: `undefined` or `null` means "everything that was
+ * discovered", a list means "only these". Paths may be given as the
+ * workspace-relative `displayPath` shown in the panel or as an absolute path;
+ * the result keeps discovery order, so the root-to-leaf reading order survives
+ * and a subtree file still comes after the root file it refines.
+ *
+ * Nothing is invented here: paths that no longer exist are reported as
+ * `missing` rather than silently replaced, so the caller can prune its stored
+ * selection instead of running a task with instructions the user did not pick.
+ */
+export function selectAgentFiles(result: AgentFilesResult, selection?: readonly string[] | null): SelectedAgentFiles {
+  const available = result.available ?? result.files.length;
+  if (selection == null) return { ...result, available, missing: [] };
+
+  const wanted = new Set(selection.map((entry) => toPosix(entry.trim()).replace(/^\.\//, '')).filter(Boolean));
+  if (wanted.size === 0) return { ...result, available, missing: [] };
+
+  const files = result.files.filter(
+    (file) => wanted.has(toPosix(file.displayPath)) || wanted.has(toPosix(file.path)),
+  );
+  const matched = new Set<string>();
+  for (const file of files) {
+    matched.add(toPosix(file.displayPath));
+    matched.add(toPosix(file.path));
+  }
+  const missing = [...wanted].filter((path) => !matched.has(path));
+  return {
+    ...result,
+    files,
+    totalBytes: files.reduce((sum, file) => sum + file.bytes, 0),
+    available,
+    selection: selection.slice(),
+    missing,
+  };
+}
+
 function isOutsideDisplayPath(displayPath: string): boolean {
   return displayPath.startsWith('~') || displayPath.startsWith('/') || /^[A-Za-z]:\//.test(displayPath);
 }
@@ -684,12 +732,16 @@ export function formatAgentInstructions(result: AgentFilesResult): string {
   }
 
   const external = result.files.filter((file) => !isInside(result.root, file.path) && file.origin !== 'user').length;
+  const pinned = result.selection && result.available && result.available > result.files.length
+    ? ` The user pinned this selection: ${result.files.length} of ${result.available} discovered file(s) are included; the rest were deliberately left out.`
+    : '';
   const lines = [
     `${result.files.length} file(s), ${formatBytes(result.totalBytes)}. ` +
       'Files are ordered from the workspace root outwards; a file in a subdirectory applies to that subtree.' +
       (external > 0
         ? ` ${external} file(s) were added explicitly from outside the workspace (codingHarness.agentFiles.extraPaths) and come last.`
-        : ''),
+        : '') +
+      pinned,
   ];
   for (const file of result.files) {
     lines.push('');

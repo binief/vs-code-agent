@@ -62,6 +62,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.messageDisposable?.dispose();
   }
 
+  /** Refresh the agents dialog after a change made outside it (file created). */
+  private async postAgentSettings(): Promise<void> {
+    this.post({ type: 'agent-settings', ...(await this.controller.getAgentSettings()) });
+  }
+
   private async handle(message: any): Promise<void> {
     if (!message || typeof message.type !== 'string') return;
     switch (message.type) {
@@ -97,6 +102,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'open-agents':
         await this.controller.openAgentInstructions();
+        break;
+      case 'get-agent-settings':
+        this.post({ type: 'agent-settings', ...(await this.controller.getAgentSettings()) });
+        break;
+      case 'save-agent-selection':
+        // `null` means "every discovered file"; the controller validates names.
+        await this.controller.saveAgentSelection(message.selection ?? null);
+        break;
+      case 'create-agent-file':
+        await this.controller.createAgentFile();
+        await this.postAgentSettings();
         break;
       case 'preview-context':
         await this.controller.previewContext();

@@ -466,6 +466,8 @@ export type HarnessEvent =
       files: AgentInstructionFile[];
       totalBytes: number;
       skipped: number;
+      /** Files discovered before the pinned selection was applied. */
+      available?: number;
     }
   | { type: 'mcp-status'; enabled: boolean; servers: number; tools: number }
   | { type: 'notice'; message: string; level: 'info' | 'warn' | 'error' }
