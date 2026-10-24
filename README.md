@@ -184,6 +184,30 @@ paths you added to `extraPaths` yourself.
 | `../shared/agent.md` | `agentFiles.extraPaths` |
 | `~/team/agent.md` | `agentFiles.includeUser` + `userPath`, or `extraPaths` |
 
+### Choosing which files are sent
+
+Discovery decides what *could* be loaded; the `agents:` chip decides what actually goes into the next
+prompt. By default every discovered file is merged, in root-to-leaf order, each under its own heading.
+
+Click the chip to pin a subset — for example `agent.md` for general work, or `.agents/code-review.md`
+when the task is a review, even though both live in the same repository. The chip then reads
+`agents: 1/2` (active/discovered), and the system message states the pin explicitly:
+
+```
+2 file(s), 3.4 kB. … The user pinned this selection: 2 of 3 discovered file(s) are included;
+the rest were deliberately left out.
+```
+
+- The pin is stored in `workspaceState`, so it survives a window reload but does not leak into other
+  repositories the way a global setting would. "Use every discovered file" clears it.
+- A file that has been renamed or deleted is dropped from the pin automatically; if that leaves
+  nothing, the extension falls back to all discovered files and says so, rather than quietly running
+  the agent with no instructions at all.
+- Discovery is unchanged, so nothing needs a fixed name and nothing outside the workspace is read
+  unless it was opted in.
+- *Preview System Context* shows exactly the pinned set, which is the quickest way to check what the
+  model will actually be told.
+
 ### Commands
 
 | Command | What it does |
@@ -192,8 +216,8 @@ paths you added to `extraPaths` yourself.
 | *Coding Harness: Reload Agent Instructions* | Rediscovers the files and shows how many bytes were loaded |
 | *Coding Harness: Preview System Context* | Opens the system message that will be sent with the next task (the tool catalogue follows the live session when one exists) |
 
-The **Agents** header button and the `agents:` chip do the same as the first command. Click the
-`ctx` chip to preview the context.
+The **Agents** header button opens a loaded file (the first command). The `agents:` chip opens the
+picker described above. Click the `ctx` chip to preview the context.
 
 ## What the model receives
 

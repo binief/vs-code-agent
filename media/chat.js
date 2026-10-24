@@ -402,22 +402,31 @@
     }
   }
 
+  /** Active count and discovered count for the empty state and the chip. */
+  function agentCounts(state) {
+    const files = Array.isArray(state.agentFiles) ? state.agentFiles : [];
+    const available = typeof state.agentFilesAvailable === 'number' ? state.agentFilesAvailable : files.length;
+    const pinned = Array.isArray(state.agentSelection) && state.agentSelection.length > 0;
+    return { files, available, pinned };
+  }
+
   function applyEmptyNote(state) {
     if (!emptyNote) return;
-    const files = Array.isArray(state.agentFiles) ? state.agentFiles : [];
+    const { files, available, pinned } = agentCounts(state);
     if (state.agentFilesEnabled === false) {
       emptyNote.innerHTML =
         'Instruction loading is off, so the agent gets context but no guidance. Enable <code>codingHarness.agentFiles.enabled</code>.';
       return;
     }
-    if (files.length === 0) {
+    if (available === 0) {
       emptyNote.innerHTML =
         'No instruction files found. Add <code>agent.md</code>, or any <code>.md</code> inside <code>.agents/</code>.';
       return;
     }
     const shown = files.slice(0, 3).map((file) => '<code>' + escapeHtml(file.displayPath) + '</code>');
     const more = files.length > shown.length ? ' +' + (files.length - shown.length) + ' more' : '';
-    emptyNote.innerHTML = files.length + ' instruction file(s) loaded: ' + shown.join(', ') + more;
+    const scope = pinned ? files.length + ' of ' + available : String(available);
+    emptyNote.innerHTML = scope + ' instruction file(s) loaded: ' + shown.join(', ') + more;
   }
 
   function applyState(state) {
@@ -444,20 +453,25 @@
     }
 
     if (chipAgents) {
-      const files = Array.isArray(state.agentFiles) ? state.agentFiles : [];
+      const { files, available, pinned } = agentCounts(state);
       const enabled = state.agentFilesEnabled !== false;
       chipAgents.classList.remove('warn');
+      chipAgents.classList.toggle('pinned', pinned);
       if (!enabled) {
         chipAgents.textContent = 'agents: off';
         chipAgents.classList.add('warn');
         chipAgents.title = 'Instruction loading is disabled (codingHarness.agentFiles.enabled). Click to open the setting.';
-      } else if (files.length === 0) {
+      } else if (available === 0) {
         chipAgents.textContent = 'agents: none';
         chipAgents.classList.add('warn');
         chipAgents.title = 'No instruction files found — click to create agent.md. The extension has no built-in prompt.';
       } else {
-        chipAgents.textContent = 'agents: ' + files.length;
-        chipAgents.title = files.map((file) => file.displayPath).join('\n') + '\n\nClick to open.';
+        // `2/3` means a pinned subset is in use; a bare number is everything.
+        chipAgents.textContent = 'agents: ' + files.length + (pinned ? '/' + available : '');
+        const names = files.map((file) => file.displayPath).join('\n');
+        chipAgents.title = pinned
+          ? 'Active (' + files.length + ' of ' + available + '):\n' + names + '\n\nPinned for this workspace. Click to change.'
+          : 'All ' + available + ' instruction file(s):\n' + names + '\n\nClick to choose which ones are sent.';
       }
     }
 
@@ -1331,7 +1345,7 @@
   if (btnCompact) btnCompact.addEventListener('click', () => vscode.postMessage({ type: 'compact' }));
   if (btnMcp) btnMcp.addEventListener('click', openMcpModal);
   if (btnAgents) btnAgents.addEventListener('click', () => vscode.postMessage({ type: 'open-agents' }));
-  if (chipAgents) chipAgents.addEventListener('click', () => vscode.postMessage({ type: 'open-agents' }));
+  if (chipAgents) chipAgents.addEventListener('click', openAgentsModal);
   if (chipContext) chipContext.addEventListener('click', () => vscode.postMessage({ type: 'preview-context' }));
   if (btnCompactBanner) btnCompactBanner.addEventListener('click', () => vscode.postMessage({ type: 'compact' }));
   if (btnCompactDismiss) {
@@ -1687,7 +1701,9 @@
     if (event.target === mcpModal) closeMcpModal();
   });
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && !mcpModal.hidden) closeMcpModal();
+    if (event.key !== 'Escape') return;
+    if (!mcpModal.hidden) closeMcpModal();
+    if (agentsModal && !agentsModal.hidden) closeAgentsModal();
   });
   mcpAddServer.addEventListener('click', () => {
     const emptyNoteNode = mcpServerList.querySelector('.mcp-empty');
@@ -1724,6 +1740,127 @@
     vscode.postMessage({ type: 'mcp-reload' });
   });
   if (chipMcp) chipMcp.addEventListener('click', openMcpModal);
+
+  /* -------------------------------------------------------- agents dialog */
+
+  const agentsModal = document.getElementById('agents-modal');
+  const agentsAll = document.getElementById('agents-all');
+  const agentsList = document.getElementById('agents-list');
+  const agentsEmpty = document.getElementById('agents-empty');
+  const agentsCreate = document.getElementById('agents-create');
+  const agentsOpen = document.getElementById('agents-open');
+  const agentsCancel = document.getElementById('agents-cancel');
+  const agentsSaveBtn = document.getElementById('agents-save');
+  const agentsStatus = document.getElementById('agents-modal-status');
+  const agentsClose = document.getElementById('agents-modal-close');
+
+  function openAgentsModal() {
+    if (!agentsModal) return;
+    agentsModal.hidden = false;
+    agentsStatus.classList.remove('error');
+    agentsStatus.textContent = 'Loading…';
+    vscode.postMessage({ type: 'get-agent-settings' });
+  }
+
+  function closeAgentsModal() {
+    if (agentsModal) agentsModal.hidden = true;
+  }
+
+  function checkedAgentPaths() {
+    if (!agentsList) return [];
+    return Array.from(agentsList.querySelectorAll('.agent-check'))
+      .filter((box) => box.checked)
+      .map((box) => box.value);
+  }
+
+  /** "Every discovered file" disables the individual boxes instead of hiding them. */
+  function syncAgentRows() {
+    if (!agentsAll || !agentsList) return;
+    const all = agentsAll.checked;
+    let checked = 0;
+    for (const row of agentsList.querySelectorAll('.agent-row')) {
+      const box = row.querySelector('.agent-check');
+      if (!box) continue;
+      box.disabled = all;
+      const on = all || box.checked;
+      row.classList.toggle('active', on);
+      if (box.checked) checked += 1;
+    }
+    if (agentsSaveBtn) agentsSaveBtn.disabled = !all && checked === 0;
+  }
+
+  function agentRow(file) {
+    const row = el('label', 'agent-row' + (file.active ? ' active' : ''));
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.className = 'agent-check';
+    box.value = file.displayPath;
+    box.checked = Boolean(file.active);
+    box.addEventListener('change', syncAgentRows);
+    row.appendChild(box);
+
+    const text = el('span', 'agent-text');
+    text.appendChild(el('span', 'agent-path', file.displayPath));
+    const meta = [];
+    if (file.origin === 'user') meta.push('user-level');
+    else if (file.scope) meta.push('applies to ' + file.scope + '/**');
+    else meta.push('workspace root');
+    if (file.bytes != null) meta.push(formatBytes(file.bytes));
+    if (file.truncated) meta.push('truncated');
+    text.appendChild(el('span', 'agent-meta', meta.join(' · ')));
+    row.appendChild(text);
+    return row;
+  }
+
+  function renderAgentSettings(data) {
+    if (!agentsList) return;
+    agentsAll.checked = data.selection === null;
+    agentsList.innerHTML = '';
+    for (const file of data.files || []) agentsList.appendChild(agentRow(file));
+    const available = typeof data.available === 'number' ? data.available : (data.files || []).length;
+    if (agentsEmpty) agentsEmpty.hidden = available > 0;
+    agentsStatus.classList.remove('error');
+    agentsStatus.textContent = available === 0 ? '' : '';
+    if (data.enabled === false) {
+      agentsStatus.textContent = 'Instruction loading is disabled in settings.';
+    }
+    syncAgentRows();
+  }
+
+  if (agentsClose) agentsClose.addEventListener('click', closeAgentsModal);
+  if (agentsCancel) agentsCancel.addEventListener('click', closeAgentsModal);
+  if (agentsModal) {
+    agentsModal.addEventListener('click', (event) => {
+      if (event.target === agentsModal) closeAgentsModal();
+    });
+  }
+  if (agentsAll) agentsAll.addEventListener('change', syncAgentRows);
+  if (agentsOpen) {
+    agentsOpen.addEventListener('click', () => {
+      // The extension opens a quick pick over the panel; close first so it is visible.
+      closeAgentsModal();
+      vscode.postMessage({ type: 'open-agents' });
+    });
+  }
+  if (agentsCreate) {
+    agentsCreate.addEventListener('click', () => {
+      agentsStatus.textContent = 'Creating agent.md…';
+      vscode.postMessage({ type: 'create-agent-file' });
+    });
+  }
+  if (agentsSaveBtn) {
+    agentsSaveBtn.addEventListener('click', () => {
+      const selection = agentsAll.checked ? null : checkedAgentPaths();
+      if (!agentsAll.checked && selection.length === 0) {
+        agentsStatus.classList.add('error');
+        agentsStatus.textContent = 'Select at least one file, or use “every discovered file”.';
+        return;
+      }
+      agentsStatus.classList.remove('error');
+      agentsStatus.textContent = 'Saving…';
+      vscode.postMessage({ type: 'save-agent-selection', selection });
+    });
+  }
 
   /* --------------------------------------------------------------- message */
 
@@ -1831,6 +1968,23 @@
       case 'mcp-settings':
         if (mcpModal.hidden) break;
         renderMcpSettings(message);
+        break;
+      case 'agent-settings':
+        if (!agentsModal || agentsModal.hidden) break;
+        renderAgentSettings(message);
+        break;
+      case 'agent-settings-saved':
+        if (!agentsModal || agentsModal.hidden) break;
+        if (message.ok) {
+          agentsStatus.classList.remove('error');
+          agentsStatus.textContent = 'Saved ✓';
+          setTimeout(() => {
+            if (agentsModal && !agentsModal.hidden) closeAgentsModal();
+          }, 600);
+        } else {
+          agentsStatus.classList.add('error');
+          agentsStatus.textContent = message.error || 'Could not save the selection.';
+        }
         break;
       case 'mcp-settings-saved':
         if (mcpModal.hidden) break;

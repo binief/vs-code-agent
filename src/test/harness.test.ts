@@ -18,8 +18,11 @@ import {
   DEFAULT_CONFIG,
   type ApprovalDecision,
   type ApprovalRequest,
+  type ChatRequest,
   type HarnessConfig,
   type HarnessHost,
+  type Provider,
+  type ProviderResponse,
   type ToolContext,
 } from '../core/types';
 
@@ -501,4 +504,60 @@ test('the default registry exposes the documented tools', () => {
     assert.ok(spec.description.length > 20, `${spec.name} needs a useful description`);
     assert.equal(spec.parameters.type, 'object');
   }
+});
+
+/* -------------------------------------------------- agent file selection */
+
+/** Records the requests a session sends, so the prompt itself can be inspected. */
+class CapturingProvider implements Provider {
+  readonly id = 'capture';
+  readonly label = 'capture';
+  readonly requests: ChatRequest[] = [];
+
+  async chat(request: ChatRequest): Promise<ProviderResponse> {
+    this.requests.push(request);
+    return { text: 'Done.', toolCalls: [] };
+  }
+
+  systemPrompt(index: number): string {
+    const message = this.requests[index].messages.find((entry) => entry.role === 'system');
+    return String(message?.content ?? '');
+  }
+}
+
+test('a pinned agent selection decides which instructions reach the model', async () => {
+  const root = makeTempWorkspace({ 'agent.md': 'root rules', '.agents/review.md': 'review rules' });
+  const provider = new CapturingProvider();
+  const session = new HarnessSession({
+    host: new FakeHost(root),
+    config: { ...DEFAULT_CONFIG, provider: 'mock', maxSteps: 2 },
+    provider,
+    agentSelection: ['agent.md'],
+  });
+
+  const events: any[] = [];
+  await session.runTask('do the thing', (event) => events.push(event));
+
+  const system = provider.systemPrompt(0);
+  assert.match(system, /root rules/, 'the pinned file is sent');
+  assert.doesNotMatch(system, /review rules/, 'the unpinned file is not');
+  assert.match(system, /pinned this selection: 1 of 2/);
+
+  const event = events.find((entry) => entry.type === 'agent-files');
+  assert.deepEqual(event.files.map((file: { displayPath: string }) => file.displayPath), ['agent.md']);
+  assert.equal(event.available, 2, 'the panel still knows how many were discovered');
+
+  // Switching mid-session applies to the next task.
+  session.setAgentSelection(['.agents/review.md']);
+  await session.runTask('again', () => {});
+  assert.match(provider.systemPrompt(1), /review rules/);
+  assert.doesNotMatch(provider.systemPrompt(1), /root rules/);
+
+  // null means everything again.
+  session.setAgentSelection(null);
+  await session.runTask('one more', () => {});
+  const third = provider.systemPrompt(2);
+  assert.match(third, /root rules/);
+  assert.match(third, /review rules/);
+  assert.doesNotMatch(third, /pinned this selection/);
 });

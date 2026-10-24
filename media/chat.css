@@ -1819,6 +1819,92 @@ body.dragging .composer-box {
   font-size: 10px;
 }
 
+/* --------------------------------------------------------- agents dialog */
+
+.agents-intro {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.agents-all-row {
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-soft);
+  font-weight: 600;
+}
+
+.agent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* One discovered instruction file. The whole row is the hit target. */
+.agent-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 5px 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.agent-row:hover {
+  background: var(--hover);
+}
+
+.agent-row.active {
+  border-color: var(--border);
+  background: var(--surface);
+}
+
+.agent-check {
+  flex: none;
+  margin: 2px 0 0;
+  accent-color: var(--vscode-button-background);
+}
+
+.agent-check:disabled {
+  opacity: 0.5;
+}
+
+.agent-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.agent-path {
+  font-family: var(--mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.agent-meta {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.agents-empty {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.agents-empty[hidden] {
+  display: none;
+}
+
+/* A pinned subset is worth flagging on the chip without the warning colour. */
+.chip.pinned {
+  color: var(--vscode-textLink-foreground);
+  opacity: 1;
+  font-weight: 600;
+}
+
 /* ------------------------------------------------------------ scrollbars */
 
 .stream::-webkit-scrollbar,

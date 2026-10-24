@@ -43,6 +43,20 @@ interface Harness {
   close: () => void;
 }
 
+/** Every mounted window, so a failed assertion cannot leave a timer running. */
+const windows: any[] = [];
+
+after(() => {
+  for (const window of windows) {
+    try {
+      window.close();
+    } catch {
+      /* already closed */
+    }
+  }
+  windows.length = 0;
+});
+
 function mount(): Harness {
   if (!jsdom) {
     throw new Error(
@@ -64,6 +78,7 @@ function mount(): Harness {
     setState: () => undefined,
   });
   window.eval(panelJs);
+  windows.push(window);
   const send = (message: unknown) => window.dispatchEvent(new window.MessageEvent('message', { data: message }));
   return { window, doc: window.document, posted, send, close: () => window.close() };
 }
@@ -114,10 +129,6 @@ const answer = [
   '',
   '<script>alert("xss")</script>',
 ].join('\n');
-
-after(() => {
-  /* each test closes its own jsdom window */
-});
 
 test('the panel boots with an empty transcript and honest status chips', () => {
   const h = mount();
@@ -262,6 +273,77 @@ test('images staged in the composer travel with the message', async () => {
   assert.ok(submit, 'an image on its own is a valid prompt');
   assert.ok(submit.images[0].dataUrl.startsWith('data:image/png;base64,'), 'bytes travel as a data URL');
   assert.ok(tray.hidden, 'and the tray empties');
+  h.close();
+});
+
+test('the agents chip opens a picker, pins a subset and refuses an empty pin', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [], state: { ...state, agentFiles: [{ displayPath: 'agent.md' }], agentFilesAvailable: 3 }, activity: idle });
+  assert.equal(h.doc.getElementById('chip-agents').textContent, 'agents: 1', 'no pin yet: just the active count');
+
+  h.doc.getElementById('chip-agents').click();
+  assert.ok(!h.doc.getElementById('agents-modal').hidden, 'the chip opens the picker');
+  assert.ok(h.posted.some((m) => m.type === 'get-agent-settings'), 'and asks for the discovered files');
+
+  h.send({
+    type: 'agent-settings',
+    enabled: true,
+    selection: null,
+    available: 3,
+    root: '/r',
+    files: [
+      { displayPath: 'agent.md', scope: '', origin: 'workspace', bytes: 10, truncated: false, active: true },
+      { displayPath: '.agents/review.md', scope: '', origin: 'workspace', bytes: 20, truncated: false, active: true },
+      { displayPath: 'api/agent.md', scope: 'api', origin: 'workspace', bytes: 30, truncated: false, active: true },
+    ],
+  });
+  assert.equal(h.doc.querySelectorAll('.agent-row').length, 3);
+  assert.ok(h.doc.querySelector('.agent-meta').textContent.includes('workspace root'));
+  assert.ok(h.doc.getElementById('agents-all').checked, '"every discovered file" is the default');
+
+  const boxes = [...h.doc.querySelectorAll('.agent-check')];
+  assert.ok(boxes.every((box: any) => box.disabled), 'individual rows are disabled while "every file" is checked');
+
+  // Choose a single file: an empty pin must be refused, a real one posted.
+  const all = h.doc.getElementById('agents-all');
+  all.checked = false;
+  all.dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  assert.ok(boxes.every((box: any) => !box.disabled));
+  for (const box of boxes) box.checked = false;
+  h.doc.getElementById('agents-save').click();
+  assert.ok(h.doc.getElementById('agents-modal-status').classList.contains('error'));
+  assert.ok(!h.posted.some((m) => m.type === 'save-agent-selection'), 'nothing is saved when nothing is selected');
+
+  // Now pin one file (the row class follows the checkbox).
+  boxes[2].checked = true;
+  boxes[2].dispatchEvent(new h.window.Event('change', { bubbles: true }));
+  assert.ok(boxes[2].closest('.agent-row').classList.contains('active'));
+  h.doc.getElementById('agents-save').click();
+  const save = h.posted.filter((m) => m.type === 'save-agent-selection').pop();
+  // Spread first: the array was built inside the jsdom realm, and deepStrictEqual
+  // compares prototypes across realms.
+  assert.deepEqual([...save.selection], ['api/agent.md']);
+
+  h.send({ type: 'agent-settings-saved', ok: true, selection: ['api/agent.md'] });
+  assert.equal(h.doc.getElementById('agents-modal-status').textContent, 'Saved ✓');
+
+  // The chip reports the pin as active/total once state arrives.
+  h.send({ type: 'state', state: { ...state, agentFiles: [{ displayPath: 'api/agent.md' }], agentFilesAvailable: 3, agentSelection: ['api/agent.md'] } });
+  assert.equal(h.doc.getElementById('chip-agents').textContent, 'agents: 1/3');
+  assert.ok(h.doc.getElementById('chip-agents').classList.contains('pinned'));
+  h.close();
+});
+
+test('the agents picker offers to create a file when nothing was found', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [], state: { ...state, agentFiles: [], agentFilesAvailable: 0 }, activity: idle });
+  h.doc.getElementById('chip-agents').click();
+  h.send({ type: 'agent-settings', enabled: true, selection: null, available: 0, root: '/r', files: [] });
+
+  assert.ok(!h.doc.getElementById('agents-empty').hidden, 'the empty state is shown');
+  assert.equal(h.doc.querySelectorAll('.agent-row').length, 0);
+  h.doc.getElementById('agents-create').click();
+  assert.ok(h.posted.some((m) => m.type === 'create-agent-file'));
   h.close();
 });
 

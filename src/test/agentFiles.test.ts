@@ -4,7 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { after, test } from 'node:test';
 
-import { agentFilesSummary, discoverAgentFiles, formatAgentInstructions } from '../core/agentFiles';
+import { agentFilesSummary, discoverAgentFiles, formatAgentInstructions, selectAgentFiles } from '../core/agentFiles';
 import { DEFAULT_CONFIG, type AgentFilesConfig } from '../core/types';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-agent-files-'));
@@ -286,4 +286,59 @@ test('discovery honors enabled=false', () => {
   assert.equal(result.enabled, false);
   assert.equal(result.files.length, 0);
   assert.match(formatAgentInstructions(result), /disabled/);
+});
+
+/* ----------------------------------------------------- manual selection */
+
+test('selectAgentFiles filters a discovery result and keeps prompt order', () => {
+  const root = workspace();
+  const all = discoverAgentFiles({ root, config: config({ scanNested: true, maxDepth: 2 }) });
+  // .github/agent.md comes from a config directory, so it is always discovered.
+  assert.deepEqual(names(all), ['.github/agent.md', 'AGENTS.md', 'src/agent.md']);
+
+  const nested = selectAgentFiles(all, ['src/agent.md', 'AGENTS.md']);
+  assert.deepEqual(names(nested), ['AGENTS.md', 'src/agent.md'], 'result follows discovery order, not the selection order');
+  assert.equal(nested.available, 3);
+  assert.deepEqual(nested.selection, ['src/agent.md', 'AGENTS.md']);
+  assert.deepEqual(nested.missing, []);
+  assert.equal(nested.totalBytes, Buffer.byteLength('root rules\n') + Buffer.byteLength('src rules\n'));
+});
+
+test('selectAgentFiles treats null/undefined as "everything" and never mutates', () => {
+  const root = workspace();
+  const all = discoverAgentFiles({ root, config: config() });
+  for (const selection of [undefined, null]) {
+    const selected = selectAgentFiles(all, selection);
+    assert.deepEqual(names(selected), names(all));
+    assert.equal(selected.available, all.files.length);
+    assert.equal(selected.selection, undefined);
+  }
+});
+
+test('selectAgentFiles accepts absolute paths and normalises them', () => {
+  const root = workspace();
+  const all = discoverAgentFiles({ root, config: config() });
+  const absolute = all.files.map((file) => file.path);
+  const selected = selectAgentFiles(all, absolute);
+  assert.equal(selected.files.length, all.files.length);
+  assert.deepEqual(selected.missing, []);
+});
+
+test('selectAgentFiles reports paths that no longer exist instead of inventing files', () => {
+  const root = workspace();
+  const all = discoverAgentFiles({ root, config: config() });
+  const selected = selectAgentFiles(all, ['AGENTS.md', 'gone/agent.md']);
+  assert.deepEqual(names(selected), ['AGENTS.md']);
+  assert.deepEqual(selected.missing, ['gone/agent.md']);
+});
+
+test('a pinned selection is stated in the prompt, and only those files are sent', () => {
+  const root = workspace();
+  const all = discoverAgentFiles({ root, config: config({ scanNested: true, maxDepth: 2 }) });
+  const selected = selectAgentFiles(all, ['AGENTS.md']);
+  const text = formatAgentInstructions(selected);
+  assert.match(text, /^## AGENTS\.md/m);
+  assert.doesNotMatch(text, /^## src\/agent\.md/m, 'the unpinned file must not be sent');
+  assert.doesNotMatch(text, /^## \.github\/agent\.md/m);
+  assert.match(text, /pinned this selection: 1 of 3/);
 });

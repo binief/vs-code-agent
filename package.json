@@ -2,7 +2,7 @@
   "name": "coding-harness",
   "displayName": "Coding Harness",
   "description": "A tool harness for VS Code: file create/edit/search, shell commands and MCP tools, with context about the environment and workspace. Instructions come from your agent.md files — no built-in prompt.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "publisher": "binief",
   "license": "MIT",
   "repository": {

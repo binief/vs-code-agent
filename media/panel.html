@@ -207,6 +207,38 @@
       </div>
     </div>
   </div>
+
+  <div class="modal-backdrop" id="agents-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="agents-modal-title">
+      <div class="modal-head">
+        <span class="modal-title" id="agents-modal-title">Agent instructions</span>
+        <button type="button" class="icon-btn" id="agents-modal-close" aria-label="Close" title="Close">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p class="agents-intro">
+          Choose which instruction files are sent with each task. Discovery is unchanged — this only pins a
+          subset, and it is remembered for this workspace.
+        </p>
+        <label class="check-row agents-all-row" title="Send every instruction file that discovery found">
+          <input type="checkbox" id="agents-all" />
+          <span>Use every discovered file</span>
+        </label>
+        <div class="agent-list" id="agents-list"></div>
+        <p class="agents-empty" id="agents-empty" hidden>
+          No instruction files were found in this workspace.
+          <button type="button" class="linklike" id="agents-create">Create agent.md</button>
+        </p>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="linklike" id="agents-open" title="Open the instruction files in the editor">Open files…</button>
+        <span class="modal-status" id="agents-modal-status"></span>
+        <button type="button" id="agents-cancel">Cancel</button>
+        <button type="button" class="primary" id="agents-save" title="Send only the checked files from now on">Apply</button>
+      </div>
+    </div>
+  </div>
 </div>
 <script nonce="{{NONCE}}" src="{{JS}}"></script>
 </body>

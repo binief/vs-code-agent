@@ -1,4 +1,4 @@
-import { agentFilesSummary, discoverAgentFiles } from './agentFiles';
+import { agentFilesSummary, discoverAgentFiles, selectAgentFiles } from './agentFiles';
 import { CheckpointStore, type RevertReport } from './checkpoints';
 import { compactHistory, estimateMessagesTokens, estimateTokens, shouldCompact } from './compaction';
 import { isRetryableProviderError, retryDelayMs } from './providers/errors';
@@ -41,6 +41,11 @@ export interface AgentDeps {
   /** Replace the tool set entirely (used by tests and embedders). */
   tools?: ToolRegistry;
   checkpoints?: CheckpointStore;
+  /**
+   * Pin which instruction files are sent: display paths (or absolute paths) of
+   * the files the user chose. `undefined`/`null` sends everything discovered.
+   */
+  agentSelection?: readonly string[] | null;
 }
 
 const MAX_TOOL_RESULT_CHARS = 30_000;
@@ -105,6 +110,15 @@ export class HarnessSession {
   /** Swap the model backend (settings changed, or a different key was added). */
   setProvider(provider: Provider): void {
     this.deps.provider = provider;
+  }
+
+  /** Pin the instruction files for the next task; `null`/`undefined` means all. */
+  setAgentSelection(selection: readonly string[] | null | undefined): void {
+    this.deps.agentSelection = selection ?? undefined;
+  }
+
+  get agentSelection(): readonly string[] | undefined {
+    return this.deps.agentSelection ?? undefined;
   }
 
   get providerLabel(): string {
@@ -210,10 +224,21 @@ export class HarnessSession {
           totalBytes: 0,
         };
       }
+      // The user may have pinned a subset (the agents chip in the panel). The
+      // selection is applied here, not in discovery, so the full result stays
+      // available for the picker and for an automatic fallback when a pinned
+      // file has been deleted.
+      const selected = selectAgentFiles(agentFiles, this.deps.agentSelection);
+      if (selected.missing.length > 0) {
+        host.log(
+          'warn',
+          `agent selection skipped ${selected.missing.length} missing file(s): ${selected.missing.join(', ')}`,
+        );
+      }
       onEvent({
         type: 'agent-files',
-        enabled: agentFiles.enabled,
-        files: agentFiles.files.map((file) => ({
+        enabled: selected.enabled,
+        files: selected.files.map((file) => ({
           displayPath: file.displayPath,
           absolutePath: file.path,
           scope: file.scope,
@@ -221,13 +246,15 @@ export class HarnessSession {
           bytes: file.bytes,
           truncated: file.truncated,
         })),
-        totalBytes: agentFiles.totalBytes,
-        skipped: agentFiles.skipped.length,
+        totalBytes: selected.totalBytes,
+        skipped: selected.skipped.length,
+        available: selected.available,
       });
       host.log(
         'info',
-        `agent instructions: ${agentFilesSummary(agentFiles)}` +
-          (agentFiles.skipped.length ? ` (${agentFiles.skipped.length} skipped)` : ''),
+        `agent instructions: ${agentFilesSummary(selected)}` +
+          (selected.selection ? ` (${selected.files.length} of ${selected.available} selected)` : '') +
+          (selected.skipped.length ? ` (${selected.skipped.length} skipped)` : ''),
       );
       const system = buildSystemPrompt({
         root: host.workspaceRoot,
@@ -235,7 +262,7 @@ export class HarnessSession {
         tools: this.registry.specs(),
         diagnostics,
         workspace,
-        agentFiles,
+        agentFiles: selected,
       });
 
       // Check if we should compact before starting
