@@ -57,10 +57,14 @@ test('the webview loads assets that actually exist', () => {
     assert.ok(fs.existsSync(path.join(repoRoot, 'media', name)), `media/${name} is missing`);
   }
 
-  // The panel must be locked down: no remote script/style sources.
-  assert.match(viewSource, /Content-Security-Policy/);
+  // The panel must be locked down: no remote script/style sources. The policy
+  // itself is generated in chatView.ts and substituted into the meta tag that
+  // lives in media/panel.html.
+  const panelSource = fs.readFileSync(path.join(repoRoot, 'media', 'panel.html'), 'utf8');
+  assert.match(panelSource, /Content-Security-Policy/);
+  assert.match(panelSource, /content="\{\{CSP\}\}"/);
   assert.match(viewSource, /nonce-\$\{nonce\}/);
-  assert.ok(!/https?:\/\/cdn/.test(viewSource), 'webview must not load remote assets');
+  assert.ok(!/https?:\/\/cdn/.test(viewSource + panelSource), 'webview must not load remote assets');
 });
 
 test('every contributed setting is actually read by the controller', () => {

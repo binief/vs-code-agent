@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="{{CSP}}" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="stylesheet" href="{{CSS}}" />
+<title>Coding Harness</title>
+</head>
+<body>
+<!-- Icon sprite: one <use> per button keeps the markup readable and the whole
+     set inherits currentColor, so it follows the active theme. -->
+<svg class="sprite" width="0" height="0" aria-hidden="true" focusable="false">
+  <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3.5v9M3.5 8h9"/></symbol>
+  <symbol id="i-file" viewBox="0 0 16 16"><path d="M4 2.5h4.4L12 6.1v7.4H4z"/><path d="M8.4 2.5v3.6H12"/><path d="M5.8 9.2h4.4M5.8 11.4h3"/></symbol>
+  <symbol id="i-plug" viewBox="0 0 16 16"><path d="M5.6 2.5v3M10.4 2.5v3"/><path d="M4 5.5h8v1.9a4 4 0 0 1-8 0z"/><path d="M8 11.4v2.1"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 16 16"><path d="M2.6 5.6h10.8v7.8H2.6z"/><path d="M2 2.6h12v3H2z"/><path d="M6.4 8.6h3.2"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 16 16"><path d="M3.2 6.4h6.6a3.2 3.2 0 0 1 0 6.4H6.2"/><path d="M3.2 6.4 5.8 3.8M3.2 6.4l2.6 2.6"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 16 16"><path d="M2.4 4.4h2.2M6.9 4.4h6.7"/><circle cx="5.6" cy="4.4" r="1.4"/><path d="M2.4 8h5.4M10.9 8h2.7"/><circle cx="9.6" cy="8" r="1.4"/><path d="M2.4 11.6h3.9M8.7 11.6h4.9"/><circle cx="7.4" cy="11.6" r="1.4"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 16 16"><rect x="4.6" y="4.6" width="6.8" height="6.8" rx="1.2" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-play" viewBox="0 0 16 16"><path d="M5.2 3.6 12 8l-6.8 4.4z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-clip" viewBox="0 0 16 16"><path d="M10.9 7.3 6.7 11.5a2.3 2.3 0 0 1-3.3-3.3l5-5a1.7 1.7 0 0 1 2.4 2.4l-4.9 4.9a1 1 0 0 1-1.4-1.4l4.2-4.2"/></symbol>
+  <symbol id="i-code" viewBox="0 0 16 16"><path d="M6 4.4 2.5 8 6 11.6M10 4.4 13.5 8 10 11.6"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 16 16"><path d="M5.6 5.6h7.2v7.2H5.6z"/><path d="M3.2 10.2V3.2h7"/></symbol>
+  <symbol id="i-external" viewBox="0 0 16 16"><path d="M6.6 3.4h6v6"/><path d="M12.6 3.4 6.2 9.8"/><path d="M11 9.4v2.4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h2.4"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><path d="M3 8.6 6.4 12 13 4.6"/></symbol>
+  <symbol id="i-x" viewBox="0 0 16 16"><path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 16 16"><path d="M4.6 6.4 8 9.8l3.4-3.4"/></symbol>
+  <symbol id="i-spark" viewBox="0 0 16 16"><path d="M8 2.2 9.2 6.4 13.4 7.6 9.2 8.8 8 13 6.8 8.8 2.6 7.6 6.8 6.4z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 16 16"><path d="M8 2.8 14 13H2z"/><path d="M8 6.6v3.2M8 11.6v.5"/></symbol>
+  <symbol id="i-info" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.6"/><path d="M8 7.2v3.4"/><circle cx="8" cy="5.1" r=".7" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 16 16"><path d="M3 4.6 6 8l-3 3.4"/><path d="M8.4 11.4h4.6"/></symbol>
+  <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="3.8"/><path d="M9.9 9.9 13.4 13.4"/></symbol>
+  <symbol id="i-pencil" viewBox="0 0 16 16"><path d="M10.8 2.9l2.3 2.3-7 7-3 .7.7-3z"/><path d="M9.4 4.3l2.3 2.3"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 16 16"><path d="M2.8 4.4h10.4"/><path d="M6 4.4V2.8h4v1.6"/><path d="M4.2 4.4l.7 8.8h6.2l.7-8.8"/><path d="M6.6 6.8v4.2M9.4 6.8v4.2"/></symbol>
+  <symbol id="i-cube" viewBox="0 0 16 16"><path d="M8 2.2 13.4 5.2v5.6L8 13.8 2.6 10.8V5.2z"/><path d="M2.6 5.2 8 8.2l5.4-3"/><path d="M8 8.2v5.6"/></symbol>
+</svg>
+
+<div class="app">
+  <header class="head">
+    <div class="headline" title="Agent status">
+      <span class="dot" id="status-dot" data-status="idle"></span>
+      <span class="headline-text" id="status-text">Idle</span>
+    </div>
+    <div class="headline-actions">
+      <button type="button" class="icon-btn" id="btn-agents" aria-label="Agent instructions" title="Agent instructions — open the loaded agent.md / AGENTS.md files">
+        <svg class="icon" aria-hidden="true"><use href="#i-file"></use></svg>
+      </button>
+      <button type="button" class="icon-btn" id="btn-mcp" aria-label="MCP servers" title="MCP servers — configure and reload">
+        <svg class="icon" aria-hidden="true"><use href="#i-plug"></use></svg>
+      </button>
+      <button type="button" class="icon-btn" id="btn-compact" aria-label="Compact conversation" title="Compact the conversation to free context">
+        <svg class="icon" aria-hidden="true"><use href="#i-archive"></use></svg>
+      </button>
+      <button type="button" class="icon-btn" id="btn-revert" aria-label="Revert last task" title="Undo the file changes from the last task">
+        <svg class="icon" aria-hidden="true"><use href="#i-undo"></use></svg>
+      </button>
+      <button type="button" class="icon-btn" id="btn-reset" aria-label="New conversation" title="Start a new conversation">
+        <svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg>
+      </button>
+      <button type="button" class="icon-btn" id="btn-settings" aria-label="Settings" title="Open Coding Harness settings">
+        <svg class="icon" aria-hidden="true"><use href="#i-sliders"></use></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="meta" id="meta">
+    <span class="chip" id="chip-provider">provider</span>
+    <span class="chip" id="chip-policy">policy</span>
+    <span class="chip" id="chip-agents" title="Agent instruction files">agents: –</span>
+    <span class="chip" id="chip-stream" title="Token-by-token rendering of model output">stream</span>
+    <span class="chip" id="chip-thinking" title="The model's reasoning stream, when the backend provides one">thinking</span>
+    <span class="chip" id="chip-tokens" title="Total tokens used (input + output)">0 tokens</span>
+    <span class="chip" id="chip-speed" title="Current generation speed" hidden>0 tok/s</span>
+    <span class="chip" id="chip-context" title="Context window utilisation — click to preview the system context">ctx 0%</span>
+    <span class="chip" id="chip-mcp" title="MCP servers" hidden>mcp: off</span>
+    <span class="chip" id="chip-workspace" title=""></span>
+  </div>
+
+  <div class="compact-banner" id="compact-banner" hidden>
+    <svg class="icon banner-icon" aria-hidden="true"><use href="#i-warn"></use></svg>
+    <span class="compact-text" id="compact-text">Context is getting full. Consider compacting.</span>
+    <div class="compact-actions">
+      <button type="button" class="primary" id="btn-compact-banner" title="Summarise older messages to free context">Compact</button>
+      <button type="button" class="icon-btn" id="btn-compact-dismiss" aria-label="Dismiss" title="Dismiss">
+        <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="activity" id="activity" hidden>
+    <span class="spinner" id="activity-spinner">◐</span>
+    <span class="activity-text" id="activity-text">Working…</span>
+    <span class="activity-detail" id="activity-detail"></span>
+    <span class="activity-elapsed" id="activity-elapsed"></span>
+  </div>
+
+  <div class="stream-wrap">
+    <button type="button" class="jump-latest" id="jump-latest" hidden>Jump to latest</button>
+    <main class="stream" id="stream" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation">
+      <div class="empty" id="empty">
+        <div class="empty-hero">
+          <svg class="empty-mark" aria-hidden="true"><use href="#i-cube"></use></svg>
+          <h2>Coding Harness</h2>
+          <p>Tools for coding: read, search, create and edit files, run commands. Every change is checkpointed and can be reverted.</p>
+          <p class="empty-note" id="empty-note">Instructions come from your <code>agent.md</code> / <code>AGENTS.md</code> files.</p>
+        </div>
+        <div class="examples" id="examples">
+          <button type="button" class="example" data-prompt="Explain the structure of this project and list the main entry points.">
+            <span class="example-title">Explain this project</span>
+            <span class="example-sub">Map the layout and entry points</span>
+          </button>
+          <button type="button" class="example" data-prompt="Find the function that handles configuration loading and summarise what it does.">
+            <span class="example-title">Find a function</span>
+            <span class="example-sub">Trace how configuration is loaded</span>
+          </button>
+          <button type="button" class="example" data-prompt="Run the test suite and fix the first failing test.">
+            <span class="example-title">Run the tests</span>
+            <span class="example-sub">Run the suite and fix the first failure</span>
+          </button>
+          <button type="button" class="example" data-prompt="Add a docstring to every public function in the main module.">
+            <span class="example-title">Document a module</span>
+            <span class="example-sub">Add docstrings to public functions</span>
+          </button>
+        </div>
+        <p class="empty-hint"><kbd>Enter</kbd> runs · <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a line · paste or drop an image</p>
+      </div>
+    </main>
+  </div>
+
+  <footer class="composer">
+    <div class="attachments" id="attachments" hidden></div>
+    <div class="composer-box">
+      <textarea id="input" rows="1" placeholder="Describe a task, ask a question, or paste a screenshot…" spellcheck="false" aria-label="Message"></textarea>
+      <div class="composer-bar">
+        <div class="composer-tools">
+          <button type="button" class="tool-btn" id="btn-attach" title="Attach an image (or paste one)">
+            <svg class="icon" aria-hidden="true"><use href="#i-clip"></use></svg><span>Image</span>
+          </button>
+          <button type="button" class="tool-btn" id="btn-selection" title="Insert the current editor selection">
+            <svg class="icon" aria-hidden="true"><use href="#i-code"></use></svg><span>Selection</span>
+          </button>
+          <input type="file" id="file-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden />
+        </div>
+        <span class="hint-usage" id="hint-usage"></span>
+        <div class="composer-actions">
+          <button type="button" class="primary" id="btn-send" title="Run the task (Enter)">
+            <svg class="icon" aria-hidden="true"><use href="#i-play"></use></svg><span>Run</span>
+          </button>
+          <button type="button" class="danger" id="btn-stop" title="Stop the running task" hidden>
+            <svg class="icon" aria-hidden="true"><use href="#i-stop"></use></svg><span>Stop</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <div class="modal-backdrop" id="mcp-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mcp-modal-title">
+      <div class="modal-head">
+        <span class="modal-title" id="mcp-modal-title">MCP servers</span>
+        <button type="button" class="icon-btn" id="mcp-modal-close" aria-label="Close" title="Close">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <label class="check-row">
+          <input type="checkbox" id="mcp-enabled" />
+          <span>Enable MCP servers</span>
+        </label>
+        <div class="form-row">
+          <label for="mcp-timeout">Tool call timeout (ms)</label>
+          <input type="number" id="mcp-timeout" min="1000" step="500" />
+        </div>
+        <div class="mcp-file-list" id="mcp-file-servers" hidden></div>
+        <div class="server-list" id="mcp-server-list"></div>
+        <button type="button" class="linklike" id="mcp-add">+ Add server</button>
+        <div class="mcp-help">
+          <p>
+            MCP (Model Context Protocol) servers add their tools to the agent, prefixed
+            <code>mcp_&lt;server&gt;_&lt;tool&gt;</code>. A <strong>stdio</strong> server is a command the editor
+            spawns and talks to over its stdin/stdout; <strong>http</strong> and <strong>sse</strong> servers are
+            reached over the network at a <code>https://</code> endpoint — Streamable HTTP by default, with
+            automatic fallback to the older SSE transport (or force one via the type selector).
+          </p>
+          <p>
+            Stdio example: <code>npx -y @modelcontextprotocol/server-filesystem .</code><br />
+            HTTP example: <code>url: https://mcp.example.com/mcp</code> with header
+            <code>Authorization: Bearer …</code>
+          </p>
+          <p>
+            These settings live in <code>codingHarness.mcp.*</code>. Servers are also read from
+            <code>.vscode/mcp.json</code>, <code>.mcp.json</code> and <code>mcp.json</code>; those appear
+            read-only above and settings override a file entry with the same name. Servers (re)connect on
+            save or via Reload.
+          </p>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <select id="mcp-target" title="Which settings file to write">
+          <option value="user">User settings (all workspaces)</option>
+          <option value="workspace">Workspace settings (.vscode/settings.json)</option>
+        </select>
+        <span class="modal-status" id="mcp-modal-status"></span>
+        <button type="button" id="mcp-reload" title="Stop every server and connect again from the stored settings">Reload</button>
+        <button type="button" class="primary" id="mcp-save" title="Write these settings and connect">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script nonce="{{NONCE}}" src="{{JS}}"></script>
+</body>
+</html>

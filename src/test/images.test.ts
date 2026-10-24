@@ -191,6 +191,7 @@ const repoRoot = path.resolve(__dirname, '..', '..');
 const js = fs.readFileSync(path.join(repoRoot, 'media', 'chat.js'), 'utf8');
 const css = fs.readFileSync(path.join(repoRoot, 'media', 'chat.css'), 'utf8');
 const view = fs.readFileSync(path.join(repoRoot, 'src', 'vscode', 'chatView.ts'), 'utf8');
+const panel = fs.readFileSync(path.join(repoRoot, 'media', 'panel.html'), 'utf8');
 
 test('the composer stages pasted and dropped images', () => {
   assert.match(js, /addEventListener\('paste'/, 'the textarea must intercept clipboard images');
@@ -201,7 +202,7 @@ test('the composer stages pasted and dropped images', () => {
 });
 
 test('the panel renders attachments, before and after sending', () => {
-  assert.match(view, /id="attachments"/, 'the staging tray must exist in the markup');
+  assert.match(panel, /id="attachments"/, 'the staging tray must exist in the markup');
   assert.match(js, /function renderAttachments\(/);
   assert.match(js, /function renderUserImages\(/);
   assert.ok(css.includes('.attachment'), 'the tray needs styling');
