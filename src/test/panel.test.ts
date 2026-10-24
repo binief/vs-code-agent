@@ -19,8 +19,21 @@ const repoRoot = path.resolve(__dirname, '..', '..');
 const panelHtml = fs.readFileSync(path.join(repoRoot, 'media', 'panel.html'), 'utf8');
 const panelJs = fs.readFileSync(path.join(repoRoot, 'media', 'chat.js'), 'utf8');
 
-/** jsdom ships no types and only a handful of members are used here. */
-const { JSDOM } = require('jsdom') as { JSDOM: any };
+/**
+ * jsdom ships no types and only a handful of members are used here.
+ *
+ * It is loaded defensively: when the installed jsdom is too new for the Node
+ * version running the tests (the release workflow uses Node 20), requiring it
+ * throws. A module-level throw would collapse this file into one opaque test
+ * failure, so remember the reason and report it from each test instead.
+ */
+let jsdom: { JSDOM: any } | undefined;
+let jsdomError = '';
+try {
+  jsdom = require('jsdom') as { JSDOM: any };
+} catch (error) {
+  jsdomError = error instanceof Error ? error.message : String(error);
+}
 
 interface Harness {
   window: any;
@@ -31,6 +44,12 @@ interface Harness {
 }
 
 function mount(): Harness {
+  if (!jsdom) {
+    throw new Error(
+      `the panel tests need jsdom (a devDependency) to load under this Node ${process.version}: ${jsdomError}`,
+    );
+  }
+  const JSDOM = jsdom.JSDOM;
   const html = panelHtml
     .replace('{{CSP}}', "default-src 'none'")
     .replace('{{CSS}}', 'chat.css')
