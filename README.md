@@ -538,7 +538,8 @@ validation as the panel.
 ```bash
 npm install
 npm run compile        # tsc → out/
-npm test               # unit tests (paths, policy, line endings, tools, agent loop, providers, manifest)
+npm test               # unit tests (paths, policy, tools, agent loop, providers,
+                       # panel rendering, manifest)
 npm run watch          # incremental compile while you hack
 npm run package        # build a .vsix
 ```
@@ -567,9 +568,17 @@ src/vscode/          the editor integration
 media/               chat.css / chat.js (no bundler)
 src/test/            node --test suites (paths, policy, tools, loop, SSE
                      streaming, panel messages via a stubbed vscode, webview
-                     layout/rendering rules and markup structure)
+                     layout rules, and panel rendering in jsdom)
 playground/          toy project for the F5 sandbox
 ```
+
+### Test runtime
+
+The release workflow runs the suite on Node 20, the same major as the extension
+host for VS Code 1.85, so keep test dependencies compatible with it: `jsdom` is
+pinned to `^26` because 30+ requires Node 22.22. A dependency that is newer than
+the runner does not fail the install — it fails when a test file tries to load,
+which is why the pin matters.
 
 ### Adding a tool
 
