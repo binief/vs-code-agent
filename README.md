@@ -483,6 +483,24 @@ are pinned with `flex: 0 0 auto`. Children of a column flex container shrink by 
 compress every bubble as the transcript grew instead of scrolling. Auto-follow also yields: scroll up
 to read earlier output and the view stays put, with a **Jump to latest** button to re-stick.
 
+Answers are rendered as Markdown — headings, ordered/nested lists, tables, blockquotes, links, inline
+formatting, and fenced code with per-block **insert** (at the cursor) and **copy** — rather than one
+pre-wrapped paragraph. Model output is escaped before any tag is added, so a transcript can never inject
+markup into the panel.
+
+Tool calls collapse to a single row (icon, name, primary argument, duration, status colour) and expand
+on click to show arguments and output; a failure stays open, a success folds away. Reasoning sits in
+its own dashed lane that is expanded while it streams and folds to a one-line preview with its duration
+once the answer lands; opening it yourself keeps it open. The header carries status plus compact, MCP,
+agents, revert, new-conversation and settings actions; the meta row reports provider, policies,
+instruction files, token count and context use, and a warning banner offers **Compact** past 75%.
+
+The markup lives in `media/panel.html` (styles in `media/chat.css`, client logic in `media/chat.js`), and
+`chatView.ts` only substitutes the CSP, two asset URIs and a nonce — so the UI can be edited as HTML
+instead of escaped strings. `src/test/webview.test.ts` holds the layout contract: the transcript
+scrolls, its children never shrink, every `getElementById` resolves to an element in the markup, tags
+balance, and colours come from theme variables only.
+
 ### Images
 
 Paste a screenshot straight into the composer (`Ctrl`/`Cmd`+`V`), drop an image file onto the panel, or

@@ -1,11 +1,19 @@
 /* Coding Harness — agent panel client.
-   Plain JS (no build step): renders transcript items the extension posts and
-   sends user intent back. All state lives in the extension. */
+
+   Plain JS, no build step. The extension owns all state; this file renders the
+   transcript items it posts and sends user intent back.
+
+   Two things are worth knowing before editing:
+   - assistant text is real Markdown (headings, lists, tables, code), rendered
+     here with an escaping-first parser because the panel has no dependencies;
+   - streamed items are patched in place, so a long answer does not rebuild its
+     subtree on every token (that used to reset scroll and kill the selection). */
 (function () {
   const vscode = acquireVsCodeApi();
 
   const stream = document.getElementById('stream');
   const empty = document.getElementById('empty');
+  const emptyNote = document.getElementById('empty-note');
   const input = document.getElementById('input');
   const btnSend = document.getElementById('btn-send');
   const btnStop = document.getElementById('btn-stop');
@@ -26,13 +34,13 @@
   const chipContext = document.getElementById('chip-context');
   const chipMcp = document.getElementById('chip-mcp');
   const chipAgents = document.getElementById('chip-agents');
+  const chipStream = document.getElementById('chip-stream');
+  const chipThinking = document.getElementById('chip-thinking');
   const hintUsage = document.getElementById('hint-usage');
   const activityBox = document.getElementById('activity');
   const activityText = document.getElementById('activity-text');
   const activityDetail = document.getElementById('activity-detail');
   const activityElapsed = document.getElementById('activity-elapsed');
-  const chipStream = document.getElementById('chip-stream');
-  const chipThinking = document.getElementById('chip-thinking');
   const btnJump = document.getElementById('jump-latest');
   const compactBanner = document.getElementById('compact-banner');
   const compactText = document.getElementById('compact-text');
@@ -53,14 +61,13 @@
   let thinkingEnabled = true;
   /** Auto-follow the transcript, until the reader scrolls up to inspect something. */
   let stickToBottom = true;
-
-  // Token tracking for live speed
+  /** Token tracking for the live speed/context readout. */
   let cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
   let currentSpeed = 0;
   let contextWindow = 128000;
   let contextTokens = 0;
   let contextPercent = 0;
-  const streamTrackers = new Map(); // id -> { start, chars, tokens }
+  let codeSeq = 0;
 
   /* Images staged for the next message: { id, name, mediaType, dataUrl, bytes }. */
   const pending = [];
@@ -78,45 +85,38 @@
     return node;
   }
 
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+
+  /** `<svg class="icon"><use href="#i-name"></use></svg>` */
+  function icon(name, className) {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('class', 'icon' + (className ? ' ' + className : ''));
+    svg.setAttribute('aria-hidden', 'true');
+    const use = document.createElementNS(SVG_NS, 'use');
+    use.setAttribute('href', '#i-' + name);
+    svg.appendChild(use);
+    return svg;
+  }
+
   function escapeHtml(value) {
     return String(value)
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
-      .replace(/\"/g, '&quot;');
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
-  /** Minimal markdown: fenced code, inline code, bold. Everything is escaped. */
-  function renderMarkdown(text) {
-    const parts = String(text).split(/```/);
-    let html = '';
-    for (let i = 0; i < parts.length; i++) {
-      if (i % 2 === 1) {
-        const body = parts[i].replace(/^[a-zA-Z0-9+#-]*\n/, '');
-        html += `<pre><code>${escapeHtml(body.replace(/\n$/, ''))}</code></pre>`;
-      } else {
-        html += escapeHtml(parts[i])
-          .replace(/`([^`\n]+)`/g, '<code>$1</code>')
-          .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
-      }
-    }
-    return html;
+  function oneLine(text, limit) {
+    const flat = String(text || '').replace(/\s+/g, ' ').trim();
+    const max = limit || 110;
+    return flat.length > max ? flat.slice(0, max - 1) + '\u2026' : flat;
   }
 
-  function setStatus(status, step, maxSteps) {
-    const labels = {
-      idle: 'Idle',
-      thinking: 'Thinking',
-      executing: 'Running tools',
-      approval: 'Waiting for approval',
-      running: 'Working',
-    };
-    let text = labels[status] || status;
-    if ((status === 'thinking' || status === 'executing') && step) {
-      text += ' · step ' + step + (maxSteps ? '/' + maxSteps : '');
-    }
-    statusText.textContent = text;
-    statusDot.dataset.status = status;
+  function formatMs(ms) {
+    if (ms < 1000) return ms + 'ms';
+    if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+    return Math.round(ms / 60000) + 'm';
   }
 
   function formatTokens(n) {
@@ -126,47 +126,275 @@
     return Math.round(n / 1000) + 'k';
   }
 
-  function updateTokenChips() {
-    if (!chipTokens) return;
-    const total = cumulativeUsage.totalTokens || 0;
-    const input = cumulativeUsage.inputTokens || 0;
-    const output = cumulativeUsage.outputTokens || 0;
-    chipTokens.textContent = formatTokens(total) + ' tokens';
-    chipTokens.title = `Input: ${input} · Output: ${output} · Total: ${total}`;
-    if (total > 0) chipTokens.hidden = false;
+  function formatBytes(bytes) {
+    if (!bytes && bytes !== 0) return '';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  }
 
-    if (chipSpeed) {
-      if (currentSpeed > 0 && busy) {
-        chipSpeed.textContent = currentSpeed.toFixed(1) + ' tok/s';
-        chipSpeed.hidden = false;
-      } else if (!busy) {
-        // Keep last speed visible for a moment, then hide if no recent activity
-        // For now, show if we have a speed and total tokens
-        if (currentSpeed > 0 && total > 0) {
-          chipSpeed.textContent = currentSpeed.toFixed(1) + ' tok/s';
-          chipSpeed.hidden = false;
-        } else {
-          chipSpeed.hidden = true;
+  /* ----------------------------------------------------------- markdown */
+
+  /* Inline formatting. The text is escaped *before* any tag is added, so model
+     output can never inject markup; only the tags built here reach innerHTML. */
+  function inlineMarkdown(text) {
+    const codes = [];
+    let out = escapeHtml(text).replace(/`([^`\n]+)`/g, (_match, code) => {
+      codes.push(code);
+      return '\u0000' + (codes.length - 1) + '\u0000';
+    });
+
+    out = out.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" rel="noreferrer">$1</a>');
+    out = out.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+    out = out.replace(/(^|[\s([{>])__([^_\n]+)__/g, '$1<strong>$2</strong>');
+    out = out.replace(/(^|[\s([{>])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    out = out.replace(/(^|[\s([{>])_([^_\n]+)_/g, '$1<em>$2</em>');
+    out = out.replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
+
+    return out.replace(/\u0000(\d+)\u0000/g, (_match, index) => '<code>' + codes[Number(index)] + '</code>');
+  }
+
+  function codeBlockHtml(lang, code) {
+    const id = 'code-' + ++codeSeq;
+    const label = lang ? escapeHtml(lang) : 'text';
+    return (
+      '<div class="code-block">' +
+      '<div class="code-head">' +
+      '<span class="code-lang">' + label + '</span>' +
+      '<button type="button" class="code-btn code-insert" data-target="' + id + '" title="Insert at the cursor in the active editor">insert</button>' +
+      '<button type="button" class="code-btn code-copy" data-target="' + id + '" title="Copy this code">copy</button>' +
+      '</div>' +
+      '<pre id="' + id + '"><code>' + escapeHtml(code) + '</code></pre>' +
+      '</div>'
+    );
+  }
+
+  const LIST_RE = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+  const BLOCK_START_RE = /^(\s*```|#{1,6}\s|\s*>|\s*([-*+]|\d+[.)])\s+|\s*\|)/;
+
+  function renderList(lines, start) {
+    const first = LIST_RE.exec(lines[start]);
+    const ordered = /^\d/.test(first[2]);
+    const indent = first[1].length;
+    let html = ordered ? '<ol>' : '<ul>';
+    let i = start;
+    while (i < lines.length) {
+      const match = LIST_RE.exec(lines[i]);
+      if (!match) break;
+      if (match[1].length < indent) break;
+      if (match[1].length > indent) break;
+      if (/^\d/.test(match[2]) !== ordered) break;
+
+      let text = match[3];
+      let nested = '';
+      i += 1;
+      // Continuation lines and nested lists belong to this item.
+      while (i < lines.length) {
+        const next = LIST_RE.exec(lines[i]);
+        if (next && next[1].length > indent) {
+          const sub = renderList(lines, i);
+          nested += sub.html;
+          i = sub.next;
+          continue;
         }
+        if (next) break;
+        if (!lines[i].trim()) {
+          const after = lines[i + 1] || '';
+          if (new RegExp('^\\s{' + (indent + 2) + ',}\\S').test(after)) {
+            i += 1;
+            continue;
+          }
+          break;
+        }
+        const leading = lines[i].match(/^\s*/)[0].length;
+        if (leading > indent) {
+          text += '\n' + lines[i].trim();
+          i += 1;
+          continue;
+        }
+        break;
+      }
+
+      let prefix = '';
+      const task = /^\[([ xX])\]\s+/.exec(text);
+      if (task) {
+        prefix = '<span class="task' + (task[1] === ' ' ? '' : ' done') + '">' + (task[1] === ' ' ? '\u2610' : '\u2611') + '</span> ';
+        text = text.slice(task[0].length);
+      }
+      const body = inlineMarkdown(text).replace(/\n/g, '<br>');
+      html += '<li>' + prefix + body + nested + '</li>';
+    }
+    html += ordered ? '</ol>' : '</ul>';
+    return { html, next: i };
+  }
+
+  /* Alignment is a class, not a style attribute: the panel CSP allows the
+     stylesheet but not inline styles. */
+  function alignClass(align) {
+    if (align === 'center') return ' class="ta-center"';
+    if (align === 'right') return ' class="ta-right"';
+    return '';
+  }
+
+  function renderTable(lines, start) {
+    const split = (row) =>
+      row
+        .trim()
+        .replace(/^\|/, '')
+        .replace(/\|$/, '')
+        .split('|')
+        .map((cell) => cell.trim());
+    const header = split(lines[start]);
+    const align = split(lines[start + 1]).map((cell) => {
+      if (/^:-+:$/.test(cell)) return 'center';
+      if (/^-+:$/.test(cell)) return 'right';
+      return 'left';
+    });
+    let html = '<table><thead><tr>';
+    header.forEach((cell, index) => {
+      html += '<th' + alignClass(align[index]) + '>' + inlineMarkdown(cell) + '</th>';
+    });
+    html += '</tr></thead><tbody>';
+    let i = start + 2;
+    while (i < lines.length && /^\s*\|/.test(lines[i])) {
+      const cells = split(lines[i]);
+      html += '<tr>';
+      for (let c = 0; c < header.length; c += 1) {
+        html += '<td' + alignClass(align[c]) + '>' + inlineMarkdown(cells[c] || '') + '</td>';
+      }
+      html += '</tr>';
+      i += 1;
+    }
+    html += '</tbody></table>';
+    return { html, next: i };
+  }
+
+  /** Markdown -> HTML. Escaping happens first; only tags built here are emitted. */
+  function renderMarkdown(source) {
+    const lines = String(source == null ? '' : source).replace(/\r\n?/g, '\n').split('\n');
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+
+      if (!line.trim()) {
+        i += 1;
+        continue;
+      }
+
+      // Fenced code: ```lang … ```
+      const fence = /^\s*```(.*)$/.exec(line);
+      if (fence) {
+        const lang = fence[1].trim().split(/\s+/)[0] || '';
+        const body = [];
+        i += 1;
+        while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) {
+          body.push(lines[i]);
+          i += 1;
+        }
+        i += 1;
+        out.push(codeBlockHtml(lang, body.join('\n')));
+        continue;
+      }
+
+      const heading = /^(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line);
+      if (heading) {
+        const level = heading[1].length;
+        out.push('<h' + level + '>' + inlineMarkdown(heading[2]) + '</h' + level + '>');
+        i += 1;
+        continue;
+      }
+
+      if (/^\s*([-*_])\s*(?:\1\s*){2,}$/.test(line)) {
+        out.push('<hr>');
+        i += 1;
+        continue;
+      }
+
+      if (/^\s*\|/.test(line) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+        const table = renderTable(lines, i);
+        out.push(table.html);
+        i = table.next;
+        continue;
+      }
+
+      if (/^\s*>/.test(line)) {
+        const quoted = [];
+        while (i < lines.length && /^\s*>/.test(lines[i])) {
+          quoted.push(lines[i].replace(/^\s*>\s?/, ''));
+          i += 1;
+        }
+        out.push('<blockquote>' + renderMarkdown(quoted.join('\n')) + '</blockquote>');
+        continue;
+      }
+
+      if (LIST_RE.test(line)) {
+        const list = renderList(lines, i);
+        out.push(list.html);
+        i = list.next;
+        continue;
+      }
+
+      // Paragraph: stop at a blank line or the start of another block.
+      const paragraph = [line];
+      i += 1;
+      while (i < lines.length && lines[i].trim() && !BLOCK_START_RE.test(lines[i])) {
+        paragraph.push(lines[i]);
+        i += 1;
+      }
+      out.push('<p>' + paragraph.map((part) => inlineMarkdown(part)).join('<br>') + '</p>');
+    }
+    return out.join('');
+  }
+
+  /* ------------------------------------------------------------ status */
+
+  function setStatus(status, step, maxSteps) {
+    const labels = {
+      idle: 'Idle',
+      thinking: 'Thinking',
+      executing: 'Running tools',
+      approval: 'Waiting for approval',
+      running: 'Working',
+    };
+    let text = labels[status] || status || 'Idle';
+    if ((status === 'thinking' || status === 'executing') && step) {
+      text += ' · step ' + step + (maxSteps ? '/' + maxSteps : '');
+    }
+    statusText.textContent = text;
+    statusDot.dataset.status = status || 'idle';
+  }
+
+  function updateTokenChips() {
+    const total = cumulativeUsage.totalTokens || 0;
+    const inputTokens = cumulativeUsage.inputTokens || 0;
+    const outputTokens = cumulativeUsage.outputTokens || 0;
+    if (chipTokens) {
+      chipTokens.textContent = formatTokens(total) + ' tokens';
+      chipTokens.title = 'Input: ' + inputTokens + ' · Output: ' + outputTokens + ' · Total: ' + total;
+      chipTokens.hidden = total === 0;
+    }
+    if (chipSpeed) {
+      const show = currentSpeed > 0 && total > 0;
+      chipSpeed.hidden = !show;
+      if (show) {
+        chipSpeed.textContent = currentSpeed.toFixed(1) + ' tok/s';
+        chipSpeed.title = 'Generation speed, last turn';
       }
     }
-
     if (chipContext) {
       const pct = contextPercent || 0;
       chipContext.textContent = 'ctx ' + Math.round(pct) + '%';
-      chipContext.title = `Context: ${contextTokens} / ${contextWindow} tokens (${Math.round(pct)}%)`;
-      chipContext.classList.remove('warn', 'error');
-      if (pct >= 90) chipContext.classList.add('error');
-      else if (pct >= 75) chipContext.classList.add('warn');
-      // Show banner when getting full
+      chipContext.title = 'Context: ' + contextTokens + ' / ' + contextWindow + ' tokens (' + Math.round(pct) + '%) — click to preview the system message';
+      chipContext.classList.toggle('warn', pct >= 75 && pct < 90);
+      chipContext.classList.toggle('error', pct >= 90);
       if (compactBanner && compactText) {
         if (pct >= 75 && !busy) {
           compactBanner.hidden = false;
-          if (pct >= 90) {
-            compactText.textContent = `Context ${Math.round(pct)}% full (${contextTokens}/${contextWindow} tokens). Compact now to avoid truncation.`;
-          } else {
-            compactText.textContent = `Context ${Math.round(pct)}% used. Consider compacting to free space.`;
-          }
+          compactText.textContent =
+            pct >= 90
+              ? 'Context ' + Math.round(pct) + '% full (' + contextTokens + '/' + contextWindow + ' tokens). Compact to avoid truncation.'
+              : 'Context ' + Math.round(pct) + '% used. Compacting frees space for the next task.';
         } else if (pct < 70) {
           compactBanner.hidden = true;
         }
@@ -174,82 +402,120 @@
     }
   }
 
+  function applyEmptyNote(state) {
+    if (!emptyNote) return;
+    const files = Array.isArray(state.agentFiles) ? state.agentFiles : [];
+    if (state.agentFilesEnabled === false) {
+      emptyNote.innerHTML =
+        'Instruction loading is off, so the agent gets context but no guidance. Enable <code>codingHarness.agentFiles.enabled</code>.';
+      return;
+    }
+    if (files.length === 0) {
+      emptyNote.innerHTML =
+        'No instruction files found. Add <code>agent.md</code>, or any <code>.md</code> inside <code>.agents/</code>.';
+      return;
+    }
+    const shown = files.slice(0, 3).map((file) => '<code>' + escapeHtml(file.displayPath) + '</code>');
+    const more = files.length > shown.length ? ' +' + (files.length - shown.length) + ' more' : '';
+    emptyNote.innerHTML = files.length + ' instruction file(s) loaded: ' + shown.join(', ') + more;
+  }
+
   function applyState(state) {
     if (!state) return;
     busy = Boolean(state.busy);
     btnSend.disabled = busy;
     btnStop.hidden = !busy;
-    chipProvider.textContent = state.provider + ' · ' + state.model;
-    chipProvider.title = state.keyPresent
-      ? 'API key: configured'
-      : state.provider === 'mock'
-        ? 'Offline planner — no API key needed'
-        : 'No API key configured (Coding Harness: Set API Key)';
-    if (!state.keyPresent && state.provider !== 'mock') chipProvider.classList.add('warn');
-    else chipProvider.classList.remove('warn');
 
-    chipPolicy.textContent = 'edits: ' + state.editPolicy + ' · shell: ' + state.commandPolicy;
+    if (chipProvider) {
+      const provider = state.provider || 'mock';
+      chipProvider.textContent = provider + (state.model ? ' · ' + state.model : '');
+      chipProvider.title = state.keyPresent
+        ? 'API key: configured'
+        : provider === 'mock'
+          ? 'Offline planner — no API key needed'
+          : 'No API key configured (Coding Harness: Set API Key)';
+      chipProvider.classList.toggle('warn', !state.keyPresent && provider !== 'mock');
+    }
+
+    if (chipPolicy) {
+      chipPolicy.textContent = 'edits: ' + state.editPolicy + ' · shell: ' + state.commandPolicy;
+      chipPolicy.title =
+        'File writes: ' + state.editPolicy + '\nShell commands: ' + state.commandPolicy + '\nChange both in settings.';
+    }
+
     if (chipAgents) {
       const files = Array.isArray(state.agentFiles) ? state.agentFiles : [];
       const enabled = state.agentFilesEnabled !== false;
+      chipAgents.classList.remove('warn');
       if (!enabled) {
         chipAgents.textContent = 'agents: off';
         chipAgents.classList.add('warn');
-        chipAgents.title = 'Agent instruction loading is disabled (codingHarness.agentFiles.enabled)';
+        chipAgents.title = 'Instruction loading is disabled (codingHarness.agentFiles.enabled). Click to open the setting.';
       } else if (files.length === 0) {
         chipAgents.textContent = 'agents: none';
         chipAgents.classList.add('warn');
-        chipAgents.title = 'No instruction files found — click to create one, or add any .md file under .agents/. The extension has no built-in prompt.';
+        chipAgents.title = 'No instruction files found — click to create agent.md. The extension has no built-in prompt.';
       } else {
         chipAgents.textContent = 'agents: ' + files.length;
-        chipAgents.classList.remove('warn');
-        chipAgents.title = files.map((file) => file.displayPath).join('\n');
+        chipAgents.title = files.map((file) => file.displayPath).join('\n') + '\n\nClick to open.';
       }
     }
-    streamEnabled = state.stream !== false;
-    chipStream.textContent = 'stream: ' + (streamEnabled ? 'on' : 'off');
-    chipStream.title = streamEnabled
-      ? 'Model output is rendered token by token'
-      : 'Streaming disabled (codingHarness.stream = false)';
-    thinkingEnabled = state.showThinking !== false;
-    chipThinking.textContent = 'thinking: ' + (thinkingEnabled ? 'shown' : 'hidden');
-    chipThinking.title = thinkingEnabled
-      ? "The model's reasoning stream is shown in its own lane"
-      : 'Reasoning hidden (codingHarness.showThinking = false)';
-    chipWorkspace.textContent = state.workspace || 'no folder open';
-    chipWorkspace.title = state.workspace || '';
 
-    // Token usage
+    if (chipStream) {
+      streamEnabled = state.stream !== false;
+      chipStream.textContent = 'stream: ' + (streamEnabled ? 'on' : 'off');
+      chipStream.title = streamEnabled
+        ? 'Model output is rendered token by token'
+        : 'Streaming disabled (codingHarness.stream = false)';
+      chipStream.hidden = streamEnabled;
+      chipStream.classList.toggle('warn', !streamEnabled);
+    }
+
+    if (chipThinking) {
+      thinkingEnabled = state.showThinking !== false;
+      chipThinking.textContent = 'thinking: ' + (thinkingEnabled ? 'shown' : 'hidden');
+      chipThinking.title = thinkingEnabled
+        ? "The model's reasoning stream is shown in its own lane"
+        : 'Reasoning hidden (codingHarness.showThinking = false)';
+      chipThinking.hidden = thinkingEnabled;
+      chipThinking.classList.toggle('warn', !thinkingEnabled);
+    }
+
+    if (chipWorkspace) {
+      const workspace = state.workspace || '';
+      const base = workspace.split(/[\\/]/).filter(Boolean).pop() || '';
+      chipWorkspace.textContent = base || 'no folder';
+      chipWorkspace.title = workspace;
+      chipWorkspace.hidden = !workspace;
+    }
+
     if (state.usage) {
       cumulativeUsage = {
         inputTokens: state.usage.inputTokens || cumulativeUsage.inputTokens,
         outputTokens: state.usage.outputTokens || cumulativeUsage.outputTokens,
-        totalTokens: state.usage.totalTokens || (state.usage.inputTokens || 0) + (state.usage.outputTokens || 0) || cumulativeUsage.totalTokens,
+        totalTokens:
+          state.usage.totalTokens ||
+          (state.usage.inputTokens || 0) + (state.usage.outputTokens || 0) ||
+          cumulativeUsage.totalTokens,
       };
     }
-    if (state.cumulativeUsage) {
-      cumulativeUsage = state.cumulativeUsage;
-    }
-    if (typeof state.tokensPerSecond === 'number') {
-      currentSpeed = state.tokensPerSecond;
-    }
+    if (state.cumulativeUsage) cumulativeUsage = state.cumulativeUsage;
+    if (typeof state.tokensPerSecond === 'number') currentSpeed = state.tokensPerSecond;
     if (typeof state.contextWindow === 'number') contextWindow = state.contextWindow;
     if (typeof state.contextTokens === 'number') contextTokens = state.contextTokens;
     if (typeof state.contextPercent === 'number') contextPercent = state.contextPercent;
-    else if (contextWindow && contextTokens) {
-      contextPercent = (contextTokens / contextWindow) * 100;
-    }
+    else if (contextWindow && contextTokens) contextPercent = (contextTokens / contextWindow) * 100;
 
-    // MCP
     if (chipMcp) {
       const configured = state.mcpConfigured || 0;
       const running = state.mcpServers || 0;
       const tools = state.mcpToolCount || 0;
+      chipMcp.classList.remove('warn');
       if (state.mcpEnabled) {
-        chipMcp.textContent = `mcp: ${running} srv, ${tools} tools`;
-        chipMcp.title = `MCP enabled: ${running} connected server(s), ${tools} tool(s), ${configured} configured`;
+        chipMcp.textContent = 'mcp: ' + running + ' srv · ' + tools + ' tools';
+        chipMcp.title =
+          'MCP enabled: ' + running + ' connected server(s), ' + tools + ' tool(s), ' + configured + ' configured. Click to configure.';
         chipMcp.hidden = configured === 0 && running === 0 && tools === 0;
-        chipMcp.classList.remove('warn');
       } else if (configured > 0) {
         chipMcp.textContent = 'mcp: off';
         chipMcp.title = 'MCP is disabled (codingHarness.mcp.enabled)';
@@ -260,10 +526,9 @@
       }
     }
 
+    applyEmptyNote(state);
     updateTokenChips();
-
-    if (!state.busy) setStatus(state.status === 'running' ? 'idle' : state.status, state.step, state.maxSteps);
-    else setStatus(state.status, state.step, state.maxSteps);
+    setStatus(state.status === 'running' ? (busy ? 'running' : 'idle') : state.status, state.step, state.maxSteps);
   }
 
   function applyActivity(next) {
@@ -280,6 +545,7 @@
       thinking: 'Thinking',
       executing: 'Running ' + (next.tool || 'tool'),
       approval: 'Waiting for your approval',
+      running: 'Working',
       idle: 'Idle',
     };
     activityText.textContent = labels[next.status] || next.status;
@@ -295,18 +561,12 @@
   }
 
   /**
-   * Previously this function pinned the inner thinking scrollbar to the bottom
-   * on every tick. That caused the visible jump: updateItem replaced the
-   * thinking node (resetting scrollTop to 0) and then tickThinking forced it
-   * back to bottom 250ms later. Now streaming thinking has no inner scrollbar
-   * (max-height:none via CSS), so outer autoScroll handles following. This
-   * function is kept as a no-op for backwards compatibility and to satisfy
-   * existing layout tests that check for its presence.
+   * Kept for compatibility with the layout tests. Streaming thinking has no
+   * inner scrollbar (max-height:none in CSS), so the outer autoScroll follows
+   * it; forcing an inner scrollTop here used to make the block jump.
    */
   function tickThinking() {
-    // Intentionally no longer forces inner scrollTop — outer stream handles it.
-    // If non-streaming thinking blocks are manually opened and exceed max-height,
-    // we leave their scroll position alone to avoid fighting user scroll.
+    // Intentionally empty — see the comment above.
   }
 
   function tickRunningTools() {
@@ -325,8 +585,8 @@
 
   /**
    * Follow the newest output, but do not yank the view back down while the
-   * reader is scrolled up reading earlier tool calls - offer the jump button
-   * instead. This is what used to make long transcripts unusable.
+   * reader is scrolled up reading earlier tool calls — offer the jump button
+   * instead.
    */
   function autoScroll(force) {
     const atBottom = nearBottom();
@@ -363,28 +623,103 @@
     }
   }
 
+  /* -------------------------------------------------------- small pieces */
+
+  function copyText(text, button) {
+    vscode.postMessage({ type: 'copy', text: String(text == null ? '' : text) });
+    if (!button) return;
+    button.classList.add('copied');
+    // Icon-only buttons have no <span>; never write text into them, or the SVG
+    // glyph is destroyed. They report success through colour and the tooltip.
+    const label = button.querySelector('span');
+    const original = label ? label.textContent : button.title;
+    if (label) label.textContent = 'Copied';
+    else button.title = 'Copied';
+    setTimeout(() => {
+      button.classList.remove('copied');
+      if (label) label.textContent = original;
+      else button.title = original;
+    }, 1200);
+  }
+
+  function actionButton(iconName, title, onClick) {
+    const button = el('button', 'icon-btn');
+    button.type = 'button';
+    button.title = title;
+    button.setAttribute('aria-label', title);
+    button.appendChild(icon(iconName));
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      onClick();
+    });
+    return button;
+  }
+
+  function caretInto(container) {
+    const caret = el('span', 'caret');
+    const last = container.lastElementChild;
+    const blockTags = ['P', 'LI', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'TD', 'BLOCKQUOTE'];
+    if (last && blockTags.indexOf(last.tagName) !== -1) last.appendChild(caret);
+    else container.appendChild(caret);
+  }
+
+  function toolIconName(name) {
+    switch (name) {
+      case 'read_file':
+      case 'list_files':
+      case 'open_file':
+        return 'file';
+      case 'create_file':
+      case 'write_file':
+      case 'replace_in_file':
+        return 'pencil';
+      case 'delete_file':
+        return 'trash';
+      case 'search_text':
+        return 'search';
+      case 'run_command':
+        return 'terminal';
+      case 'get_diagnostics':
+        return 'warn';
+      default:
+        return name && name.indexOf('mcp_') === 0 ? 'plug' : 'terminal';
+    }
+  }
+
+  /** The one argument worth showing in a collapsed tool row. */
+  function primaryArg(item) {
+    let args = {};
+    try {
+      args = JSON.parse(item.args || '{}') || {};
+    } catch {
+      return oneLine(item.args, 60);
+    }
+    if (item.name === 'run_command' && args.command) return args.command;
+    return (
+      args.path ||
+      args.file ||
+      args.pattern ||
+      args.query ||
+      args.glob ||
+      args.command ||
+      args.url ||
+      ''
+    );
+  }
+
   /* ------------------------------------------------------------ renderers */
 
   function renderItem(item) {
     switch (item.kind) {
-      case 'user': {
-        const node = el('div', 'msg user');
-        if (item.text) node.appendChild(el('div', 'msg-text', item.text));
-        if (item.images && item.images.length) node.appendChild(renderUserImages(item.images));
-        return node;
-      }
-      case 'assistant': {
-        const node = el('div', 'msg assistant' + (item.final ? ' final' : '') + (item.streaming ? ' streaming' : ''));
-        node.innerHTML = renderMarkdown(item.text) + '<span class="caret"></span>';
-        return node;
-      }
+      case 'user':
+        return renderUser(item);
+      case 'assistant':
+        return renderAssistant(item);
       case 'thinking':
         return renderThinking(item);
-      case 'notice': {
-        const node = el('div', 'msg notice' + (item.level === 'info' ? '' : ' ' + item.level));
-        node.textContent = item.message;
-        return node;
-      }
+      case 'notice':
+        return renderNotice(item);
       case 'tool':
         return renderTool(item);
       case 'approval':
@@ -396,26 +731,68 @@
     }
   }
 
+  function renderUser(item) {
+    const node = el('div', 'msg user');
+    node.dataset.id = item.id;
+    const head = el('div', 'msg-head');
+    head.appendChild(el('span', null, 'You'));
+    if (item.text) {
+      const actions = el('div', 'msg-actions');
+      actions.appendChild(actionButton('copy', 'Copy this message', () => copyText(item.text)));
+      head.appendChild(actions);
+    }
+    node.appendChild(head);
+    if (item.text) node.appendChild(el('div', 'msg-text', item.text));
+    if (item.images && item.images.length) node.appendChild(renderUserImages(item.images));
+    return node;
+  }
+
+  function renderAssistant(item) {
+    const node = el('div', 'msg assistant' + (item.streaming ? ' streaming' : ''));
+    node.dataset.id = item.id;
+    node.setAttribute('role', 'article');
+    node.setAttribute('aria-label', 'Assistant');
+
+    const body = el('div', 'msg-body prose');
+    body.innerHTML = renderMarkdown(item.text);
+    if (item.streaming) caretInto(body);
+    node.appendChild(body);
+
+    if (!item.streaming && item.text) {
+      const head = el('div', 'msg-actions assistant-actions');
+      head.appendChild(actionButton('copy', 'Copy this answer', () => copyText(item.text)));
+      node.appendChild(head);
+    }
+    return node;
+  }
+
   /**
    * The reasoning lane. Expanded and following along while the model is
    * thinking, then collapsed to a one-line summary once the answer lands so it
    * does not crowd out the actual results.
    */
   function renderThinking(item) {
-    const node = el('div', 'thinking' + (item.streaming ? ' streaming' : '') + (item.streaming ? ' open' : ''));
+    const node = el('div', 'thinking' + (item.streaming ? ' open' : ''));
     node.dataset.id = item.id;
+    if (item.open) {
+      node.classList.add('open');
+      node.dataset.userOpen = '1';
+    }
 
     const head = el('div', 'thinking-head');
-    head.appendChild(el('span', 'thinking-icon', '\u2733'));
-    head.appendChild(el('span', 'thinking-label', item.streaming ? 'Thinking…' : 'Thought'));
-
+    head.appendChild(icon('spark', 'thinking-icon'));
+    head.appendChild(el('span', 'thinking-label', item.streaming ? 'Thinking' : 'Thought'));
     const preview = el('span', 'thinking-preview');
     preview.textContent = item.streaming ? '' : oneLine(item.text);
     head.appendChild(preview);
-    if (!item.streaming && item.durationMs) {
-      head.appendChild(el('span', 'thinking-time', formatMs(item.durationMs)));
-    }
-    head.addEventListener('click', () => node.classList.toggle('open'));
+    if (!item.streaming && item.durationMs) head.appendChild(el('span', 'thinking-time', formatMs(item.durationMs)));
+    head.appendChild(icon('chevron', 'thinking-chevron'));
+    head.addEventListener('click', () => {
+      const open = node.classList.toggle('open');
+      // Distinguish "the reader opened this" from "it auto-opened because it is
+      // streaming", so finishing the stream collapses the latter only.
+      node.dataset.userOpen = open ? '1' : '0';
+    });
     node.appendChild(head);
 
     const body = el('div', 'thinking-body');
@@ -424,27 +801,59 @@
     return node;
   }
 
-  function oneLine(text) {
-    const flat = String(text || '').replace(/\s+/g, ' ').trim();
-    return flat.length > 110 ? flat.slice(0, 107) + '\u2026' : flat;
+  function renderNotice(item) {
+    const level = item.level === 'info' ? '' : ' ' + item.level;
+    const node = el('div', 'msg notice' + level);
+    node.dataset.id = item.id;
+    node.appendChild(icon(item.level === 'error' || item.level === 'warn' ? 'warn' : 'info'));
+    node.appendChild(el('div', 'notice-text', item.message));
+    return node;
   }
 
   function renderTool(item) {
-    const node = el('div', 'tool ' + (item.status || 'running'));
+    const status = item.status || 'running';
+    const node = el('div', 'tool ' + status);
     node.dataset.id = item.id;
-    if (item.status === 'running') {
+    // A running tool stays open so its output is visible; a failure stays open
+    // because the user needs to read it. Success collapses to one line.
+    if (item.open === undefined) {
+      if (status === 'running' || status === 'failed') node.classList.add('open');
+    } else if (item.open) {
       node.classList.add('open');
-      node.dataset.startedAt = String(item.startedAt || Date.now());
     }
+    if (item.open !== undefined) node.dataset.userOpen = item.open ? '1' : '0';
+    if (status === 'running') node.dataset.startedAt = String(item.startedAt || Date.now());
 
     const head = el('div', 'tool-head');
-    const icon = el('span', 'tool-icon', item.status === 'running' ? '◐' : item.status === 'ok' ? '✓' : '✗');
-    head.appendChild(icon);
+    head.setAttribute('role', 'button');
+    head.setAttribute('tabindex', '0');
+    head.appendChild(icon(toolIconName(item.name), 'tool-icon'));
     head.appendChild(el('span', 'tool-name', item.name));
-    head.appendChild(el('span', 'tool-summary', item.summary || (item.status === 'running' ? 'running…' : '')));
+    const arg = primaryArg(item);
+    if (arg) {
+      const argNode = el('span', 'tool-arg', arg);
+      argNode.title = arg;
+      head.appendChild(argNode);
+    }
+    if (item.summary) {
+      const summary = el('span', 'tool-summary', oneLine(item.summary, 60));
+      summary.title = item.summary;
+      head.appendChild(summary);
+    }
     if (item.durationMs) head.appendChild(el('span', 'tool-time', formatMs(item.durationMs)));
-    else if (item.status === 'running') head.appendChild(el('span', 'tool-time', '0.0s'));
-    head.addEventListener('click', () => node.classList.toggle('open'));
+    else if (status === 'running') head.appendChild(el('span', 'tool-time', '0.0s'));
+    head.appendChild(icon('chevron', 'tool-chevron'));
+    const toggle = () => {
+      const open = node.classList.toggle('open');
+      node.dataset.userOpen = open ? '1' : '0';
+    };
+    head.addEventListener('click', toggle);
+    head.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        toggle();
+      }
+    });
     node.appendChild(head);
 
     const body = el('div', 'tool-body');
@@ -455,74 +864,129 @@
       args = item.args || '';
     }
     if (args && args !== '{}') {
+      body.appendChild(el('div', 'tool-label', 'arguments'));
       const pre = el('pre');
       pre.textContent = args.length > 1500 ? args.slice(0, 1500) + '\n… (truncated)' : args;
       body.appendChild(pre);
     }
     if (item.detail) {
+      body.appendChild(el('div', 'tool-label', status === 'failed' ? 'error' : 'output'));
       const pre = el('pre');
       pre.textContent = item.detail.length > 4000 ? item.detail.slice(0, 4000) + '\n… (truncated)' : item.detail;
       body.appendChild(pre);
     }
+    const actions = el('div', 'tool-actions');
     if (item.relPath) {
-      const actions = el('div', 'tool-actions');
       const open = el('button', null, 'Open ' + item.relPath);
+      open.type = 'button';
+      open.title = 'Open this file in the editor';
       open.addEventListener('click', (event) => {
         event.stopPropagation();
         vscode.postMessage({ type: 'open-file', path: item.relPath });
       });
       actions.appendChild(open);
-      body.appendChild(actions);
     }
+    if (item.detail || args) {
+      const copy = el('button', null, 'Copy output');
+      copy.type = 'button';
+      copy.addEventListener('click', (event) => {
+        event.stopPropagation();
+        copyText(item.detail || args, copy);
+      });
+      actions.appendChild(copy);
+    }
+    if (actions.childElementCount > 0) body.appendChild(actions);
     node.appendChild(body);
     return node;
   }
 
+  function renderDiff(diffText) {
+    const box = el('div', 'diff');
+    const lines = String(diffText).split('\n');
+    const limit = 240;
+    const shown = lines.slice(0, limit);
+    for (const line of shown) {
+      let cls = 'ctx';
+      if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) cls = 'hunk';
+      else if (line.startsWith('+')) cls = 'add';
+      else if (line.startsWith('-')) cls = 'del';
+      box.appendChild(el('span', 'line ' + cls, line));
+    }
+    if (lines.length > limit) box.appendChild(el('span', 'line hunk', '… ' + (lines.length - limit) + ' more lines'));
+    return box;
+  }
+
+  function approvalKind(request) {
+    switch (request.kind) {
+      case 'write':
+        return { icon: 'pencil', label: 'edit' };
+      case 'delete':
+        return { icon: 'trash', label: 'delete' };
+      case 'command':
+        return { icon: 'terminal', label: 'command' };
+      default:
+        return { icon: 'info', label: request.kind || 'action' };
+    }
+  }
+
   function renderApproval(item) {
     const request = item.request || {};
-    const node = el('div', 'approval' + (item.decision ? ' resolved ' + (item.decision === 'apply' ? 'applied' : 'rejected') : ''));
+    const resolved = Boolean(item.decision);
+    const node = el(
+      'div',
+      'approval' + (resolved ? ' resolved ' + (item.decision === 'apply' ? 'applied' : 'rejected') : ''),
+    );
     node.dataset.id = item.id;
+    const kind = approvalKind(request);
 
     const head = el('div', 'approval-head');
-    head.appendChild(el('span', null, item.decision ? 'Resolved: ' + request.title : 'Approval needed: ' + request.title));
-    head.appendChild(el('span', null, request.kind));
+    head.appendChild(icon(resolved ? (item.decision === 'apply' ? 'check' : 'x') : kind.icon));
+    const title = resolved ? (item.decision === 'apply' ? 'Applied' : 'Rejected') : 'Approval needed';
+    head.appendChild(el('span', null, title));
+    head.appendChild(el('span', 'approval-kind', kind.label));
+    const target = request.path || (request.command ? request.command : '');
+    if (target) {
+      const targetNode = el('span', 'approval-target', target);
+      targetNode.title = target;
+      head.appendChild(targetNode);
+    }
     node.appendChild(head);
 
     const body = el('div', 'approval-body');
-    if (request.kind === 'write') {
-      body.appendChild(renderDiff(request.detail || ''));
+    if (request.kind === 'write' || request.kind === 'delete') {
+      if (request.detail) body.appendChild(renderDiff(request.detail));
     } else {
       const pre = el('div', 'command');
-      pre.textContent = request.detail || '';
+      pre.textContent = request.detail || request.title || '';
       body.appendChild(pre);
     }
     node.appendChild(body);
 
-    if (!item.decision) {
+    if (!resolved) {
       const actions = el('div', 'approval-actions');
-
-      const apply = el('button', 'primary', request.kind === 'write' ? 'Apply edit' : 'Run command');
+      const apply = el('button', 'primary', request.kind === 'command' ? 'Run command' : 'Apply change');
+      apply.type = 'button';
       apply.addEventListener('click', () =>
         vscode.postMessage({ type: 'approval-response', id: item.approvalId, decision: 'apply' }),
       );
-
-      const always = el('button', null, 'Always for this session');
-      always.title = 'Apply this and stop asking about ' + request.kind + ' for the rest of this session';
+      const always = el('button', null, 'Always');
+      always.type = 'button';
+      always.title = 'Apply this, and stop asking about ' + request.kind + ' actions for the rest of the session';
       always.addEventListener('click', () =>
         vscode.postMessage({ type: 'approval-response', id: item.approvalId, decision: 'apply', remember: 'all' }),
       );
-
       const reject = el('button', 'danger', 'Reject');
+      reject.type = 'button';
       reject.addEventListener('click', () =>
         vscode.postMessage({ type: 'approval-response', id: item.approvalId, decision: 'reject' }),
       );
-
       actions.appendChild(apply);
       actions.appendChild(always);
       actions.appendChild(reject);
-
-      if (request.kind === 'write') {
-        const diffBtn = el('button', null, 'Open in diff editor');
+      if (request.kind !== 'command') {
+        const diffBtn = el('button', null, 'Diff editor');
+        diffBtn.type = 'button';
+        diffBtn.title = 'Open this change in the editor’s diff view';
         diffBtn.addEventListener('click', () => vscode.postMessage({ type: 'open-diff', id: item.approvalId }));
         actions.appendChild(diffBtn);
       }
@@ -531,47 +995,44 @@
     return node;
   }
 
-  function renderDiff(diffText) {
-    const box = el('div', 'diff');
-    const lines = String(diffText).split('\n');
-    const limit = 200;
-    const shown = lines.slice(0, limit);
-    for (const line of shown) {
-      let cls = 'ctx';
-      if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) cls = 'hunk';
-      else if (line.startsWith('+')) cls = 'add';
-      else if (line.startsWith('-')) cls = 'del';
-      const row = el('span', cls, line);
-      box.appendChild(row);
-    }
-    if (lines.length > limit) box.appendChild(el('span', 'hunk', '… ' + (lines.length - limit) + ' more lines'));
-    return box;
-  }
+  const DONE_LABEL = {
+    complete: 'Done',
+    'max-steps': 'Step limit reached',
+    cancelled: 'Cancelled',
+    error: 'Failed',
+  };
 
   function renderDone(item) {
-    const node = el('div', 'msg done');
-    const title = el('div', 'done-title');
-    const badge = el('span', 'pill', item.reason);
-    title.appendChild(badge);
-    if (item.usage) {
-      const usageBadge = el('span', 'pill', (item.usage.totalTokens || 0) + ' tokens');
-      usageBadge.title = `Input: ${item.usage.inputTokens || 0} · Output: ${item.usage.outputTokens || 0}`;
-      title.appendChild(usageBadge);
-    }
-    if (item.tokensPerSecond) {
-      const speedBadge = el('span', 'pill', item.tokensPerSecond.toFixed(1) + ' tok/s');
-      title.appendChild(speedBadge);
-    }
-    node.appendChild(title);
+    const reason = item.reason || 'complete';
+    const node = el('div', 'msg done ' + reason);
+    node.dataset.id = item.id;
 
-    const summary = el('div');
-    summary.innerHTML = renderMarkdown(item.summary || '');
-    node.appendChild(summary);
+    const head = el('div', 'done-head');
+    head.appendChild(icon(reason === 'complete' ? 'check' : reason === 'cancelled' ? 'stop' : 'warn'));
+    head.appendChild(el('span', 'done-title', DONE_LABEL[reason] || reason));
+
+    const stats = el('div', 'done-stats');
+    if (item.usage) {
+      stats.appendChild(el('span', null, formatTokens(item.usage.totalTokens || 0) + ' tokens'));
+    }
+    if (item.tokensPerSecond) stats.appendChild(el('span', null, item.tokensPerSecond.toFixed(1) + ' tok/s'));
+    if (item.filesChanged && item.filesChanged.length) {
+      stats.appendChild(el('span', null, item.filesChanged.length + ' file(s) changed'));
+    }
+    if (stats.childElementCount) head.appendChild(stats);
+    node.appendChild(head);
+
+    if (item.summary) {
+      const summary = el('div', 'done-summary prose');
+      summary.innerHTML = renderMarkdown(item.summary);
+      node.appendChild(summary);
+    }
 
     if (item.filesChanged && item.filesChanged.length) {
       const files = el('div', 'files');
       for (const file of item.filesChanged) {
-        const chip = el('span', 'file', file);
+        const chip = el('button', 'file', file);
+        chip.type = 'button';
         chip.title = 'Open ' + file;
         chip.addEventListener('click', () => vscode.postMessage({ type: 'open-file', path: file }));
         files.appendChild(chip);
@@ -581,20 +1042,7 @@
     return node;
   }
 
-  function formatMs(ms) {
-    if (ms < 1000) return ms + 'ms';
-    if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
-    return Math.round(ms / 60000) + 'm';
-  }
-
   /* -------------------------------------------------------- attachments */
-
-  function formatBytes(bytes) {
-    if (!bytes && bytes !== 0) return '';
-    if (bytes < 1024) return bytes + ' B';
-    if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KB';
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-  }
 
   function attachmentNotice(text) {
     addItem({ id: 'attach-note-' + ++attachmentSeq, kind: 'notice', level: 'warn', message: text });
@@ -633,7 +1081,7 @@
   }
 
   function removeAttachment(id) {
-    const index = pending.findIndex((p) => p.id === id);
+    const index = pending.findIndex((entry) => entry.id === id);
     if (index >= 0) pending.splice(index, 1);
     renderAttachments();
   }
@@ -658,6 +1106,7 @@
       label.title = item.name + ' · ' + item.mediaType + ' · ' + formatBytes(item.bytes);
       chip.appendChild(label);
       const remove = el('button', 'attachment-remove', '\u2715');
+      remove.type = 'button';
       remove.title = 'Remove attachment';
       remove.addEventListener('click', () => removeAttachment(item.id));
       chip.appendChild(remove);
@@ -681,69 +1130,145 @@
 
   /* --------------------------------------------------------- item plumbing */
 
-  function addItem(item, position) {
+  function addItem(item, forceScroll) {
     items.set(item.id, item);
     const node = renderItem(item);
     elements.set(item.id, node);
-    if (position === 'prepend' && stream.firstChild && stream.firstChild !== empty) {
-      stream.insertBefore(node, stream.firstChild);
-    } else {
-      stream.appendChild(node);
-    }
+    stream.appendChild(node);
     toggleEmpty();
-    autoScroll();
+    autoScroll(forceScroll);
+  }
+
+  function replaceNode(item, node) {
+    const previous = elements.get(item.id);
+    if (previous && previous.parentElement) previous.parentElement.replaceChild(node, previous);
+    else stream.appendChild(node);
+    elements.set(item.id, node);
   }
 
   function updateItem(item) {
     const previous = items.get(item.id);
-    // Fix for thinking scrollbar jumping: when thinking is streaming, we previously
-    // replaced the whole node on every delta, resetting scrollTop to 0, then
-    // tickThinking forced it to bottom — causing a jump. Now we update in place.
-    if (previous && previous.kind === 'thinking' && item.kind === 'thinking' && item.streaming) {
-      const existingNode = elements.get(item.id);
-      if (existingNode) {
-        const body = existingNode.querySelector('.thinking-body');
-        if (body) {
-          // Preserve scroll position relative to outer, not inner (inner has no scrollbar while streaming)
-          body.textContent = item.text || '';
+    const merged = Object.assign({}, previous, item);
+    items.set(item.id, merged);
+
+    // Streamed assistant text: patch the body, keep the element (and therefore
+    // the scroll position, text selection and any open code block) intact.
+    if (merged.kind === 'assistant') {
+      const node = elements.get(item.id);
+      const body = node && node.querySelector('.msg-body');
+      if (body) {
+        body.innerHTML = renderMarkdown(merged.text);
+        if (merged.streaming) caretInto(body);
+        node.classList.toggle('streaming', Boolean(merged.streaming));
+        const oldActions = node.querySelector('.assistant-actions');
+        if (oldActions && !merged.streaming) oldActions.remove();
+        if (!merged.streaming && merged.text) {
+          const actions = el('div', 'msg-actions assistant-actions');
+          actions.appendChild(actionButton('copy', 'Copy this answer', () => copyText(merged.text)));
+          node.appendChild(actions);
         }
-        // Keep open and streaming classes
-        existingNode.classList.add('open');
-        existingNode.classList.add('streaming');
-        items.set(item.id, Object.assign({}, previous, item));
         autoScroll();
         return;
       }
     }
 
-    // A reader who opened a collapsed thinking block should keep it open
-    // across the next repaint of that item.
-    if (previous && previous.kind === 'thinking' && item.kind === 'thinking') {
+    // Streamed thinking: append text without rebuilding the header.
+    if (merged.kind === 'thinking') {
       const node = elements.get(item.id);
-      if (node && node.classList.contains('open') && !item.streaming) item = Object.assign({}, item, { open: true });
+      const body = node && node.querySelector('.thinking-body');
+      if (body && merged.streaming) {
+        body.textContent = merged.text || '';
+        node.classList.add('open', 'streaming');
+        autoScroll();
+        return;
+      }
+      if (node && body) {
+        // Only an explicit click keeps the block expanded. Auto-open while
+        // streaming must end with the stream, or the rationale buries the answer.
+        const explicit = node.dataset.userOpen;
+        if (explicit === '1') merged.open = true;
+        else if (explicit === '0') merged.open = false;
+        else delete merged.open;
+        body.textContent = merged.text || '';
+        node.classList.remove('streaming');
+        node.classList.toggle('open', Boolean(merged.open));
+        const preview = node.querySelector('.thinking-preview');
+        if (preview) preview.textContent = oneLine(merged.text);
+        const label = node.querySelector('.thinking-label');
+        if (label) label.textContent = 'Thought';
+        const head = node.querySelector('.thinking-head');
+        if (head && merged.durationMs && !head.querySelector('.thinking-time')) {
+          head.appendChild(el('span', 'thinking-time', formatMs(merged.durationMs)));
+        }
+        autoScroll();
+        return;
+      }
     }
-    items.set(item.id, Object.assign({}, previous, item));
-    const old = elements.get(item.id);
-    const node = renderItem(items.get(item.id));
-    if (items.get(item.id).open) node.classList.add('open');
-    if (old && old.parentElement) old.parentElement.replaceChild(node, old);
-    else stream.appendChild(node);
-    elements.set(item.id, node);
+
+    // Everything else: re-render, but keep a tool card open if the reader
+    // opened it (or toggled it closed) while it was running.
+    if (merged.kind === 'tool') {
+      const node = elements.get(item.id);
+      const explicit = node && node.dataset.userOpen;
+      if (explicit === '1') merged.open = true;
+      else if (explicit === '0') merged.open = false;
+      // No explicit choice: drop the flag so the status decides (running and
+      // failed open, success collapsed).
+      else delete merged.open;
+    }
+    replaceNode(merged, renderItem(merged));
     autoScroll();
   }
 
   /* --------------------------------------------------------------- events */
 
-  btnSend.addEventListener('click', submit);
+  /* One delegated listener for everything rendered inside the transcript:
+     copy buttons, "insert" on a code block, and external links. */
+  stream.addEventListener('click', (event) => {
+    const copyButton = event.target.closest('.code-copy');
+    if (copyButton) {
+      const target = document.getElementById(copyButton.dataset.target || '');
+      copyText(target ? target.textContent : '', copyButton);
+      return;
+    }
+    const insertButton = event.target.closest('.code-insert');
+    if (insertButton) {
+      const target = document.getElementById(insertButton.dataset.target || '');
+      vscode.postMessage({ type: 'insert-code', text: target ? target.textContent : '' });
+      return;
+    }
+    const link = event.target.closest('a[href]');
+    if (link) {
+      event.preventDefault();
+      vscode.postMessage({ type: 'open-external', url: link.getAttribute('href') });
+    }
+  });
+
+  function submit(text) {
+    const value = (text !== undefined ? text : input.value).trim();
+    // An image on its own is a valid prompt ("what is wrong in this screenshot?").
+    if ((!value && pending.length === 0) || busy) return;
+    const images = pending.map((entry) => ({ name: entry.name, mediaType: entry.mediaType, dataUrl: entry.dataUrl }));
+    vscode.postMessage({ type: 'submit', text: value, images });
+    clearAttachments();
+    if (text === undefined) {
+      input.value = '';
+      input.style.height = 'auto';
+    }
+    stickToBottom = true;
+    autoScroll(true);
+  }
+
+  btnSend.addEventListener('click', () => submit());
   input.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && !event.shiftKey) {
+    if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
       event.preventDefault();
       submit();
     }
   });
   input.addEventListener('input', () => {
     input.style.height = 'auto';
-    input.style.height = Math.min(220, input.scrollHeight) + 'px';
+    input.style.height = Math.min(200, input.scrollHeight) + 'px';
   });
 
   /* Pasting a screenshot: the clipboard carries it as an image/* item, which we
@@ -775,7 +1300,7 @@
   for (const target of [input, document.body]) {
     target.addEventListener('dragover', (event) => {
       if (!event.dataTransfer) return;
-      const hasFiles = Array.prototype.some.call(event.dataTransfer.types || [], (t) => t === 'Files');
+      const hasFiles = Array.prototype.some.call(event.dataTransfer.types || [], (type) => type === 'Files');
       if (!hasFiles) return;
       event.preventDefault();
       document.body.classList.add('dragging');
@@ -798,19 +1323,6 @@
     });
   }
 
-  function submit(text) {
-    const value = (text !== undefined ? text : input.value).trim();
-    // An image on its own is a valid prompt ("what is wrong in this screenshot?").
-    if ((!value && pending.length === 0) || busy) return;
-    const images = pending.map((p) => ({ name: p.name, mediaType: p.mediaType, dataUrl: p.dataUrl }));
-    vscode.postMessage({ type: 'submit', text: value, images });
-    clearAttachments();
-    if (text === undefined) {
-      input.value = '';
-      input.style.height = 'auto';
-    }
-  }
-
   btnStop.addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
   btnRevert.addEventListener('click', () => vscode.postMessage({ type: 'revert' }));
   btnReset.addEventListener('click', () => vscode.postMessage({ type: 'reset' }));
@@ -822,14 +1334,17 @@
   if (chipAgents) chipAgents.addEventListener('click', () => vscode.postMessage({ type: 'open-agents' }));
   if (chipContext) chipContext.addEventListener('click', () => vscode.postMessage({ type: 'preview-context' }));
   if (btnCompactBanner) btnCompactBanner.addEventListener('click', () => vscode.postMessage({ type: 'compact' }));
-  if (btnCompactDismiss) btnCompactDismiss.addEventListener('click', () => {
-    if (compactBanner) compactBanner.hidden = true;
-  });
+  if (btnCompactDismiss) {
+    btnCompactDismiss.addEventListener('click', () => {
+      if (compactBanner) compactBanner.hidden = true;
+    });
+  }
 
-  for (const li of document.querySelectorAll('#examples li')) {
-    li.addEventListener('click', () => {
-      input.value = li.dataset.prompt || '';
+  for (const button of document.querySelectorAll('#examples .example')) {
+    button.addEventListener('click', () => {
+      input.value = button.dataset.prompt || '';
       input.focus();
+      input.dispatchEvent(new Event('input'));
     });
   }
 
@@ -912,13 +1427,13 @@
     for (const rawLine of String(text || '').split('\n')) {
       const line = rawLine.trim();
       if (!line) continue;
-      const idx = line.indexOf(separator);
-      if (idx <= 0) {
+      const index = line.indexOf(separator);
+      if (index <= 0) {
         bad.push(line);
         continue;
       }
-      const key = line.slice(0, idx).trim();
-      const value = line.slice(idx + separator.length).trim();
+      const key = line.slice(0, index).trim();
+      const value = line.slice(index + separator.length).trim();
       if (key) map[key] = value;
     }
     return { map, bad };
@@ -939,8 +1454,11 @@
     badge.textContent = state.text;
     badge.classList.add(state.cls);
     badge.title = state.title;
-    const remove = el('button', 'icon-btn', '✕');
+    const remove = el('button', 'icon-btn');
+    remove.type = 'button';
     remove.title = 'Remove this server';
+    remove.setAttribute('aria-label', 'Remove this server');
+    remove.appendChild(icon('x'));
     remove.addEventListener('click', () => {
       card.remove();
       mcpDirty = true;
@@ -1065,25 +1583,25 @@
         mcpFileServers.hidden = false;
         if (sources.length) {
           mcpFileServers.appendChild(
-            el('p', 'mcp-file-note', 'Read-only servers from config files: ' + sources.map((s) => s.path).join(', ')),
+            el('p', 'mcp-file-note', 'Read-only servers from config files: ' + sources.map((source) => source.path).join(', ')),
           );
         }
         for (const id of fileIds) {
           const cfg = fileServers[id] || {};
           const row = el('div', 'mcp-file-server');
-          const name = el('span', 'mcp-file-name', id);
+          row.appendChild(el('span', 'mcp-file-name', id));
           const detail = el(
             'span',
             'mcp-file-detail',
             cfg.url ? 'http · ' + cfg.url : 'stdio · ' + (cfg.command || '?') + ' ' + ((cfg.args || []).join(' ')),
           );
+          detail.title = detail.textContent;
+          row.appendChild(detail);
           const badge = el('span', 'mcp-badge', 'config file');
           const info = mcpServerStatus[id];
           badge.classList.add(info && info.running ? 'ok' : info && info.error ? 'error' : 'off');
           badge.title = info && info.error ? info.error : info && info.running ? (info.tools || 0) + ' tool(s)' : 'not running';
           if (cfg.disabled) badge.title = 'disabled in the config file';
-          row.appendChild(name);
-          row.appendChild(detail);
           row.appendChild(badge);
           mcpFileServers.appendChild(row);
         }
@@ -1172,8 +1690,8 @@
     if (event.key === 'Escape' && !mcpModal.hidden) closeMcpModal();
   });
   mcpAddServer.addEventListener('click', () => {
-    const emptyNote = mcpServerList.querySelector('.mcp-empty');
-    if (emptyNote) emptyNote.remove();
+    const emptyNoteNode = mcpServerList.querySelector('.mcp-empty');
+    if (emptyNoteNode) emptyNoteNode.remove();
     const card = mcpServerCard('', {});
     mcpServerList.appendChild(card);
     mcpDirty = true;
@@ -1207,26 +1725,39 @@
   });
   if (chipMcp) chipMcp.addEventListener('click', openMcpModal);
 
+  /* --------------------------------------------------------------- message */
+
+  function rebuild(itemsToRender) {
+    items.clear();
+    elements.clear();
+    stream.innerHTML = '';
+    if (empty) stream.appendChild(empty);
+    for (const item of itemsToRender || []) {
+      items.set(item.id, item);
+      const node = renderItem(item);
+      elements.set(item.id, node);
+      stream.appendChild(node);
+    }
+    toggleEmpty();
+  }
+
   window.addEventListener('message', (event) => {
     const message = event.data;
     if (!message || typeof message.type !== 'string') return;
     switch (message.type) {
       case 'init':
-        items.clear();
-        elements.clear();
-        stream.innerHTML = '';
-        if (empty) stream.appendChild(empty);
-        for (const item of message.items || []) addItem(item);
+        rebuild(message.items);
         applyState(message.state);
         applyActivity(message.activity);
         if (message.usage) {
           cumulativeUsage = message.usage;
           updateTokenChips();
         }
-        toggleEmpty();
+        stickToBottom = true;
+        autoScroll(true);
         break;
       case 'item':
-        addItem(message.item);
+        addItem(message.item, message.item.kind === 'user' || message.item.kind === 'approval');
         break;
       case 'update':
         updateItem(message.item);
@@ -1244,76 +1775,64 @@
         const usage = message.usage;
         const step = message.step;
         if (usage) {
-          // If message has cumulative flag, replace, else merge
           if (message.cumulative) {
-            cumulativeUsage = usage;
+            cumulativeUsage = message.cumulative;
           } else {
-            // Merge into cumulative
             cumulativeUsage = {
               inputTokens: (cumulativeUsage.inputTokens || 0) + (usage.inputTokens || 0),
               outputTokens: (cumulativeUsage.outputTokens || 0) + (usage.outputTokens || 0),
-              totalTokens: (cumulativeUsage.totalTokens || 0) + (usage.totalTokens || (usage.inputTokens || 0) + (usage.outputTokens || 0)),
+              totalTokens:
+                (cumulativeUsage.totalTokens || 0) +
+                (usage.totalTokens || (usage.inputTokens || 0) + (usage.outputTokens || 0)),
             };
-            // If usage has totalTokens but we double counted, use provided total if larger
-            if (usage.totalTokens && usage.totalTokens > 0) {
-              // For per-step usage, we should track cumulative as sum, but also allow override if server sends cumulative
-              if (message.isCumulative) cumulativeUsage = usage;
-            }
           }
           if (typeof message.tokensPerSecond === 'number') currentSpeed = message.tokensPerSecond;
           else if (typeof message.durationMs === 'number' && usage.outputTokens) {
-            const sec = message.durationMs / 1000;
-            if (sec > 0) currentSpeed = usage.outputTokens / sec;
+            const seconds = message.durationMs / 1000;
+            if (seconds > 0) currentSpeed = usage.outputTokens / seconds;
           }
           if (typeof message.contextWindow === 'number') contextWindow = message.contextWindow;
           if (typeof message.contextTokens === 'number') contextTokens = message.contextTokens;
           if (typeof message.contextPercent === 'number') contextPercent = message.contextPercent;
           else if (contextWindow && contextTokens) contextPercent = (contextTokens / contextWindow) * 100;
 
-          // Live update for hint
-          const total = cumulativeUsage.totalTokens || usage.totalTokens || 0;
-          const speedStr = currentSpeed > 0 ? ` · ${currentSpeed.toFixed(1)} tok/s` : '';
-          const inputStr = usage.inputTokens ? ` in:${usage.inputTokens}` : '';
-          const outputStr = usage.outputTokens ? ` out:${usage.outputTokens}` : '';
           if (hintUsage) {
-            hintUsage.textContent = `step ${step || ''} · ${total} tokens${inputStr}${outputStr}${speedStr}`.trim();
+            const total = cumulativeUsage.totalTokens || 0;
+            const speed = currentSpeed > 0 ? ' · ' + currentSpeed.toFixed(1) + ' tok/s' : '';
+            hintUsage.textContent = (step ? 'step ' + step + ' · ' : '') + total + ' tokens' + speed;
           }
           updateTokenChips();
         }
         break;
       }
-      case 'token-speed': {
+      case 'token-speed':
         if (typeof message.tokensPerSecond === 'number') {
           currentSpeed = message.tokensPerSecond;
           updateTokenChips();
         }
         break;
-      }
-      case 'context': {
+      case 'context':
         if (typeof message.contextTokens === 'number') contextTokens = message.contextTokens;
         if (typeof message.contextWindow === 'number') contextWindow = message.contextWindow;
         if (typeof message.contextPercent === 'number') contextPercent = message.contextPercent;
         else if (contextWindow && contextTokens) contextPercent = (contextTokens / contextWindow) * 100;
         updateTokenChips();
         break;
-      }
-      case 'mcp-status': {
+      case 'mcp-status':
         if (chipMcp) {
           if (message.enabled) {
-            chipMcp.textContent = `mcp: ${message.servers || 0} srv, ${message.tools || 0} tools`;
+            chipMcp.textContent = 'mcp: ' + (message.servers || 0) + ' srv · ' + (message.tools || 0) + ' tools';
             chipMcp.hidden = false;
           } else {
             chipMcp.hidden = true;
           }
         }
         break;
-      }
-      case 'mcp-settings': {
+      case 'mcp-settings':
         if (mcpModal.hidden) break;
         renderMcpSettings(message);
         break;
-      }
-      case 'mcp-settings-saved': {
+      case 'mcp-settings-saved':
         if (mcpModal.hidden) break;
         if (message.ok) {
           mcpModalStatus.classList.remove('error');
@@ -1325,34 +1844,32 @@
           mcpDirty = true;
         }
         break;
-      }
       case 'approval-request':
-        addItem({
-          id: 'approval-' + message.id,
-          kind: 'approval',
-          approvalId: message.id,
-          request: message.request,
-        });
-        document.querySelector('.app').scrollIntoView(false);
+        addItem(
+          {
+            id: 'approval-' + message.id,
+            kind: 'approval',
+            approvalId: message.id,
+            request: message.request,
+          },
+          true,
+        );
         break;
       case 'reset':
-        items.clear();
-        elements.clear();
+        rebuild([]);
         clearAttachments();
-        stream.innerHTML = '';
-        if (empty) stream.appendChild(empty);
-        hintUsage.textContent = '';
+        if (hintUsage) hintUsage.textContent = '';
         cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
         currentSpeed = 0;
         contextTokens = 0;
         contextPercent = 0;
-        streamTrackers.clear();
         updateTokenChips();
-        toggleEmpty();
+        stickToBottom = true;
         break;
       case 'prefill':
         input.value = (input.value ? input.value + '\n' : '') + (message.text || '');
         input.focus();
+        input.dispatchEvent(new Event('input'));
         break;
       default:
         break;
@@ -1365,7 +1882,8 @@
   let frame = 0;
   setInterval(() => {
     frame = (frame + 1) % frames.length;
-    for (const node of stream.querySelectorAll('.tool.running .tool-icon')) node.textContent = frames[frame];
+    // Tool icons are <svg>; the running state pulses them via CSS. Only the
+    // activity strip carries the text spinner.
     if (spinner && !activityBox.hidden) spinner.textContent = frames[frame];
     if (!busy) return;
     tickActivity();

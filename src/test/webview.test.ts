@@ -15,6 +15,9 @@ const repoRoot = path.resolve(__dirname, '..', '..');
 const css = fs.readFileSync(path.join(repoRoot, 'media', 'chat.css'), 'utf8');
 const js = fs.readFileSync(path.join(repoRoot, 'media', 'chat.js'), 'utf8');
 const view = fs.readFileSync(path.join(repoRoot, 'src', 'vscode', 'chatView.ts'), 'utf8');
+/* The panel markup is a real HTML file (media/panel.html) that chatView.ts reads
+   and fills in, so layout assertions run against the file itself. */
+const panel = fs.readFileSync(path.join(repoRoot, 'media', 'panel.html'), 'utf8');
 
 /** Pull a rule block out of the stylesheet by selector. */
 function rule(selector: string): string {
@@ -54,8 +57,8 @@ test('the stream sits in a positioning context for the jump button', () => {
   assert.match(wrap, /position:\s*relative/);
   assert.match(wrap, /min-height:\s*0/);
   assert.match(rule('.jump-latest'), /position:\s*absolute/);
-  assert.match(view, /id="jump-latest"/, 'the button must exist in the markup');
-  assert.match(view, /<div class="stream-wrap">/, 'the wrapper must exist in the markup');
+  assert.match(panel, /id="jump-latest"/, 'the button must exist in the markup');
+  assert.match(panel, /<div class="stream-wrap">/, 'the wrapper must exist in the markup');
 });
 
 test('auto-scroll yields to a reader who scrolled up', () => {
@@ -97,11 +100,11 @@ test('the panel handles thinking items, and the controller feeds it deltas', () 
 });
 
 test('an expanded thinking block survives the next repaint', () => {
-  assert.match(js, /item\.open = true|open: true/, 'open state must be preserved across updates');
+  assert.match(js, /\.open = true/, 'open state must be preserved across updates');
 });
 
 test('the panel is wired to the showThinking setting', () => {
-  assert.match(view, /id="chip-thinking"/, 'a chip should report the setting');
+  assert.match(panel, /id="chip-thinking"/, 'a chip should report the setting');
   assert.match(js, /state\.showThinking !== false/);
 });
 
@@ -111,18 +114,18 @@ test('every element the script looks up exists in the markup', () => {
   const ids = [...js.matchAll(/getElementById\('([^']+)'\)/g)].map((m) => m[1]);
   assert.ok(ids.length >= 12, `expected a decent set of lookups, got ${ids.length}`);
   for (const id of new Set(ids)) {
-    assert.match(view, new RegExp(`id="${id}"`), `chatView markup has no element with id="${id}"`);
+    assert.match(panel, new RegExp(`id="${id}"`), `panel.html has no element with id="${id}"`);
   }
 });
 
 test('the markup is well-formed and nests the stream inside its wrapper', () => {
-  // The panel HTML is a template literal that no compiler checks; a stray
-  // </div> silently breaks the layout, so validate the tag structure here.
-  const template = view.match(/return `<!DOCTYPE html>([\s\S]*?)`;/);
-  assert.ok(template, 'could not find the webview template literal');
+  // No compiler checks this HTML; a stray </div> silently breaks the layout,
+  // so validate the tag structure here.
+  assert.ok(panel.indexOf('<!DOCTYPE html>') === 0, 'the panel must be a complete document');
 
-  // Drop the interpolations, then walk the tags with a stack.
-  const html = template![1].replace(/\$\{[^}]*\}/g, 'x');
+  // Substitution tokens and comments carry no structure (comments may mention
+  // tags in prose), so drop them before walking the tags with a stack.
+  const html = panel.replace(/\{\{[A-Z]+\}\}/g, 'x').replace(/<!--[\s\S]*?-->/g, '');
   const voidTags = new Set(['meta', 'link', 'br', 'hr', 'img', 'input', 'source']);
   const stack: string[] = [];
   for (const match of html.matchAll(/<(\/?)([a-zA-Z][\w-]*)([^>]*?)(\/?)>/g)) {
@@ -139,9 +142,9 @@ test('the markup is well-formed and nests the stream inside its wrapper', () => 
   assert.deepEqual(stack, [], `unclosed tags: ${stack.join(', ')}`);
 
   // The wrapper must actually contain the stream pane.
-  const wrap = template![1].indexOf('class="stream-wrap"');
-  const streamPane = template![1].indexOf('class="stream" id="stream"');
-  const composer = template![1].indexOf('class="composer"');
+  const wrap = panel.indexOf('class="stream-wrap"');
+  const streamPane = panel.indexOf('class="stream" id="stream"');
+  const composer = panel.indexOf('class="composer"');
   assert.ok(wrap > 0 && streamPane > wrap && composer > streamPane, 'stream must sit inside the wrapper, above the composer');
 });
 
@@ -156,21 +159,36 @@ test('the stylesheet only uses theme variables, never hard-coded colours', () =>
   }
 });
 
+test('chatView loads the panel markup from media/panel.html', () => {
+  assert.match(view, /readFileSync/, 'the markup must come from a file, not an inline template');
+  assert.match(view, /'media', 'panel\.html'/, 'and from media/panel.html specifically');
+  assert.match(view, /vscode\.Uri\.joinPath\(this\.extensionUri, 'media', 'panel\.html'\)\.fsPath/);
+
+  // Everything the file needs substituted is declared in the file itself.
+  for (const token of ['{{CSP}}', '{{CSS}}', '{{JS}}', '{{NONCE}}']) {
+    assert.ok(panel.includes(token), `panel.html should contain ${token}`);
+  }
+  // The CSP token must be inside the meta tag, not escaped as text.
+  assert.match(panel, /http-equiv="Content-Security-Policy" content="\{\{CSP\}\}"/);
+  assert.match(panel, /<script nonce="\{\{NONCE\}\}" src="\{\{JS\}\}"><\/script>/);
+  assert.match(panel, /<link rel="stylesheet" href="\{\{CSS\}\}" \/>/);
+});
+
 /* ------------------------------------------------------------- mcp dialog */
 
 test('the MCP settings dialog is wired end to end', () => {
   // Markup: the dialog, its form fields and its buttons exist.
-  assert.match(view, /id="mcp-modal"/, 'the dialog markup must exist');
-  assert.match(view, /id="mcp-server-list"/);
-  assert.match(view, /id="mcp-enabled"/);
-  assert.match(view, /id="mcp-timeout"/);
-  assert.match(view, /id="mcp-add"/);
-  assert.match(view, /id="mcp-target"/);
-  assert.match(view, /id="mcp-save"/);
-  assert.match(view, /id="mcp-reload"/);
-  assert.match(view, /id="mcp-modal-status"/);
+  assert.match(panel, /id="mcp-modal"/, 'the dialog markup must exist');
+  assert.match(panel, /id="mcp-server-list"/);
+  assert.match(panel, /id="mcp-enabled"/);
+  assert.match(panel, /id="mcp-timeout"/);
+  assert.match(panel, /id="mcp-add"/);
+  assert.match(panel, /id="mcp-target"/);
+  assert.match(panel, /id="mcp-save"/);
+  assert.match(panel, /id="mcp-reload"/);
+  assert.match(panel, /id="mcp-modal-status"/);
   // The header MCP button opens the dialog instead of just reloading.
-  assert.match(view, /id="btn-mcp"/);
+  assert.match(panel, /id="btn-mcp"/);
   assert.match(js, /btnMcp\.addEventListener\('click', openMcpModal\)/);
 
   // Script: asks for the snapshot, renders it, saves and reloads.
@@ -182,7 +200,8 @@ test('the MCP settings dialog is wired end to end', () => {
   assert.match(js, /function collectServers\(/);
   assert.match(js, /URL must start with http:\/\/ or https:\/\//);
 
-  // The extension side answers the dialog.
+  // The extension side answers the dialog (chatView.ts), and loads its markup
+  // from media/panel.html instead of building an HTML string inline.
   assert.match(view, /case 'get-mcp-settings':/);
   assert.match(view, /case 'save-mcp-settings':/);
 });
