@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { after, test } from 'node:test';
 import { HarnessSession } from '../core/agent';
 import { compactHistory } from '../core/compaction';
+import { ToolRegistry } from '../core/tools';
 import { httpError, isRetryableProviderError, retryDelayMs } from '../core/providers/errors';
 import { auditToolMessages, isTranscriptWellFormed, repairToolMessages } from '../core/transcript';
 import {
@@ -331,4 +332,43 @@ test('a reply cut off by the output limit is continued, not treated as the answe
   assert.equal(result.outcome, 'complete');
   assert.equal(result.summary, 'Continued: ... } — done.');
   assert.equal(session.transcript.some((m) => m.role === 'user' && /cut off/i.test(m.content)), true);
+});
+
+test('an in-flight snapshot keeps completed tool groups when a later task reuses their id', async () => {
+  const dir = makeWorkspace();
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  const wait = new Promise<void>((resolve) => { release = resolve; });
+  let toolRuns = 0;
+  let providerCalls = 0;
+  const provider: Provider = {
+    id: 'test', label: 'test',
+    async chat() {
+      providerCalls++;
+      return providerCalls % 2
+        ? { text: 'Using a tool', toolCalls: [{ id: 'same-id', name: 'test_tool', arguments: '{}' }] }
+        : { text: 'Finished', toolCalls: [] };
+    },
+  };
+  const registry = new ToolRegistry([{
+    name: 'test_tool', description: 'test', parameters: { type: 'object' },
+    async run() {
+      toolRuns++;
+      if (toolRuns === 2) { entered(); await wait; }
+      return { ok: true, content: `result ${toolRuns}` };
+    },
+  }]);
+  const session = new HarnessSession({ host: new FakeHost(dir), config: config(), provider, registry });
+  await session.runTask('First task', () => {});
+  const running = session.runTask('Second task', () => {});
+  await started;
+  const snapshot = session.conversationSnapshot;
+  assert.ok(isTranscriptWellFormed(snapshot));
+  assert.ok(snapshot.some((message) => message.role === 'assistant' && message.toolCalls?.[0]?.id === 'same-id'));
+  assert.ok(snapshot.some((message) => message.role === 'tool' && message.content === 'result 1'));
+  assert.ok(snapshot.some((message) => message.role === 'user' && message.content === 'Second task'));
+  assert.equal(snapshot.filter((message) => message.role === 'tool').length, 1, 'the pending call is not falsely recorded as completed');
+  release();
+  await running;
 });

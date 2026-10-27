@@ -39,6 +39,8 @@
     "onCommand:codingHarness.showLog",
     "onCommand:codingHarness.askAboutSelection",
     "onCommand:codingHarness.compactConversation",
+    "onCommand:codingHarness.exportChat",
+    "onCommand:codingHarness.importChat",
     "onCommand:codingHarness.reloadMcpServers",
     "onCommand:codingHarness.openAgentFiles",
     "onCommand:codingHarness.reloadAgentFiles",
@@ -100,6 +102,16 @@
         "command": "codingHarness.compactConversation",
         "title": "Coding Harness: Compact Conversation",
         "icon": "$(compress)"
+      },
+      {
+        "command": "codingHarness.exportChat",
+        "title": "Coding Harness: Export Chat…",
+        "icon": "$(export)"
+      },
+      {
+        "command": "codingHarness.importChat",
+        "title": "Coding Harness: Import Chat…",
+        "icon": "$(cloud-download)"
       },
       {
         "command": "codingHarness.reloadMcpServers",
@@ -296,6 +308,18 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "Show the model's reasoning stream in its own lane when the backend provides one (DeepSeek `reasoning_content`, OpenRouter `reasoning`, OpenAI-compatible reasoning models, Anthropic extended thinking). The reasoning is displayed only — it is never sent back to the model as conversation content."
+        },
+        "codingHarness.chat.saveEnabled": {
+          "type": "boolean",
+          "scope": "window",
+          "default": true,
+          "markdownDescription": "Automatically save and restore the current chat for this workspace. Turning this off stops automatic saving and restoring but does not delete previously saved files. Manual chat import and export remain available."
+        },
+        "codingHarness.chat.saveFolder": {
+          "type": "string",
+          "scope": "window",
+          "default": "",
+          "markdownDescription": "Folder for automatic chat saves. Leave empty to use VS Code's workspace storage. A relative path is resolved against the first workspace folder; absolute paths and `~` are also supported on the extension host. Each workspace gets its own file. Changing folders saves the current chat there and leaves the old file in place. Chat files are unencrypted and may contain sensitive data."
         },
         "codingHarness.agentFiles.enabled": {
           "type": "boolean",

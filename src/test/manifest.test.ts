@@ -80,6 +80,16 @@ test('every contributed setting is actually read by the controller', () => {
   }
 });
 
+test('chat saving and its folder are configurable per workspace with backward-compatible defaults', () => {
+  const properties = manifest.contributes.configuration.properties;
+  assert.equal(properties['codingHarness.chat.saveEnabled'].type, 'boolean');
+  assert.equal(properties['codingHarness.chat.saveEnabled'].default, true);
+  assert.equal(properties['codingHarness.chat.saveEnabled'].scope, 'window');
+  assert.equal(properties['codingHarness.chat.saveFolder'].type, 'string');
+  assert.equal(properties['codingHarness.chat.saveFolder'].default, '');
+  assert.equal(properties['codingHarness.chat.saveFolder'].scope, 'window');
+});
+
 test('there is no built-in prompt setting; instructions come from agent files', () => {
   const properties = Object.keys(manifest.contributes?.configuration?.properties ?? {});
   assert.ok(!properties.includes('codingHarness.systemPromptExtra'), 'systemPromptExtra is a built-in prompt backdoor');

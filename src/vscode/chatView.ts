@@ -69,9 +69,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async handle(message: any): Promise<void> {
     if (!message || typeof message.type !== 'string') return;
+    await this.controller.whenReady();
     switch (message.type) {
       case 'ready':
       case 'reload':
+        if (!this.controller.isBusy) await this.controller.refreshState();
         this.post({
           type: 'init',
           items: this.controller.getTranscript(),
@@ -86,7 +88,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.controller.cancel();
         break;
       case 'reset':
-        this.controller.reset();
+        await this.controller.reset();
+        break;
+      case 'import-chat':
+        await this.controller.importChat();
+        break;
+      case 'export-chat':
+        await this.controller.exportChat();
         break;
       case 'revert':
         await this.controller.revertLastTask();
@@ -141,7 +149,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await vscode.commands.executeCommand('workbench.action.openSettings', 'codingHarness');
         break;
       case 'copy':
-        await vscode.env.clipboard.writeText(String(message.text ?? ''));
+        try {
+          await vscode.env.clipboard.writeText(String(message.text ?? ''));
+          this.post({ type: 'copy-result', id: message.id, ok: true });
+        } catch (error) {
+          this.log.warn(`clipboard write failed: ${String(error)}`);
+          this.post({ type: 'copy-result', id: message.id, ok: false });
+          void vscode.window.showErrorMessage('Coding Harness could not copy to the clipboard.');
+        }
         break;
       case 'insert-code': {
         // Explicit user action: put a rendered code block at the cursor.

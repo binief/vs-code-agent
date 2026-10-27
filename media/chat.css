@@ -141,8 +141,11 @@ body > .app {
 .headline-actions {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  min-width: 0;
   gap: 1px;
-  flex: none;
+  flex: 0 1 auto;
 }
 
 /* ---------------------------------------------------------------- buttons */
@@ -548,13 +551,20 @@ kbd {
   margin-left: auto;
   display: flex;
   gap: 1px;
-  opacity: 0;
+  opacity: 0.65;
   transition: opacity 0.12s ease;
 }
 
 .msg:hover .msg-actions,
 .msg:focus-within .msg-actions {
   opacity: 1;
+}
+
+.stream .msg-text,
+.stream .prose,
+.stream .tool-body,
+.stream .thinking-body {
+  user-select: text;
 }
 
 .msg-text {
@@ -605,12 +615,12 @@ kbd {
   display: none;
 }
 
-/* The copy affordance for a finished answer: quiet until the message is hovered. */
+/* Keep copy discoverable even before hovering, including while an answer streams. */
 .msg.assistant > .msg-actions {
   display: flex;
   gap: 1px;
   margin-top: 2px;
-  opacity: 0;
+  opacity: 0.65;
   transition: opacity 0.12s ease;
 }
 

@@ -377,3 +377,144 @@ test('the mcp dialog renders a snapshot and validates before saving', () => {
   assert.ok(!h.posted.some((m) => m.type === 'save-mcp-settings'), 'and nothing is written');
   h.close();
 });
+
+/* ---------------------------------------------------------- copy and chats */
+
+test('message, streaming answer, code and tool copy buttons send exact text and wait for confirmation', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [
+    { id: 'u1', kind: 'user', text: 'A user question' },
+    { id: 'a1', kind: 'assistant', text: 'First', final: false, streaming: true },
+    { id: 't1', kind: 'tool', toolCallId: 't', name: 'read_file', args: '{}', status: 'ok', detail: 'raw tool output' },
+  ], state, activity: idle });
+
+  const userButton = h.doc.querySelector('[aria-label="Copy this message"]');
+  userButton.click();
+  let copy = h.posted.filter((m) => m.type === 'copy').pop();
+  assert.equal(copy.text, 'A user question');
+  assert.ok(!userButton.classList.contains('copied'), 'do not claim success before the host writes');
+  h.send({ type: 'copy-result', id: copy.id, ok: false });
+  assert.ok(!userButton.classList.contains('copied'), 'a failed copy is not reported as successful');
+
+  h.send({ type: 'update', item: { id: 'a1', text: 'Updated **answer**\n\n```ts\nconst x = 1;\n```', streaming: true } });
+  const answerButton = h.doc.querySelector('[aria-label="Copy this answer"]');
+  assert.ok(answerButton, 'copy is available during streaming');
+  answerButton.click();
+  copy = h.posted.filter((m) => m.type === 'copy').pop();
+  assert.equal(copy.text, 'Updated **answer**\n\n```ts\nconst x = 1;\n```', 'the latest raw Markdown is copied');
+  h.send({ type: 'copy-result', id: copy.id, ok: true });
+  assert.ok(answerButton.classList.contains('copied'));
+  assert.equal(answerButton.title, 'Copied');
+  assert.ok(answerButton.querySelector('svg'), 'feedback must not replace the icon');
+
+  const codeButton = h.doc.querySelector('.code-copy');
+  codeButton.click();
+  copy = h.posted.filter((m) => m.type === 'copy').pop();
+  assert.equal(copy.text, 'const x = 1;');
+  h.send({ type: 'copy-result', id: copy.id, ok: true });
+  assert.equal(codeButton.textContent, 'Copied');
+
+  const toolButton = [...h.doc.querySelectorAll('.tool-actions button')].find((b: any) => b.textContent === 'Copy output') as any;
+  toolButton.click();
+  copy = h.posted.filter((m) => m.type === 'copy').pop();
+  assert.equal(copy.text, 'raw tool output');
+  h.close();
+});
+
+test('selected chat text uses the VS Code clipboard without hijacking input copy', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [{ id: 'a', kind: 'assistant', text: 'Select this passage', final: true }], state, activity: idle });
+  const text = h.doc.querySelector('.msg-body p').firstChild;
+  const range = h.doc.createRange();
+  range.setStart(text, 7);
+  range.setEnd(text, 11);
+  const selection = h.window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+
+  const shortcut = new h.window.KeyboardEvent('keydown', { key: 'c', ctrlKey: true, bubbles: true, cancelable: true });
+  h.doc.body.dispatchEvent(shortcut);
+  assert.equal(shortcut.defaultPrevented, true);
+  assert.equal(h.posted.filter((m) => m.type === 'copy').pop().text, 'this');
+
+  const before = h.posted.filter((m) => m.type === 'copy').length;
+  const inputShortcut = new h.window.KeyboardEvent('keydown', { key: 'c', ctrlKey: true, bubbles: true, cancelable: true });
+  h.doc.getElementById('input').dispatchEvent(inputShortcut);
+  assert.equal(inputShortcut.defaultPrevented, false);
+  assert.equal(h.posted.filter((m) => m.type === 'copy').length, before);
+
+  let copied = '';
+  const copyEvent = new h.window.Event('copy', { bubbles: true, cancelable: true });
+  Object.defineProperty(copyEvent, 'clipboardData', { value: { setData: (_type: string, value: string) => { copied = value; } } });
+  h.doc.body.dispatchEvent(copyEvent);
+  assert.equal(copyEvent.defaultPrevented, true);
+  assert.equal(copied, 'this', 'context-menu copy gets plain selected text');
+  h.close();
+});
+
+test('streaming updates do not destroy an active text selection', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [{ id: 'a', kind: 'assistant', text: 'Hello reader', final: false, streaming: true }], state, activity: idle });
+  const body = h.doc.querySelector('.msg-body');
+  const text = body.querySelector('p').firstChild;
+  const range = h.doc.createRange();
+  range.setStart(text, 0);
+  range.setEnd(text, 5);
+  const selection = h.window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+
+  h.send({ type: 'update', item: { id: 'a', text: 'Hello reader, more arrived', streaming: true } });
+  assert.equal(selection.toString(), 'Hello');
+  assert.equal(body.querySelector('p').firstChild, text, 'the selected DOM is not replaced');
+  selection.removeAllRanges();
+  h.doc.dispatchEvent(new h.window.Event('selectionchange'));
+  assert.ok(body.textContent.includes('more arrived'), 'the deferred repaint catches up');
+  h.close();
+});
+
+test('chat import/export actions, replacement, and interrupted approvals are wired safely', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [], state, activity: idle });
+  h.doc.getElementById('btn-import-chat').click();
+  h.doc.getElementById('btn-export-chat').click();
+  assert.ok(h.posted.some((m) => m.type === 'import-chat'));
+  assert.ok(h.posted.some((m) => m.type === 'export-chat'));
+
+  h.send({ type: 'state', state: { ...state, busy: true } });
+  assert.equal(h.doc.getElementById('btn-import-chat').disabled, true);
+  assert.equal(h.doc.getElementById('btn-export-chat').disabled, true);
+  assert.equal(h.doc.getElementById('btn-reset').disabled, true);
+
+  h.doc.getElementById('input').value = 'old draft';
+  h.send({ type: 'chat-replaced', items: [
+    { id: 'old-approval', kind: 'approval', approvalId: 'x', request: { kind: 'command', title: 'Run', detail: 'echo test' }, interrupted: true },
+    { id: 'restored', kind: 'assistant', text: 'Restored answer', final: true },
+  ], state, activity: idle });
+  assert.equal(h.doc.getElementById('input').value, '');
+  assert.ok(h.doc.querySelector('.msg.assistant').textContent.includes('Restored answer'));
+  assert.match(h.doc.querySelector('.approval-head').textContent, /Interrupted/);
+  assert.equal(h.doc.querySelectorAll('.approval-actions button').length, 0, 'stale approvals are never actionable');
+  h.close();
+});
+
+test('a selected thinking stream stays readable and catches up after selection', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [{ id: 't', kind: 'thinking', text: 'Thinking aloud', streaming: true }], state, activity: idle });
+  const lane = h.doc.querySelector('.thinking');
+  const body = lane.querySelector('.thinking-body');
+  const text = body.firstChild;
+  const range = h.doc.createRange();
+  range.setStart(text, 0);
+  range.setEnd(text, 8);
+  const selection = h.window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+  h.send({ type: 'update', item: { id: 't', text: 'Thinking aloud, now finished', streaming: false, durationMs: 100 } });
+  assert.equal(selection.toString(), 'Thinking');
+  assert.ok(lane.classList.contains('open'), 'finishing does not hide text being selected');
+  selection.removeAllRanges();
+  h.doc.dispatchEvent(new h.window.Event('selectionchange'));
+  assert.equal(body.textContent, 'Thinking aloud, now finished');
+  h.close();
+});

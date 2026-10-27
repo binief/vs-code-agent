@@ -405,6 +405,8 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.lineEndings` | `auto` | Preserve existing style; `lf` \| `crlf` \| `cr` \| `native` override it |
 | `codingHarness.stream` | `true` | Render output token by token; off = one response per turn |
 | `codingHarness.showThinking` | `true` | Show the model's reasoning lane when the backend provides one |
+| `codingHarness.chat.saveEnabled` | `true` | Automatically save and restore the current workspace chat |
+| `codingHarness.chat.saveFolder` | `""` | Folder for automatic saves; empty uses VS Code workspace storage |
 | `codingHarness.agentFiles.enabled` | `true` | Load instructions from agent files (no built-in prompt) |
 | `codingHarness.agentFiles.names` | `["AGENTS.md","agent.md","agents.md","copilot-instructions.md"]` | Exact names searched (case-insensitive) |
 | `codingHarness.agentFiles.patterns` | `["*.instructions.md"]` | Workspace-relative globs, so files can have any name |
@@ -445,6 +447,8 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | *Coding Harness: Open Agent Instructions* | Opens the loaded agent files or creates `agent.md` |
 | *Coding Harness: Reload Agent Instructions* | Rediscovers instruction files now |
 | *Coding Harness: Preview System Context* | Inspect the next system message (context + agent files) |
+| *Coding Harness: Import Chat…* | Replace the current chat with an exported JSON chat |
+| *Coding Harness: Export Chat…* | Save the current chat and its model context to JSON |
 | *Coding Harness: Reload MCP Servers* | Re-reads config files + settings and reconnects |
 
 ## How a task runs
@@ -515,15 +519,62 @@ markup into the panel.
 Tool calls collapse to a single row (icon, name, primary argument, duration, status colour) and expand
 on click to show arguments and output; a failure stays open, a success folds away. Reasoning sits in
 its own dashed lane that is expanded while it streams and folds to a one-line preview with its duration
-once the answer lands; opening it yourself keeps it open. The header carries status plus compact, MCP,
-agents, revert, new-conversation and settings actions; the meta row reports provider, policies,
-instruction files, token count and context use, and a warning banner offers **Compact** past 75%.
+once the answer lands; opening it yourself keeps it open. Select text and press `Ctrl`/`Cmd`+`C`, or
+use the copy buttons on messages, code blocks and tool output. Message buttons copy the original
+Markdown, including during streaming; they show **Copied** only after VS Code confirms the clipboard
+write. The header includes import/export, compact, MCP, agents, revert, new-conversation and settings
+actions; the meta row reports provider, policies, instruction files, token count and context use, and
+a warning banner offers **Compact** past 75%.
 
 The markup lives in `media/panel.html` (styles in `media/chat.css`, client logic in `media/chat.js`), and
 `chatView.ts` only substitutes the CSP, two asset URIs and a nonce — so the UI can be edited as HTML
 instead of escaped strings. `src/test/webview.test.ts` holds the layout contract: the transcript
 scrolls, its children never shrink, every `getElementById` resolves to an element in the markup, tags
 balance, and colours come from theme variables only.
+
+### Saved chats, import and export
+
+By default, the current conversation is saved automatically in VS Code's **workspace-specific
+extension storage**, outside the project. Reopen the same folder or workspace after restarting VS Code
+to see it again and send a follow-up. Both the visible transcript and the model's conversation history
+are restored, including images and tool results; normal history trimming and compaction still apply.
+If VS Code closes during a task, the latest saved progress is shown as interrupted. Tools and approval
+requests are not restarted or applied automatically.
+
+Use the panel's **Settings** button or VS Code Settings to change these user- or workspace-level
+preferences:
+
+- **`codingHarness.chat.saveEnabled`** (default `true`) controls automatic saving **and** restoring.
+  Set it to `false` to keep the current session in memory only; it will not be restored after closing.
+  Turning it off does **not** delete files saved earlier. Delete those files yourself if desired.
+- **`codingHarness.chat.saveFolder`** (default `""`) chooses the folder for automatic saves. Leave it
+  empty for VS Code's workspace-specific storage (`current-chat.json`). Use an absolute path, a path
+  relative to the first workspace folder (for example `.harness/chats`), or `~` for the extension
+  host's home directory. In a remote workspace, the path is on the remote host. The folder is created
+  as needed, and files are named `coding-harness-chat-<workspace-id>.json` so workspaces using the
+  same folder do not overwrite one another.
+
+Changes take effect without restarting. Enabling saving or changing its folder saves the current chat
+at the selected destination, replacing that workspace's existing file there. It does not load or
+replace the live chat, and it leaves the previous destination's file in place. If the current chat
+is still untouched and empty, the destination is left unchanged; its saved chat will be loaded on the
+next restart. A reset made while saving is off is saved when it is turned back on. Export an existing
+chat first if you need to keep it before replacing it.
+
+Use the **Export chat** and **Import chat** buttons in the panel header, or the corresponding commands
+in the Command Palette. Manual import and export work even when automatic saving is off. Export creates
+a versioned JSON file; import validates the file and asks for confirmation before replacing an
+existing chat. Finish or stop a running task before importing or exporting. Files are limited to 512 MB.
+**New conversation** clears the current saved chat when automatic saving is enabled, so export it first
+if you want to keep it. File-change checkpoints are not included in exports or restored after a restart.
+API credentials are stored separately in VS Code, not in chat archives; imported chats do not change
+project files by themselves.
+
+Chat storage and exports are not encrypted by this extension. They can contain prompts, responses,
+reasoning, code, tool output and screenshots, including sensitive information entered or returned in
+the conversation. A custom folder inside a repository may be committed or synced; exclude it if
+necessary. Review an export before sharing it. API keys configured in Secret Storage or settings are
+not intentionally added to the archive.
 
 ### Images
 
