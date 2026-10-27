@@ -1,7 +1,10 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+import { createHash, randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
 import { HarnessSession } from '../core/agent';
+import { compactHistory as compactMessages, estimateMessagesTokens } from '../core/compaction';
 import { agentFilesSummary, discoverAgentFiles, selectAgentFiles, type AgentFilesResult } from '../core/agentFiles';
 import { buildSystemPrompt, summarizeDiagnostics } from '../core/prompt';
 import { apiKeyFromEnv, createProvider } from '../core/providers';
@@ -21,6 +24,7 @@ import {
   resolveConfig,
   type ApprovalRequest,
   type AgentInstructionFile,
+  type ChatMessage,
   type ImageAttachment,
   type HarnessConfig,
   type McpServerConfig,
@@ -29,6 +33,7 @@ import {
   type Usage,
   type WorkspaceContext,
 } from '../core/types';
+import { CHAT_ARCHIVE_FORMAT, CHAT_ARCHIVE_VERSION, MAX_CHAT_ARCHIVE_BYTES, parseChatArchive, type ChatArchive } from './chatArchive';
 import type { ApprovalService } from './host';
 import { VsCodeHost } from './host';
 import type { Logger } from './log';
@@ -67,7 +72,7 @@ export type TranscriptItem =
       durationMs?: number;
       relPath?: string;
     }
-  | { id: string; kind: 'approval'; approvalId: string; request: ApprovalRequest; decision?: 'apply' | 'reject' }
+  | { id: string; kind: 'approval'; approvalId: string; request: ApprovalRequest; decision?: 'apply' | 'reject'; interrupted?: boolean }
   | { id: string; kind: 'notice'; level: 'info' | 'warn' | 'error'; message: string }
   | { id: string; kind: 'done'; reason: TaskOutcome; summary: string; filesChanged: string[]; usage?: Usage; tokensPerSecond?: number };
 
@@ -173,6 +178,20 @@ export interface McpSettingsSnapshot {
 }
 
 const MAX_ITEMS = 400;
+const CHAT_FILE = 'current-chat.json';
+const CHAT_SAVE_DELAY_MS = 1500;
+
+interface ChatSaveLocation {
+  directory: vscode.Uri;
+  file: vscode.Uri;
+  key: string;
+}
+
+interface ChatSaveSettings {
+  enabled: boolean;
+  location?: ChatSaveLocation;
+  error?: string;
+}
 
 /**
  * Owns the agent session and translates core events into renderable UI items.
@@ -194,8 +213,19 @@ export class HarnessController {
   private readonly mcpInputCache = new Map<string, string>();
   private agentNoticeShown = false;
   private items: TranscriptItem[] = [];
+  /** Restored before the first session is created, then handed to the agent. */
+  private restoredHistory: ChatMessage[] = [];
+  private readonly ready: Promise<void>;
+  private chatSaveSettings: ChatSaveSettings;
+  /** Invalidates queued writes when saving is disabled or the destination changes. */
+  private chatSaveGeneration = 0;
+  private saveTimer?: NodeJS.Timeout;
+  private saveQueue: Promise<void> = Promise.resolve();
+  private chatRevision = 0;
+  private savedChatRevision = 0;
+  private saveErrorNotified = false;
+  private cancelPendingStart = false;
   private readonly listeners = new Set<(message: unknown) => void>();
-  private counter = 0;
   /** Throttled streaming buffers, keyed by assistant message id. */
   private readonly streams = new Map<string, { timer?: NodeJS.Timeout }>();
   private activity: Activity = {
@@ -252,6 +282,8 @@ export class HarnessController {
     // does not leak into other repositories the way a global setting would.
     const stored = HarnessController.arrayOfStrings(this.context.workspaceState?.get(AGENT_SELECTION_KEY));
     if (stored && stored.length > 0) this.agentSelection = stored;
+    this.chatSaveSettings = this.readChatSaveSettings();
+    this.ready = this.restoreSavedChat();
   }
 
   /* ------------------------------------------------------------- wiring */
@@ -285,6 +317,387 @@ export class HarnessController {
 
   get isBusy(): boolean {
     return this.state.busy;
+  }
+
+  /** Wait for workspace storage before displaying or modifying the chat. */
+  whenReady(): Promise<void> {
+    return this.ready;
+  }
+
+  /* -------------------------------------------------------- chat storage */
+
+  /** Resolve paths on the extension host, preserving the workspace's remote filesystem. */
+  private readChatSaveSettings(): ChatSaveSettings {
+    const config = vscode.workspace.getConfiguration('codingHarness');
+    const enabledSetting = config.get<unknown>('chat.saveEnabled');
+    if (enabledSetting !== undefined && typeof enabledSetting !== 'boolean') {
+      // Fail closed if settings.json contains an invalid value such as "false".
+      return { enabled: false, error: 'chat.saveEnabled must be true or false.' };
+    }
+    const enabled = enabledSetting ?? true;
+    if (!enabled) return { enabled: false };
+    const folderSetting = config.get<unknown>('chat.saveFolder');
+    if (folderSetting !== undefined && typeof folderSetting !== 'string') {
+      return { enabled, error: 'chat.saveFolder must be a folder path string.' };
+    }
+    const folder = (folderSetting ?? '').trim();
+
+    if (!folder) {
+      const directory = this.context.storageUri;
+      if (!directory) return { enabled }; // No workspace storage in an empty window.
+      const file = vscode.Uri.joinPath(directory, CHAT_FILE);
+      return { enabled, location: { directory, file, key: file.toString() } };
+    }
+
+    const workspace = vscode.workspace.workspaceFolders?.[0];
+    if (!workspace) return { enabled }; // Tasks require an open folder or workspace.
+    try {
+      if (folder.includes('\0')) throw new Error('The chat save folder contains a null character.');
+      let expanded = folder;
+      if (folder === '~') expanded = os.homedir();
+      else if (/^~[\\/]/.test(folder)) expanded = path.join(os.homedir(), folder.slice(2).replace(/[\\/]/g, path.sep));
+
+      let directory: vscode.Uri;
+      if (path.isAbsolute(expanded)) {
+        const fileUri = vscode.Uri.file(path.normalize(expanded));
+        // In a remote workspace the path is on the remote extension host,
+        // not the machine running the VS Code UI.
+        directory = workspace.uri.scheme === 'file' ? fileUri : workspace.uri.with({ path: fileUri.path });
+      } else {
+        directory = vscode.Uri.joinPath(workspace.uri, expanded.replace(/\\/g, '/'));
+      }
+      // A shared save folder must not make different workspaces share a chat.
+      // A saved multi-root workspace is identified by its .code-workspace URI.
+      const workspaceId = (vscode.workspace.workspaceFile ?? workspace.uri).toString();
+      const digest = createHash('sha256').update(workspaceId).digest('hex').slice(0, 24);
+      const file = vscode.Uri.joinPath(directory, `coding-harness-chat-${digest}.json`);
+      return { enabled, location: { directory, file, key: file.toString() } };
+    } catch (error) {
+      return { enabled, error: String(error) };
+    }
+  }
+
+  private sameChatSaveSettings(a: ChatSaveSettings, b: ChatSaveSettings): boolean {
+    return a.enabled === b.enabled && a.location?.key === b.location?.key && a.error === b.error;
+  }
+
+  private reportChatSaveSettingsError(error: string): void {
+    this.log.warn(`invalid chat saving settings: ${error}`);
+    void vscode.window.showWarningMessage('Coding Harness could not use the chat saving settings. Check the settings and the Coding Harness log.');
+  }
+
+  private async restoreSavedChat(): Promise<void> {
+    // Settings can change while the file is being read. Never restore an old
+    // destination, or restore anything after the user has opted out.
+    for (;;) {
+      const settings = this.chatSaveSettings;
+      if (settings.error) this.reportChatSaveSettingsError(settings.error);
+      if (!settings.enabled || !settings.location) return;
+      let bytes: Uint8Array | undefined;
+      let readError: unknown;
+      try {
+        bytes = await vscode.workspace.fs.readFile(settings.location.file);
+      } catch (error) {
+        readError = error;
+      }
+      const latest = this.readChatSaveSettings();
+      if (!this.sameChatSaveSettings(settings, latest)) {
+        this.chatSaveSettings = latest;
+        this.chatSaveGeneration++;
+        continue;
+      }
+      try {
+        if (readError) throw readError;
+        const archive = parseChatArchive(Buffer.from(bytes!).toString('utf8'));
+        const interrupted = this.applyChatArchive(archive);
+        // Replace transient running/approval states with their interrupted forms.
+        if (interrupted) this.scheduleChatSave();
+        this.log.info('restored the current workspace conversation');
+      } catch (error) {
+        const code = (error as { code?: string }).code;
+        if (code === 'FileNotFound' || code === 'ENOENT') return;
+        this.log.warn(`could not restore chat: ${(error as Error).message}`);
+        void vscode.window.showWarningMessage('Coding Harness could not restore the saved chat. See the Coding Harness log for details.');
+      }
+      return;
+    }
+  }
+
+  /** Apply saving preferences without replacing the live conversation. */
+  private async refreshChatSaveSettings(): Promise<void> {
+    await this.whenReady();
+    const next = this.readChatSaveSettings();
+    if (this.sameChatSaveSettings(this.chatSaveSettings, next)) return;
+    this.chatSaveSettings = next;
+    this.chatSaveGeneration++;
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = undefined;
+    if (next.error) this.reportChatSaveSettingsError(next.error);
+    if (!next.enabled || !next.location) {
+      await this.saveQueue;
+      return;
+    }
+
+    const changed = this.chatRevision !== this.savedChatRevision;
+    const hasChat = this.items.length > 0 || this.restoredHistory.length > 0 || Boolean(this.session?.transcript.length);
+    if (hasChat || changed) {
+      // The current chat wins when enabling saving or moving to another folder.
+      // Old files are deliberately left in place; do not load a different chat.
+      this.savedChatRevision = -1;
+      this.scheduleChatSave();
+      await this.persistChat();
+    } else {
+      // Opening settings alone must not overwrite an existing or unreadable file.
+      this.savedChatRevision = this.chatRevision;
+      await this.saveQueue;
+    }
+  }
+
+  private isCurrentChatSave(location: ChatSaveLocation, generation: number): boolean {
+    if (generation !== this.chatSaveGeneration || !this.chatSaveSettings.enabled || this.chatSaveSettings.location?.key !== location.key) return false;
+    // Also consult the actual configuration in case the settings event is
+    // still waiting to run while a filesystem operation is in flight.
+    const latest = this.readChatSaveSettings();
+    return latest.enabled && latest.location?.key === location.key;
+  }
+
+  private currentChatArchive(): ChatArchive {
+    return {
+      format: CHAT_ARCHIVE_FORMAT,
+      version: CHAT_ARCHIVE_VERSION,
+      savedAt: new Date().toISOString(),
+      inProgress: this.state.busy,
+      items: this.items,
+      history: this.session ? this.session.conversationSnapshot : this.restoredHistory,
+      usage: this.session ? this.session.usage : this.cumulativeUsage,
+    };
+  }
+
+  /** Recovered cards are historical: no interrupted tool or approval can resume. */
+  private applyChatArchive(archive: ChatArchive): boolean {
+    let interrupted = archive.inProgress;
+    this.items = archive.items.map((item): TranscriptItem => {
+      if (item.kind === 'assistant' && item.streaming) {
+        interrupted = true;
+        return { ...item, streaming: false };
+      }
+      if (item.kind === 'thinking' && item.streaming) {
+        interrupted = true;
+        return { ...item, streaming: false };
+      }
+      if (item.kind === 'tool' && item.status === 'running') {
+        interrupted = true;
+        return { ...item, status: 'failed', summary: 'Interrupted', detail: item.detail || 'The task stopped before this tool finished.' };
+      }
+      if (item.kind === 'approval' && !item.decision && !item.interrupted) {
+        interrupted = true;
+        return { ...item, interrupted: true };
+      }
+      return item;
+    });
+    if (interrupted) {
+      this.items.push({
+        id: this.id(),
+        kind: 'notice',
+        level: 'warn',
+        message: 'The previous task was interrupted. Its saved progress is shown above; send a follow-up to continue.',
+      });
+    }
+    this.trimItems();
+    this.cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0, ...archive.usage };
+    this.lastTokensPerSecond = 0;
+    if (this.session) {
+      this.session.reset(); // Checkpoints and live approvals do not belong to the imported chat.
+      this.session.restoreConversation(archive.history, this.cumulativeUsage);
+      this.restoredHistory = [];
+    } else {
+      this.restoredHistory = [...archive.history];
+    }
+    const contextTokens = estimateMessagesTokens(archive.history);
+    const contextWindow = this.readConfig().compaction.contextWindowTokens;
+    this.state = {
+      ...this.state,
+      status: 'idle',
+      busy: false,
+      step: 0,
+      usage: { ...this.cumulativeUsage },
+      cumulativeUsage: { ...this.cumulativeUsage },
+      tokensPerSecond: 0,
+      contextTokens,
+      contextWindow,
+      contextPercent: contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0,
+    };
+    this.activity = { status: 'idle', step: 0, maxSteps: 0, tool: null, detail: null, startedAt: 0, taskStartedAt: 0 };
+    return interrupted;
+  }
+
+  private scheduleChatSave(): void {
+    // Track edits even when saving is disabled (e.g. to protect imports from
+    // concurrent changes and to persist a reset if saving is later enabled).
+    this.chatRevision++;
+    if (!this.chatSaveSettings.enabled || !this.chatSaveSettings.location || this.saveTimer) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = undefined;
+      void this.persistChat();
+    }, CHAT_SAVE_DELAY_MS);
+  }
+
+  /** Serialize writes so an older streaming snapshot can never overwrite a newer one. */
+  private async persistChat(): Promise<void> {
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = undefined;
+    await this.whenReady();
+    const location = this.chatSaveSettings.location;
+    const generation = this.chatSaveGeneration;
+    if (!location || !this.isCurrentChatSave(location, generation) || this.chatRevision === this.savedChatRevision) {
+      // Do not overwrite an unreadable saved file when the chat has not changed.
+      await this.saveQueue;
+      return;
+    }
+    const write = this.saveQueue.then(async () => {
+      // Capture only when the previous write is done. Bursts of streaming
+      // updates then coalesce instead of queuing large image-filled buffers.
+      if (!this.isCurrentChatSave(location, generation) || this.chatRevision === this.savedChatRevision) return;
+      const revision = this.chatRevision;
+      const data = Buffer.from(JSON.stringify(this.currentChatArchive()), 'utf8');
+      const temp = vscode.Uri.joinPath(location.directory, `.current-chat-${randomUUID()}.tmp`);
+      await vscode.workspace.fs.createDirectory(location.directory);
+      if (!this.isCurrentChatSave(location, generation)) return;
+      try {
+        await vscode.workspace.fs.writeFile(temp, data);
+        // Opting out or moving the folder while writing must not commit an old
+        // snapshot after the setting changed. Remove the temporary file instead.
+        if (!this.isCurrentChatSave(location, generation)) {
+          try { await vscode.workspace.fs.delete(temp); } catch { /* best-effort cleanup */ }
+          return;
+        }
+        await vscode.workspace.fs.rename(temp, location.file, { overwrite: true });
+      } catch (error) {
+        try { await vscode.workspace.fs.delete(temp); } catch { /* no temporary file to remove */ }
+        throw error;
+      }
+      if (this.isCurrentChatSave(location, generation)) {
+        this.savedChatRevision = Math.max(this.savedChatRevision, revision);
+        this.saveErrorNotified = false;
+      }
+    });
+    this.saveQueue = write.catch((error) => {
+      if (this.isCurrentChatSave(location, generation)) this.reportChatSaveError(error);
+    });
+    await this.saveQueue;
+  }
+
+  private reportChatSaveError(error: unknown): void {
+    this.log.warn(`could not save chat: ${String(error)}`);
+    if (!this.saveErrorNotified) {
+      this.saveErrorNotified = true;
+      void vscode.window.showWarningMessage('Coding Harness could not save the current chat. See the Coding Harness log for details.');
+    }
+  }
+
+  /** Stop live work and flush the most recent snapshot on extension shutdown. */
+  async shutdown(): Promise<void> {
+    await this.whenReady();
+    this.cancel();
+    this.approvals.cancelAll();
+    // Honor the latest setting even if its change event is still queued.
+    await this.refreshChatSaveSettings();
+    await this.persistChat();
+  }
+
+  async exportChat(): Promise<void> {
+    await this.whenReady();
+    if (this.isBusy) {
+      void vscode.window.showWarningMessage('Stop or finish the current task before exporting the chat.');
+      return;
+    }
+    if (!this.items.length && !(this.session?.transcript.length || this.restoredHistory.length)) {
+      void vscode.window.showInformationMessage('There is no chat to export yet.');
+      return;
+    }
+    const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
+    const filename = `coding-harness-chat-${new Date().toISOString().slice(0, 10)}.json`;
+    const uri = await vscode.window.showSaveDialog({
+      title: 'Export Coding Harness chat',
+      saveLabel: 'Export Chat',
+      filters: { 'Coding Harness chat': ['json'] },
+      ...(folder ? { defaultUri: vscode.Uri.joinPath(folder, filename) } : {}),
+    });
+    if (!uri) return;
+    if (this.isBusy) {
+      void vscode.window.showWarningMessage('Stop or finish the current task before exporting the chat.');
+      return;
+    }
+    try {
+      const data = Buffer.from(`${JSON.stringify(this.currentChatArchive(), null, 2)}\n`, 'utf8');
+      if (data.byteLength > MAX_CHAT_ARCHIVE_BYTES) throw new Error('Chat exceeds the 512 MB import/export limit.');
+      await vscode.workspace.fs.writeFile(uri, data);
+      void vscode.window.showInformationMessage('Coding Harness chat exported.');
+    } catch (error) {
+      this.log.error(`chat export failed: ${String(error)}`);
+      void vscode.window.showErrorMessage(`Could not export chat: ${(error as Error).message}`);
+    }
+  }
+
+  async importChat(): Promise<void> {
+    await this.whenReady();
+    if (!this.workspaceRoot()) {
+      void vscode.window.showErrorMessage('Open a folder or workspace before importing a chat.');
+      return;
+    }
+    if (this.isBusy) {
+      void vscode.window.showWarningMessage('Stop or finish the current task before importing a chat.');
+      return;
+    }
+    const selected = await vscode.window.showOpenDialog({
+      title: 'Import Coding Harness chat',
+      openLabel: 'Import Chat',
+      canSelectMany: false,
+      filters: { 'Coding Harness chat': ['json'] },
+    });
+    if (!selected?.[0]) return;
+    let archive: ChatArchive;
+    try {
+      const stat = await vscode.workspace.fs.stat(selected[0]);
+      if (stat.size > MAX_CHAT_ARCHIVE_BYTES) throw new Error('Chat exceeds the 512 MB import/export limit.');
+      const bytes = await vscode.workspace.fs.readFile(selected[0]);
+      if (bytes.byteLength > MAX_CHAT_ARCHIVE_BYTES) throw new Error('Chat exceeds the 512 MB import/export limit.');
+      archive = parseChatArchive(Buffer.from(bytes).toString('utf8'));
+    } catch (error) {
+      this.log.warn(`chat import failed: ${String(error)}`);
+      void vscode.window.showErrorMessage(`Could not import chat: ${(error as Error).message}`);
+      return;
+    }
+    if (this.isBusy) {
+      void vscode.window.showWarningMessage('Stop or finish the current task before importing a chat.');
+      return;
+    }
+    const revision = this.chatRevision;
+    if (this.items.length || this.session?.transcript.length || this.restoredHistory.length) {
+      const choice = await vscode.window.showWarningMessage(
+        'Importing will replace the current chat. Export it first if you want to keep it.',
+        { modal: true },
+        'Replace Chat',
+      );
+      if (choice !== 'Replace Chat') return;
+    }
+    // Another command may have started or even finished work while the picker
+    // or confirmation was open. Never replace a chat the user did not confirm.
+    if (this.isBusy) {
+      void vscode.window.showWarningMessage('Stop or finish the current task before importing a chat.');
+      return;
+    }
+    if (revision !== this.chatRevision) {
+      void vscode.window.showWarningMessage('The current chat changed while importing. Please try again.');
+      return;
+    }
+    this.approvals.cancelAll();
+    this.approvals.forgetAll();
+    this.applyChatArchive(archive);
+    this.post({ type: 'chat-replaced', items: this.items, state: this.state, activity: this.activity });
+    this.scheduleChatSave();
+    await this.persistChat();
+    void vscode.window.showInformationMessage('Coding Harness chat imported. You can continue the conversation.');
   }
 
   /* --------------------------------------------------------- config/key */
@@ -470,6 +883,7 @@ export class HarnessController {
     }
 
     if (!this.session || !this.host || this.host.workspaceRoot !== root) {
+      const history = this.session?.conversationSnapshot ?? this.restoredHistory;
       this.host = new VsCodeHost({ root, log: this.log, approvals: this.approvals });
       this.session = new HarnessSession({
         host: this.host,
@@ -478,6 +892,8 @@ export class HarnessController {
         registry: toolRegistry,
         agentSelection: this.agentSelection,
       });
+      this.session.restoreConversation(history, this.cumulativeUsage);
+      this.restoredHistory = [];
       this.log.info(`session created for ${root} using ${provider.label} with ${toolRegistry.size} tools`);
     } else {
       this.session.updateConfig(config);
@@ -494,10 +910,7 @@ export class HarnessController {
           registry: toolRegistry,
           agentSelection: this.agentSelection,
         });
-        // Restore history and cumulative usage
-        // @ts-ignore - accessing private for restoration
-        (this.session as any).history = [...oldHistory];
-        (this.session as any).cumulativeUsage = { ...this.cumulativeUsage };
+        this.session.restoreConversation(oldHistory, this.cumulativeUsage);
         this.log.info(`session recreated with ${toolRegistry.size} tools (MCP updated)`);
       }
     }
@@ -578,6 +991,7 @@ export class HarnessController {
   /** Re-read settings (called on configuration change). */
   async refreshState(): Promise<void> {
     try {
+      await this.refreshChatSaveSettings();
       const config = this.readConfig();
       const apiKey = await this.resolveApiKey(config);
       this.state = {
@@ -601,7 +1015,9 @@ export class HarnessController {
         cumulativeUsage: this.cumulativeUsage,
         tokensPerSecond: this.lastTokensPerSecond,
       };
-      if (this.session) {
+      // A task must keep its current provider/registry until it finishes;
+      // ensureSession will apply changed settings on the next task.
+      if (this.session && !this.isBusy && !this.session.isRunning) {
         this.session.updateConfig(config);
         this.session.setProvider(createProvider({ config, apiKey }));
       }
@@ -614,25 +1030,36 @@ export class HarnessController {
   /* --------------------------------------------------------------- tasks */
 
   async run(prompt: string, rawImages?: readonly RawImageInput[]): Promise<void> {
+    await this.whenReady();
+    if (this.state.busy) {
+      void vscode.window.showWarningMessage('Coding Harness is already running a task. Stop it first.');
+      return;
+    }
     const text = prompt.trim();
     const { images, errors } = normalizeImages(rawImages);
     for (const error of errors) {
       this.pushNotice('warn', `Attachment skipped${error.name ? ` (${error.name})` : ''}: ${error.reason}`);
       this.log.warn(`image attachment rejected: ${error.reason}`);
     }
-    // An image on its own is a valid request ("what is wrong here?"), so only
-    // a turn with neither text nor images is ignored.
+    // An image on its own is a valid request.
     if (!text && images.length === 0) return;
-    if (this.state.busy) {
-      void vscode.window.showWarningMessage('Coding Harness is already running a task. Stop it first.');
-      return;
-    }
 
+    // Lock before asynchronous session/MCP setup so another action cannot
+    // replace the chat or start a second task while initialization is pending.
+    this.cancelPendingStart = false;
+    this.setStatus('thinking', true);
     let session: HarnessSession;
     try {
       session = await this.ensureSession();
     } catch (err) {
+      this.setStatus('idle', false);
       void vscode.window.showErrorMessage((err as Error).message);
+      return;
+    }
+    if (this.cancelPendingStart) {
+      this.cancelPendingStart = false;
+      this.setStatus('idle', false);
+      await this.persistChat();
       return;
     }
 
@@ -648,13 +1075,18 @@ export class HarnessController {
     } as TranscriptItem;
     this.items.push(item);
     this.post({ type: 'item', item });
+    this.scheduleChatSave();
     const now = Date.now();
     this.activity = { ...this.activity, taskStartedAt: now, startedAt: now, step: 0, tool: null, detail: null };
-    this.setStatus('thinking', true);
     this.log.info(`task: ${text.slice(0, 200)}${images.length ? ` [+${images.length} image(s)]` : ''}`);
 
+    // The core reuses step/tool IDs on every task. Scope them to this task so
+    // follow-ups cannot overwrite earlier bubbles, including after a restart.
+    const taskId = this.id();
     try {
-      const result = await session.runTask(text, (event) => this.handleEvent(event), { images });
+      const result = await session.runTask(text, (event) => {
+        this.handleEvent('id' in event ? { ...event, id: `${taskId}:${event.id}` } : event);
+      }, { images });
       this.cumulativeUsage = result.usage;
       this.lastTokensPerSecond = result.tokensPerSecond || 0;
       this.state = {
@@ -673,49 +1105,88 @@ export class HarnessController {
       this.setStatus('idle', false);
       this.approvals.cancelAll();
       this.trimItems();
+      await this.persistChat();
     }
   }
 
   cancel(): void {
-    if (!this.session?.isRunning) return;
-    this.session.cancel();
+    if (this.session?.isRunning) {
+      this.session.cancel();
+    } else if (this.state.busy && !this.cancelPendingStart) {
+      this.cancelPendingStart = true;
+    } else {
+      return;
+    }
     this.pushNotice('info', 'Cancelling the current task…');
   }
 
-  reset(): void {
-    if (this.session?.isRunning) this.session.cancel();
+  async reset(): Promise<void> {
+    await this.whenReady();
+    if (this.isBusy) {
+      void vscode.window.showWarningMessage('Stop or finish the current task before starting a new conversation.');
+      return;
+    }
     this.session?.reset();
+    this.restoredHistory = [];
+    this.approvals.forgetAll();
     this.cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
     this.lastTokensPerSecond = 0;
     this.items = [];
+    this.state = {
+      ...this.state,
+      usage: { ...this.cumulativeUsage },
+      cumulativeUsage: { ...this.cumulativeUsage },
+      tokensPerSecond: 0,
+      contextTokens: 0,
+      contextPercent: 0,
+      step: 0,
+    };
     this.post({ type: 'reset' });
+    this.post({ type: 'state', state: this.state });
     this.log.info('conversation reset');
+    this.scheduleChatSave();
+    await this.persistChat();
   }
 
   async compactHistory(): Promise<void> {
-    if (!this.session) {
+    await this.whenReady();
+    if (this.isBusy) {
+      void vscode.window.showWarningMessage('Stop or finish the current task before compacting the conversation.');
+      return;
+    }
+    if (!this.session && !this.restoredHistory.length) {
       void vscode.window.showInformationMessage('No active session to compact.');
       return;
     }
-    const result = this.session.compact();
+    let result: { compacted: boolean; originalTokens: number; newTokens: number; removed: number };
+    if (this.session) {
+      result = this.session.compact();
+    } else {
+      const compacted = compactMessages(this.restoredHistory, this.readConfig());
+      this.restoredHistory = compacted.newHistory;
+      result = { ...compacted.result, removed: compacted.result.removedMessages };
+    }
     if (result.compacted) {
       this.pushNotice('info', `Compacted conversation: removed ${result.removed} old messages, freed ${result.originalTokens - result.newTokens} tokens (${result.newTokens} tokens now).`);
       this.log.info(`manual compaction: ${result.originalTokens} -> ${result.newTokens} tokens, removed ${result.removed}`);
-      // Update context display
-      const ctx = this.session.getContextUsage();
-      this.state = {
-        ...this.state,
-        contextTokens: ctx.tokens,
-        contextPercent: ctx.percent,
-      };
+      const tokens = this.session?.getContextUsage().tokens ?? estimateMessagesTokens(this.restoredHistory);
+      const window = this.readConfig().compaction.contextWindowTokens;
+      const percent = window > 0 ? (tokens / window) * 100 : 0;
+      this.state = { ...this.state, contextTokens: tokens, contextWindow: window, contextPercent: percent };
       this.post({ type: 'state', state: this.state });
-      this.post({ type: 'context', contextTokens: ctx.tokens, contextWindow: ctx.window, contextPercent: ctx.percent });
+      this.post({ type: 'context', contextTokens: tokens, contextWindow: window, contextPercent: percent });
+      await this.persistChat();
     } else {
       void vscode.window.showInformationMessage('Nothing to compact — conversation is already short.');
     }
   }
 
   async reloadMcpServers(): Promise<void> {
+    await this.whenReady();
+    if (this.isBusy) {
+      void vscode.window.showWarningMessage('Stop or finish the current task before reloading MCP servers.');
+      return;
+    }
     const root = this.workspaceRoot();
     if (!root) {
       void vscode.window.showErrorMessage('Open a folder first.');
@@ -774,8 +1245,7 @@ export class HarnessController {
           registry,
           agentSelection: this.agentSelection,
         });
-        (this.session as any).history = [...oldHistory];
-        (this.session as any).cumulativeUsage = { ...this.cumulativeUsage };
+        this.session.restoreConversation(oldHistory, this.cumulativeUsage);
         this.state = { ...this.state, toolCount: registry.size };
         this.post({ type: 'state', state: this.state });
       }
@@ -834,6 +1304,11 @@ export class HarnessController {
 
   /** Persist the dialog payload to settings, then (re)connect the servers. */
   async saveMcpSettings(input: { enabled?: unknown; timeoutMs?: unknown; servers?: unknown; target?: unknown }): Promise<void> {
+    await this.whenReady();
+    if (this.isBusy) {
+      this.post({ type: 'mcp-settings-saved', ok: false, error: 'Stop or finish the current task before changing MCP servers.' });
+      return;
+    }
     const servers = sanitizeMcpServers(input.servers);
     const enabled = Boolean(input.enabled);
     let timeoutMs =
@@ -885,8 +1360,7 @@ export class HarnessController {
           registry,
           agentSelection: this.agentSelection,
         });
-        (this.session as any).history = [...oldHistory];
-        (this.session as any).cumulativeUsage = { ...this.cumulativeUsage };
+        this.session.restoreConversation(oldHistory, this.cumulativeUsage);
         this.state = { ...this.state, toolCount: registry.size };
         this.post({ type: 'state', state: this.state });
       }
@@ -923,6 +1397,7 @@ export class HarnessController {
 
   /** Re-read the agent files and publish the result to the panel. */
   async refreshAgentFiles(notify = false): Promise<AgentFilesResult | undefined> {
+    await this.whenReady();
     const root = this.workspaceRoot();
     const config = this.readConfig();
     if (!root) {
@@ -1203,6 +1678,7 @@ export class HarnessController {
 
   /** Undo every file change made during the last task. */
   async revertLastTask(): Promise<void> {
+    await this.whenReady();
     if (!this.session) {
       void vscode.window.showInformationMessage('Nothing to revert yet.');
       return;
@@ -1460,11 +1936,11 @@ export class HarnessController {
           usage: event.usage || this.cumulativeUsage,
           tokensPerSecond: event.tokensPerSecond || this.lastTokensPerSecond,
         });
-        this.setStatus('idle', false);
         break;
       default:
         break;
     }
+    if (event.type !== 'status' && event.type !== 'step') this.scheduleChatSave();
   }
 
   private patchApproval(approvalId: string, decision: 'apply' | 'reject'): void {
@@ -1474,6 +1950,7 @@ export class HarnessController {
     if (!item || item.decision) return;
     item.decision = decision;
     this.post({ type: 'update', item });
+    this.scheduleChatSave();
   }
 
   /** Append a streamed fragment; creates the bubble on the first fragment. */
@@ -1562,7 +2039,8 @@ export class HarnessController {
     for (const [id, entry] of this.streams) {
       if (entry.timer) clearTimeout(entry.timer);
       const item = this.items.find(
-        (i): i is Extract<TranscriptItem, { kind: 'assistant' }> => i.kind === 'assistant' && i.id === id,
+        (i): i is Extract<TranscriptItem, { kind: 'assistant' | 'thinking' }> =>
+          (i.kind === 'assistant' || i.kind === 'thinking') && i.id === id,
       );
       if (item) {
         item.streaming = false;
@@ -1583,6 +2061,7 @@ export class HarnessController {
     // explicit `update` rather than by inspecting a mutated object.
     this.post({ type: 'item', item: { ...item } });
     this.trimItems();
+    this.scheduleChatSave();
   }
 
   private pushNotice(level: 'info' | 'warn' | 'error', message: string): void {
@@ -1606,7 +2085,7 @@ export class HarnessController {
   }
 
   private id(): string {
-    return `item-${++this.counter}`;
+    return `item-${randomUUID()}`;
   }
 }
 

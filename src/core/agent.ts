@@ -73,6 +73,10 @@ export class HarnessSession {
   readonly checkpoints: CheckpointStore;
   private readonly registry: ToolRegistry;
   private history: ChatMessage[] = [];
+  /** The current task is normally committed only when it ends. Keep a view of
+   * it as well so a restart can recover a partially completed conversation. */
+  private pendingMessages?: ChatMessage[];
+  private pendingAssistantText = '';
   private controller?: AbortController;
   private busy = false;
   private cumulativeUsage: Usage = {};
@@ -101,6 +105,25 @@ export class HarnessSession {
 
   get usage(): Usage {
     return { ...this.cumulativeUsage };
+  }
+
+  /** A provider-safe snapshot, including the current task if one is running. */
+  get conversationSnapshot(): ChatMessage[] {
+    const pending = [...(this.pendingMessages ?? [])];
+    if (this.pendingMessages && this.pendingAssistantText) {
+      pending.push({ role: 'assistant', content: this.pendingAssistantText });
+    }
+    // Repair the in-flight task separately. Providers may reuse a tool ID in
+    // a later task; an unanswered new call must not erase an older, completed
+    // call and result with the same ID from the committed history.
+    return [...this.history, ...repairToolMessages(pending)];
+  }
+
+  /** Restore model history without restoring file checkpoints or live work. */
+  restoreConversation(messages: readonly ChatMessage[], usage: Usage = {}): void {
+    if (this.busy) throw new Error('Cannot replace a conversation while a task is running.');
+    this.history = repairToolMessages([...messages]);
+    this.cumulativeUsage = { ...usage };
   }
 
   updateConfig(config: HarnessConfig): void {
@@ -183,6 +206,8 @@ export class HarnessSession {
     const userMessage: ChatMessage = { role: 'user', content: text, ...(images ? { images } : {}) };
     /** Everything produced during this task, appended to history when it ends. */
     const taskMessages: ChatMessage[] = [userMessage];
+    this.pendingMessages = taskMessages;
+    this.pendingAssistantText = '';
     this.checkpoints.begin(userMessage.content.slice(0, 80));
     onEvent({ type: 'status', status: 'thinking' });
 
@@ -376,6 +401,7 @@ export class HarnessSession {
               thinkingId = thinkingIdFor(attempt);
               streamed = false;
               attemptText = '';
+              this.pendingAssistantText = '';
               thinking = '';
               thinkingStartedAt = 0;
               return {
@@ -390,6 +416,7 @@ export class HarnessSession {
                   ? (delta: string) => {
                       streamed = true;
                       attemptText += delta;
+                      this.pendingAssistantText = attemptText;
                       onEvent({ type: 'assistant-delta', id: streamId, text: delta });
                     }
                   : undefined,
@@ -419,6 +446,7 @@ export class HarnessSession {
               if (attemptText || streamed) {
                 onEvent({ type: 'assistant', id: streamId, text: attemptText.trim(), final: false, streamed: true });
               }
+              this.pendingAssistantText = '';
             },
           );
           callDurationMs = Date.now() - callStartedAt;
@@ -503,6 +531,7 @@ export class HarnessSession {
         const trimmed = text.trim();
         if (trimmed) lastText = trimmed;
 
+        this.pendingAssistantText = '';
         taskMessages.push({
           role: 'assistant',
           content: text,
@@ -582,10 +611,17 @@ export class HarnessSession {
     } finally {
       this.busy = false;
       this.controller = undefined;
+      // If a stream was interrupted before the provider returned, preserve
+      // the partial prose that the user already saw for the next follow-up.
+      if (this.pendingAssistantText) {
+        taskMessages.push({ role: 'assistant', content: this.pendingAssistantText });
+      }
       // A run that was cancelled or failed part-way can leave an unanswered
       // tool call behind; repairing here keeps the *next* task runnable
       // instead of shipping the provider a transcript it will refuse.
       this.history = repairToolMessages(trimHistory([...this.history, ...taskMessages]));
+      this.pendingMessages = undefined;
+      this.pendingAssistantText = '';
     }
 
     onEvent({ type: 'status', status: 'idle' });

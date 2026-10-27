@@ -157,6 +157,15 @@ function registerCommands(
       await controller.compactHistory();
     }),
 
+    vscode.commands.registerCommand('codingHarness.exportChat', async () => {
+      await controller.exportChat();
+    }),
+
+    vscode.commands.registerCommand('codingHarness.importChat', async () => {
+      await controller.importChat();
+      await chatView.reveal();
+    }),
+
     vscode.commands.registerCommand('codingHarness.reloadMcpServers', async () => {
       await chatView.reveal();
       await controller.reloadMcpServers();
@@ -177,7 +186,7 @@ function registerCommands(
   );
 }
 
-export function deactivate(): void {
+export async function deactivate(): Promise<void> {
   approvals?.cancelAll();
-  controller?.cancel();
+  await controller?.shutdown();
 }

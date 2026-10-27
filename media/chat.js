@@ -6,8 +6,8 @@
    Two things are worth knowing before editing:
    - assistant text is real Markdown (headings, lists, tables, code), rendered
      here with an escaping-first parser because the panel has no dependencies;
-   - streamed items are patched in place, so a long answer does not rebuild its
-     subtree on every token (that used to reset scroll and kill the selection). */
+   - streamed items keep their outer element and defer text repaints while the
+     reader has a selection, so copying does not lose the selected text. */
 (function () {
   const vscode = acquireVsCodeApi();
 
@@ -19,6 +19,8 @@
   const btnStop = document.getElementById('btn-stop');
   const btnRevert = document.getElementById('btn-revert');
   const btnReset = document.getElementById('btn-reset');
+  const btnImportChat = document.getElementById('btn-import-chat');
+  const btnExportChat = document.getElementById('btn-export-chat');
   const btnSettings = document.getElementById('btn-settings');
   const btnSelection = document.getElementById('btn-selection');
   const btnCompact = document.getElementById('btn-compact');
@@ -434,6 +436,11 @@
     busy = Boolean(state.busy);
     btnSend.disabled = busy;
     btnStop.hidden = !busy;
+    btnReset.disabled = busy;
+    btnImportChat.disabled = busy;
+    btnExportChat.disabled = busy;
+    btnCompact.disabled = busy;
+    if (btnCompactBanner) btnCompactBanner.disabled = busy;
 
     if (chipProvider) {
       const provider = state.provider || 'mock';
@@ -639,20 +646,42 @@
 
   /* -------------------------------------------------------- small pieces */
 
+  const copyRequests = new Map();
+  const copyFeedback = new WeakMap();
+  let copySequence = 0;
+
+  /** The extension host has access to the real VS Code clipboard, including
+      in remote sessions where navigator.clipboard is not available. */
   function copyText(text, button) {
-    vscode.postMessage({ type: 'copy', text: String(text == null ? '' : text) });
-    if (!button) return;
+    const value = String(text == null ? '' : text);
+    if (!value) return;
+    const id = 'copy-' + ++copySequence;
+    if (button) copyRequests.set(id, button);
+    vscode.postMessage({ type: 'copy', id, text: value });
+  }
+
+  function copyResult(id, ok) {
+    const button = copyRequests.get(id);
+    copyRequests.delete(id);
+    if (!button || !ok) return;
+    let feedback = copyFeedback.get(button);
+    if (!feedback) {
+      const label = button.querySelector('span') || (button.children.length === 0 ? button : null);
+      feedback = { label, text: label ? label.textContent : '', title: button.title, aria: button.getAttribute('aria-label') };
+      copyFeedback.set(button, feedback);
+    }
+    if (feedback.timer) clearTimeout(feedback.timer);
     button.classList.add('copied');
-    // Icon-only buttons have no <span>; never write text into them, or the SVG
-    // glyph is destroyed. They report success through colour and the tooltip.
-    const label = button.querySelector('span');
-    const original = label ? label.textContent : button.title;
-    if (label) label.textContent = 'Copied';
-    else button.title = 'Copied';
-    setTimeout(() => {
+    if (feedback.label) feedback.label.textContent = 'Copied';
+    button.title = 'Copied';
+    button.setAttribute('aria-label', 'Copied');
+    feedback.timer = setTimeout(() => {
       button.classList.remove('copied');
-      if (label) label.textContent = original;
-      else button.title = original;
+      if (feedback.label) feedback.label.textContent = feedback.text;
+      button.title = feedback.title;
+      if (feedback.aria === null) button.removeAttribute('aria-label');
+      else button.setAttribute('aria-label', feedback.aria);
+      copyFeedback.delete(button);
     }, 1200);
   }
 
@@ -665,10 +694,47 @@
     button.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      onClick();
+      onClick(button);
     });
     return button;
   }
+
+  function selectedTranscriptText() {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || !selection.anchorNode || !selection.focusNode) return '';
+    if (!stream.contains(selection.anchorNode) || !stream.contains(selection.focusNode)) return '';
+    return selection.toString();
+  }
+
+  // VS Code can intercept the normal copy shortcut before the webview's native
+  // clipboard handles it. Forward selected transcript text to the host instead;
+  // inputs keep their normal editing shortcuts.
+  document.addEventListener('keydown', (event) => {
+    if (!(event.ctrlKey || event.metaKey) || event.altKey || event.key.toLowerCase() !== 'c') return;
+    const target = event.target;
+    if (target && (target.isContentEditable || /^(INPUT|TEXTAREA)$/.test(target.tagName))) return;
+    const text = selectedTranscriptText();
+    if (!text) return;
+    event.preventDefault();
+    copyText(text);
+  });
+
+  // Native/context-menu Copy may arrive as a copy event rather than a keydown.
+  document.addEventListener('copy', (event) => {
+    const target = event.target;
+    if (target && (target.isContentEditable || /^(INPUT|TEXTAREA)$/.test(target.tagName))) return;
+    const text = selectedTranscriptText();
+    if (!text) return;
+    if (event.clipboardData) {
+      try {
+        event.clipboardData.setData('text/plain', text);
+        event.preventDefault();
+        return;
+      } catch (_) { /* fall back to the VS Code clipboard */ }
+    }
+    event.preventDefault();
+    copyText(text);
+  });
 
   function caretInto(container) {
     const caret = el('span', 'caret');
@@ -752,7 +818,7 @@
     head.appendChild(el('span', null, 'You'));
     if (item.text) {
       const actions = el('div', 'msg-actions');
-      actions.appendChild(actionButton('copy', 'Copy this message', () => copyText(item.text)));
+      actions.appendChild(actionButton('copy', 'Copy this message', (button) => copyText(item.text, button)));
       head.appendChild(actions);
     }
     node.appendChild(head);
@@ -772,9 +838,9 @@
     if (item.streaming) caretInto(body);
     node.appendChild(body);
 
-    if (!item.streaming && item.text) {
+    if (item.text) {
       const head = el('div', 'msg-actions assistant-actions');
-      head.appendChild(actionButton('copy', 'Copy this answer', () => copyText(item.text)));
+      head.appendChild(actionButton('copy', 'Copy this answer', (button) => copyText((items.get(item.id) || item).text, button)));
       node.appendChild(head);
     }
     return node;
@@ -945,17 +1011,18 @@
 
   function renderApproval(item) {
     const request = item.request || {};
-    const resolved = Boolean(item.decision);
+    const interrupted = Boolean(item.interrupted);
+    const resolved = Boolean(item.decision) || interrupted;
     const node = el(
       'div',
-      'approval' + (resolved ? ' resolved ' + (item.decision === 'apply' ? 'applied' : 'rejected') : ''),
+      'approval' + (resolved ? ' resolved ' + (interrupted ? 'interrupted' : item.decision === 'apply' ? 'applied' : 'rejected') : ''),
     );
     node.dataset.id = item.id;
     const kind = approvalKind(request);
 
     const head = el('div', 'approval-head');
-    head.appendChild(icon(resolved ? (item.decision === 'apply' ? 'check' : 'x') : kind.icon));
-    const title = resolved ? (item.decision === 'apply' ? 'Applied' : 'Rejected') : 'Approval needed';
+    head.appendChild(icon(interrupted ? 'warn' : resolved ? (item.decision === 'apply' ? 'check' : 'x') : kind.icon));
+    const title = interrupted ? 'Interrupted' : resolved ? (item.decision === 'apply' ? 'Applied' : 'Rejected') : 'Approval needed';
     head.appendChild(el('span', null, title));
     head.appendChild(el('span', 'approval-kind', kind.label));
     const target = request.path || (request.command ? request.command : '');
@@ -1160,25 +1227,63 @@
     elements.set(item.id, node);
   }
 
+  function selectionIntersects(node) {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || !selection.rangeCount) return false;
+    try { return selection.getRangeAt(0).intersectsNode(node); } catch (_) { return false; }
+  }
+
+  function paintAssistantBody(node, item) {
+    const body = node.querySelector('.msg-body');
+    if (!body) return;
+    // Replacing innerHTML destroys an active selection. Hold just this repaint
+    // until the reader releases it, while retaining the latest text in `items`.
+    if (selectionIntersects(body)) {
+      node.dataset.pendingRender = '1';
+      return;
+    }
+    body.innerHTML = renderMarkdown(item.text);
+    if (item.streaming) caretInto(body);
+    delete node.dataset.pendingRender;
+  }
+
+  function paintThinkingBody(node, item) {
+    const body = node.querySelector('.thinking-body');
+    if (!body) return;
+    if (selectionIntersects(body)) {
+      node.dataset.pendingRender = '1';
+      return;
+    }
+    body.textContent = item.text || '';
+    delete node.dataset.pendingRender;
+  }
+
+  document.addEventListener('selectionchange', () => {
+    for (const node of stream.querySelectorAll('[data-pending-render="1"]')) {
+      const item = items.get(node.dataset.id);
+      if (!item) continue;
+      if (item.kind === 'assistant') paintAssistantBody(node, item);
+      else if (item.kind === 'thinking') paintThinkingBody(node, item);
+    }
+  });
+
   function updateItem(item) {
     const previous = items.get(item.id);
     const merged = Object.assign({}, previous, item);
     items.set(item.id, merged);
 
-    // Streamed assistant text: patch the body, keep the element (and therefore
-    // the scroll position, text selection and any open code block) intact.
+    // Keep the outer element stable; defer body repaints while text is selected.
     if (merged.kind === 'assistant') {
       const node = elements.get(item.id);
       const body = node && node.querySelector('.msg-body');
       if (body) {
-        body.innerHTML = renderMarkdown(merged.text);
-        if (merged.streaming) caretInto(body);
+        paintAssistantBody(node, merged);
         node.classList.toggle('streaming', Boolean(merged.streaming));
         const oldActions = node.querySelector('.assistant-actions');
-        if (oldActions && !merged.streaming) oldActions.remove();
-        if (!merged.streaming && merged.text) {
+        if (oldActions && !merged.text) oldActions.remove();
+        if (!oldActions && merged.text) {
           const actions = el('div', 'msg-actions assistant-actions');
-          actions.appendChild(actionButton('copy', 'Copy this answer', () => copyText(merged.text)));
+          actions.appendChild(actionButton('copy', 'Copy this answer', (button) => copyText((items.get(item.id) || merged).text, button)));
           node.appendChild(actions);
         }
         autoScroll();
@@ -1191,7 +1296,7 @@
       const node = elements.get(item.id);
       const body = node && node.querySelector('.thinking-body');
       if (body && merged.streaming) {
-        body.textContent = merged.text || '';
+        paintThinkingBody(node, merged);
         node.classList.add('open', 'streaming');
         autoScroll();
         return;
@@ -1200,10 +1305,13 @@
         // Only an explicit click keeps the block expanded. Auto-open while
         // streaming must end with the stream, or the rationale buries the answer.
         const explicit = node.dataset.userOpen;
-        if (explicit === '1') merged.open = true;
+        if (selectionIntersects(body)) {
+          merged.open = true;
+          node.dataset.userOpen = '1';
+        } else if (explicit === '1') merged.open = true;
         else if (explicit === '0') merged.open = false;
         else delete merged.open;
-        body.textContent = merged.text || '';
+        paintThinkingBody(node, merged);
         node.classList.remove('streaming');
         node.classList.toggle('open', Boolean(merged.open));
         const preview = node.querySelector('.thinking-preview');
@@ -1340,6 +1448,8 @@
   btnStop.addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
   btnRevert.addEventListener('click', () => vscode.postMessage({ type: 'revert' }));
   btnReset.addEventListener('click', () => vscode.postMessage({ type: 'reset' }));
+  btnImportChat.addEventListener('click', () => vscode.postMessage({ type: 'import-chat' }));
+  btnExportChat.addEventListener('click', () => vscode.postMessage({ type: 'export-chat' }));
   btnSettings.addEventListener('click', () => vscode.postMessage({ type: 'open-settings' }));
   btnSelection.addEventListener('click', () => vscode.postMessage({ type: 'insert-selection' }));
   if (btnCompact) btnCompact.addEventListener('click', () => vscode.postMessage({ type: 'compact' }));
@@ -1882,6 +1992,13 @@
     const message = event.data;
     if (!message || typeof message.type !== 'string') return;
     switch (message.type) {
+      case 'chat-replaced':
+        clearAttachments();
+        input.value = '';
+        input.style.height = 'auto';
+        if (hintUsage) hintUsage.textContent = '';
+        // The rest is the same full repaint as a newly opened panel.
+        // fall through
       case 'init':
         rebuild(message.items);
         applyState(message.state);
@@ -2012,6 +2129,8 @@
       case 'reset':
         rebuild([]);
         clearAttachments();
+        input.value = '';
+        input.style.height = 'auto';
         if (hintUsage) hintUsage.textContent = '';
         cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
         currentSpeed = 0;
@@ -2019,6 +2138,9 @@
         contextPercent = 0;
         updateTokenChips();
         stickToBottom = true;
+        break;
+      case 'copy-result':
+        copyResult(message.id, message.ok === true);
         break;
       case 'prefill':
         input.value = (input.value ? input.value + '\n' : '') + (message.text || '');
