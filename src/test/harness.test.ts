@@ -250,6 +250,49 @@ test('replace_in_file requires an exact match and edits in place', async () => {
   assert.match(fs.readFileSync(path.join(root, 'app.js'), 'utf8'), /^let a = 1;\nlet b = 42;/);
 });
 
+test('replace_in_file rejects ambiguous snippets unless count is explicit', async () => {
+  const original = '@media (max-width: 1200px) {\r\n  .first { color: red; }\r\n}\r\n' +
+    '@media (max-width: 1200px) {\r\n  .second { color: blue; }\r\n';
+  const root = makeTempWorkspace({ 'style.css': original });
+  const host = new FakeHost(root);
+  const ctx = makeContext(root, host);
+  const snippet = '@media (max-width: 1200px) {\n';
+
+  const ambiguous = await replaceInFileTool.run({ path: 'style.css', old_text: snippet, new_text: 'changed\n' }, ctx);
+  assert.equal(ambiguous.ok, false);
+  assert.match(ambiguous.content, /matches 2 occurrences.*No changes were made/);
+  assert.equal(host.approvals.length, 0);
+  assert.equal(fs.readFileSync(path.join(root, 'style.css'), 'utf8'), original);
+
+  const targeted = await replaceInFileTool.run({
+    path: 'style.css',
+    old_text: snippet + '  .second { color: blue; }\n',
+    new_text: snippet + '  .second { color: blue; }\n}\n',
+  }, ctx);
+  assert.equal(targeted.ok, true);
+  assert.equal(fs.readFileSync(path.join(root, 'style.css'), 'utf8'), original + '}\r\n');
+
+  const explicit = await replaceInFileTool.run({ path: 'style.css', old_text: snippet, new_text: 'changed\n', count: 1 }, ctx);
+  assert.equal(explicit.ok, true);
+  assert.match(explicit.content, /1 further occurrence\(s\) left untouched/);
+  assert.ok(fs.readFileSync(path.join(root, 'style.css'), 'utf8').startsWith('changed\r\n'));
+});
+
+test('replace_in_file validates count and supports line-ending independent explicit replace all', async () => {
+  const original = 'alpha\r\nbeta\r\nalpha\r\nbeta\r\n';
+  const root = makeTempWorkspace({ 'windows.txt': original });
+  const ctx = makeContext(root, new FakeHost(root));
+  for (const count of [0, -2, 1.5, NaN, Infinity]) {
+    const invalid = await replaceInFileTool.run({ path: 'windows.txt', old_text: 'alpha', new_text: 'x', count }, ctx);
+    assert.equal(invalid.ok, false);
+    assert.match(invalid.content, /positive integer or -1/);
+    assert.equal(fs.readFileSync(path.join(root, 'windows.txt'), 'utf8'), original);
+  }
+  const all = await replaceInFileTool.run({ path: 'windows.txt', old_text: 'alpha\nbeta', new_text: 'one\ntwo', count: -1 }, ctx);
+  assert.equal(all.ok, true);
+  assert.equal(fs.readFileSync(path.join(root, 'windows.txt'), 'utf8'), 'one\r\ntwo\r\none\r\ntwo\r\n');
+});
+
 test('file tools edit CRLF files with LF snippets and preserve their style', async () => {
   const root = makeTempWorkspace({ 'windows.txt': 'alpha\r\nbeta\r\ngamma\r\n' });
   const host = new FakeHost(root);

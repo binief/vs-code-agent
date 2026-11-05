@@ -269,6 +269,10 @@ style. `write_file` also preserves the existing style when overwriting or append
 host OS style by default. Use `codingHarness.lineEndings` to force `lf`, `crlf`, `cr`, or `native`
 when a project requires a specific format.
 
+By default, `replace_in_file` requires a unique match and makes no changes if the snippet occurs
+more than once. Include surrounding lines to identify the intended location. To replace multiple
+matches deliberately, pass `count` as a positive integer (the first N matches) or `-1` (all matches).
+
 ## MCP servers (Model Context Protocol)
 
 MCP servers add tools to the same loop — local ones spawned as processes (**stdio**) and remote ones
