@@ -4,6 +4,7 @@ import { compactHistory, estimateMessagesTokens, estimateTokens, shouldCompact }
 import { isRetryableProviderError, retryDelayMs } from './providers/errors';
 import { buildSystemPrompt, summarizeDiagnostics } from './prompt';
 import { createDefaultTools, ToolRegistry } from './tools';
+import { detectRepetition, dedupeThinking, ThinkingMonitor } from './thinking';
 import { repairToolMessages } from './transcript';
 import {
   DEFAULT_CONFIG,
@@ -80,6 +81,8 @@ export class HarnessSession {
   private controller?: AbortController;
   private busy = false;
   private cumulativeUsage: Usage = {};
+  /** Recent thinking signatures for cross-step loop detection. */
+  private thinkingHistory: string[] = [];
 
   constructor(private deps: AgentDeps) {
     this.registry = deps.registry ?? deps.tools ?? new ToolRegistry(createDefaultTools());
@@ -152,6 +155,7 @@ export class HarnessSession {
     this.history = [];
     this.checkpoints.clear();
     this.cumulativeUsage = {};
+    this.thinkingHistory = [];
   }
 
   cancel(): void {
@@ -218,6 +222,8 @@ export class HarnessSession {
     let lastText = '';
     let errorText = '';
     let lastTokensPerSecond = 0;
+    // Fresh thinking history per task so cross-task follow-ups still ground
+    this.thinkingHistory = [];
 
     try {
       const workspace = await this.collectWorkspaceContext();
@@ -388,6 +394,8 @@ export class HarnessSession {
         let streamId = streamIdFor(1);
         let thinkingId = thinkingIdFor(1);
         const showThinking = this.deps.config.showThinking;
+        // Track thinking per step to detect loops / repetitions.
+        let thinkingMonitor: ThinkingMonitor | undefined;
         let callStartedAt = 0;
         let callDurationMs = 0;
         let finishReason: string | undefined;
@@ -404,6 +412,8 @@ export class HarnessSession {
               this.pendingAssistantText = '';
               thinking = '';
               thinkingStartedAt = 0;
+              thinkingMonitor = showThinking ? new ThinkingMonitor() : undefined;
+              thinkingMonitor?.reset();
               return {
                 model: this.deps.config.model,
                 messages,
@@ -421,12 +431,26 @@ export class HarnessSession {
                     }
                   : undefined,
                 // The reasoning lane: shown, never echoed back to the model.
+                // Wrapped with a monitor that tracks repetitions and caps length
+                // so a looping reasoning block doesn't spam the panel / waste tokens.
                 onThinking:
                   this.deps.config.stream && showThinking
                     ? (delta: string) => {
                         if (!thinkingStartedAt) thinkingStartedAt = Date.now();
-                        thinking += delta;
-                        onEvent({ type: 'thinking-delta', id: thinkingId, text: delta });
+                        if (thinkingMonitor) {
+                          const res = thinkingMonitor.add(delta);
+                          // Keep authoritative `thinking` in sync with monitor's raw buffer
+                          thinking = thinkingMonitor.getRaw();
+                          if (res.notice) {
+                            host.log('warn', res.notice);
+                            onEvent({ type: 'notice', message: res.notice, level: 'warn' });
+                          }
+                          if (!res.shouldEmit) return;
+                          onEvent({ type: 'thinking-delta', id: thinkingId, text: res.filteredDelta ?? delta });
+                        } else {
+                          thinking += delta;
+                          onEvent({ type: 'thinking-delta', id: thinkingId, text: delta });
+                        }
                       }
                     : undefined,
               };
@@ -453,7 +477,30 @@ export class HarnessSession {
           text = response.text ?? '';
           calls = isFinalStep ? [] : response.toolCalls ?? [];
           finishReason = response.finishReason;
-          if (!thinking && response.thinking) thinking = response.thinking;
+          if (!thinking && response.thinking) {
+            thinking = response.thinking;
+            // Non-streaming thinking still gets checked for loops.
+            const check = detectRepetition(thinking);
+            if (check.isRepeating || check.isTooLong) {
+              const msg = check.isRepeating
+                ? `Thinking is repeating: ${check.reason} — collapsed for display.`
+                : `Thinking exceeded limit: ${check.reason}`;
+              host.log('warn', msg);
+              onEvent({ type: 'notice', message: msg, level: 'warn' });
+              if (check.isRepeating) thinking = dedupeThinking(thinking);
+            }
+            // Keep monitor in sync so the final `thinking` event uses the same deduped text.
+            if (thinkingMonitor) {
+              // Prime the monitor with the full text if it wasn't streamed
+              for (const chunk of chunkString(thinking, 400)) thinkingMonitor.add(chunk);
+              thinking = thinkingMonitor.getDeduped();
+            }
+          } else if (thinkingMonitor) {
+            // Streaming case: prefer the monitor's deduped view if it flagged repetition
+            const state = thinkingMonitor.snapshot();
+            if (state.isRepeating) thinking = thinkingMonitor.getDeduped();
+            else thinking = thinkingMonitor.getRaw();
+          }
           if (response.usage) {
             // Compute tokens per second
             const outputTokens = response.usage.outputTokens ?? estimateTokens(text);
@@ -526,6 +573,33 @@ export class HarnessSession {
             text: thinking,
             durationMs: thinkingStartedAt ? Date.now() - thinkingStartedAt : 0,
           });
+          // Track cross-step repetition: same thinking 3 times => nudge the model
+          const signature = normalizeThinkingSignature(thinking);
+          if (signature) {
+            this.thinkingHistory.push(signature);
+            if (this.thinkingHistory.length > 6) this.thinkingHistory.shift();
+            if (this.thinkingHistory.length >= 3) {
+              const last3 = this.thinkingHistory.slice(-3);
+              if (last3[0] === last3[1] && last3[1] === last3[2]) {
+                const nudge =
+                  'Your recent thinking has repeated verbatim for 3 consecutive turns. ' +
+                  'Stop repeating and take a concrete action: run list_files/search_text/read_file, or provide the final answer if you have enough information.';
+                host.log('warn', `thinking loop detected: ${signature.slice(0, 80)}`);
+                onEvent({ type: 'notice', message: `Thinking loop detected — nudging model: ${nudge}`, level: 'warn' });
+                // Inject a user nudge that the model will see next turn
+                taskMessages.push({ role: 'user', content: nudge });
+                // Clear history to avoid spamming
+                this.thinkingHistory = [];
+              }
+            }
+          }
+        } else if (thinking.trim()) {
+          // Even when showThinking is off, keep history for loop detection (no UI)
+          const signature = normalizeThinkingSignature(thinking);
+          if (signature) {
+            this.thinkingHistory.push(signature);
+            if (this.thinkingHistory.length > 6) this.thinkingHistory.shift();
+          }
         }
 
         const trimmed = text.trim();
@@ -884,6 +958,17 @@ function trimHistory(history: ChatMessage[]): ChatMessage[] {
   }
   const firstUser = out.findIndex((m) => m.role === 'user');
   if (firstUser > 0) out = out.slice(firstUser);
+  return out;
+}
+
+function normalizeThinkingSignature(thinking: string): string {
+  // Lowercase, collapse whitespace, keep first ~120 chars for comparison
+  return thinking.toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 120);
+}
+
+function chunkString(text: string, size: number): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < text.length; i += size) out.push(text.slice(i, i + size));
   return out;
 }
 
