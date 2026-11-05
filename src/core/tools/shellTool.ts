@@ -103,7 +103,7 @@ export const runCommandTool: Tool<{
   name: 'run_command',
   description:
     'Run a shell command in the workspace (POSIX sh, or cmd.exe on Windows) and return stdout/stderr with the exit code. ' +
-    'Use it for tests, builds, linters, git inspection and running scripts. Read-only commands run automatically; ' +
+    'Use it for tests, builds, linters, git inspection and running scripts. Never invent command output — only report what this tool returned. Read-only commands run automatically; ' +
     'anything with side effects asks the user first, and dangerous commands are refused.',
   parameters: {
     type: 'object',
