@@ -6,7 +6,7 @@ export const getDiagnosticsTool: Tool<{ path?: string; severity?: 'error' | 'war
   name: 'get_diagnostics',
   description:
     'Get the current errors and warnings the editor knows about (TypeScript, ESLint, Pylance, \u2026). ' +
-    'Use it after editing files to verify the change compiled, or to explore what is already broken.',
+    'Use it after editing files to verify the change compiled, or to explore what is already broken. Report only what this tool returns — never invent diagnostics.',
   parameters: {
     type: 'object',
     properties: {
