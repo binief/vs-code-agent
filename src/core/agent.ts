@@ -2,6 +2,7 @@ import { agentFilesSummary, discoverAgentFiles, selectAgentFiles } from './agent
 import { CheckpointStore, type RevertReport } from './checkpoints';
 import { compactHistory, estimateMessagesTokens, estimateTokens, shouldCompact } from './compaction';
 import { isRetryableProviderError, retryDelayMs } from './providers/errors';
+import { ConsecutiveSentenceTracker, RepeatedToolCallTracker } from './loopTracking';
 import { buildSystemPrompt, summarizeDiagnostics } from './prompt';
 import { createDefaultTools, ToolRegistry } from './tools';
 import { detectRepetition, dedupeThinking, ThinkingMonitor } from './thinking';
@@ -81,8 +82,6 @@ export class HarnessSession {
   private controller?: AbortController;
   private busy = false;
   private cumulativeUsage: Usage = {};
-  /** Recent thinking signatures for cross-step loop detection. */
-  private thinkingHistory: string[] = [];
 
   constructor(private deps: AgentDeps) {
     this.registry = deps.registry ?? deps.tools ?? new ToolRegistry(createDefaultTools());
@@ -155,7 +154,6 @@ export class HarnessSession {
     this.history = [];
     this.checkpoints.clear();
     this.cumulativeUsage = {};
-    this.thinkingHistory = [];
   }
 
   cancel(): void {
@@ -222,8 +220,8 @@ export class HarnessSession {
     let lastText = '';
     let errorText = '';
     let lastTokensPerSecond = 0;
-    // Fresh thinking history per task so cross-task follow-ups still ground
-    this.thinkingHistory = [];
+    const toolLoop = new RepeatedToolCallTracker();
+    let thinkingInterruptions = 0;
 
     try {
       const workspace = await this.collectWorkspaceContext();
@@ -399,6 +397,12 @@ export class HarnessSession {
         let callStartedAt = 0;
         let callDurationMs = 0;
         let finishReason: string | undefined;
+        const attemptController = new AbortController();
+        const abortAttempt = () => attemptController.abort();
+        signal.addEventListener('abort', abortAttempt, { once: true });
+        if (signal.aborted) abortAttempt();
+        let thinkingInterrupted = false;
+        let sentenceTracker = new ConsecutiveSentenceTracker();
         try {
           callStartedAt = Date.now();
           const response = await this.callProvider(
@@ -412,47 +416,47 @@ export class HarnessSession {
               this.pendingAssistantText = '';
               thinking = '';
               thinkingStartedAt = 0;
+              sentenceTracker = new ConsecutiveSentenceTracker();
               thinkingMonitor = showThinking ? new ThinkingMonitor() : undefined;
               thinkingMonitor?.reset();
               return {
                 model: this.deps.config.model,
                 messages,
                 tools: isFinalStep ? [] : this.registry.specs(),
-                signal,
+                signal: attemptController.signal,
                 temperature: this.deps.config.temperature,
                 maxTokens: this.deps.config.maxOutputTokens,
                 // Streaming keeps the panel alive while the model is still writing.
                 onDelta: this.deps.config.stream
                   ? (delta: string) => {
+                      if (thinkingInterrupted || signal.aborted) return;
                       streamed = true;
                       attemptText += delta;
                       this.pendingAssistantText = attemptText;
                       onEvent({ type: 'assistant-delta', id: streamId, text: delta });
                     }
                   : undefined,
-                // The reasoning lane: shown, never echoed back to the model.
-                // Wrapped with a monitor that tracks repetitions and caps length
-                // so a looping reasoning block doesn't spam the panel / waste tokens.
-                onThinking:
-                  this.deps.config.stream && showThinking
-                    ? (delta: string) => {
-                        if (!thinkingStartedAt) thinkingStartedAt = Date.now();
-                        if (thinkingMonitor) {
-                          const res = thinkingMonitor.add(delta);
-                          // Keep authoritative `thinking` in sync with monitor's raw buffer
-                          thinking = thinkingMonitor.getRaw();
-                          if (res.notice) {
-                            host.log('warn', res.notice);
-                            onEvent({ type: 'notice', message: res.notice, level: 'warn' });
-                          }
-                          if (!res.shouldEmit) return;
-                          onEvent({ type: 'thinking-delta', id: thinkingId, text: res.filteredDelta ?? delta });
-                        } else {
-                          thinking += delta;
-                          onEvent({ type: 'thinking-delta', id: thinkingId, text: delta });
+                // Track reasoning even when the display lane is disabled.
+                onThinking: this.deps.config.stream
+                  ? (delta: string) => {
+                      if (thinkingInterrupted || signal.aborted) return;
+                      if (!thinkingStartedAt) thinkingStartedAt = Date.now();
+                      const streak = sentenceTracker.add(delta);
+                      if (thinkingMonitor) {
+                        const res = thinkingMonitor.add(delta);
+                        thinking = thinkingMonitor.getRaw();
+                        if (res.notice) {
+                          host.log('warn', res.notice);
+                          onEvent({ type: 'notice', message: res.notice, level: 'warn' });
                         }
+                        if (res.shouldEmit) onEvent({ type: 'thinking-delta', id: thinkingId, text: res.filteredDelta ?? delta });
                       }
-                    : undefined,
+                      if (streak.looping) {
+                        thinkingInterrupted = true;
+                        abortAttempt();
+                      }
+                    }
+                  : undefined,
               };
             },
             onEvent,
@@ -473,18 +477,23 @@ export class HarnessSession {
               this.pendingAssistantText = '';
             },
           );
+          if (thinkingInterrupted) throw new Error('Thinking loop interrupted');
+          thinkingInterruptions = 0;
           callDurationMs = Date.now() - callStartedAt;
           text = response.text ?? '';
           calls = isFinalStep ? [] : response.toolCalls ?? [];
           finishReason = response.finishReason;
           if (!thinking && response.thinking) {
             thinking = response.thinking;
-            // Non-streaming thinking still gets checked for loops.
+            // A completed non-streaming response cannot be interrupted, but can be reported.
+            const streak = new ConsecutiveSentenceTracker().add(thinking);
             const check = detectRepetition(thinking);
-            if (check.isRepeating || check.isTooLong) {
-              const msg = check.isRepeating
-                ? `Thinking is repeating: ${check.reason} — collapsed for display.`
-                : `Thinking exceeded limit: ${check.reason}`;
+            if (streak.looping || check.isRepeating || check.isTooLong) {
+              const msg = streak.looping
+                ? `Thinking repeated the same sentence ${streak.count} consecutive times in a completed response.`
+                : check.isRepeating
+                  ? `Thinking is repeating: ${check.reason} — collapsed for display.`
+                  : `Thinking exceeded limit: ${check.reason}`;
               host.log('warn', msg);
               onEvent({ type: 'notice', message: msg, level: 'warn' });
               if (check.isRepeating) thinking = dedupeThinking(thinking);
@@ -558,11 +567,35 @@ export class HarnessSession {
             outcome = 'cancelled';
             break;
           }
+          if (thinkingInterrupted) {
+            thinkingInterruptions++;
+            if (showThinking && thinking.trim()) {
+              onEvent({ type: 'thinking', id: thinkingId, text: thinking, durationMs: thinkingStartedAt ? Date.now() - thinkingStartedAt : 0 });
+            }
+            if (attemptText || streamed) {
+              onEvent({ type: 'assistant', id: streamId, text: attemptText.trim(), final: false, streamed: true });
+              if (attemptText.trim()) taskMessages.push({ role: 'assistant', content: attemptText });
+            }
+            this.pendingAssistantText = '';
+            const message = 'Thinking loop detected: the same sentence repeated 3 consecutive times. The model stream was interrupted.';
+            host.log('warn', message);
+            onEvent({ type: 'notice', message, level: 'warn' });
+            if (thinkingInterruptions >= 3 || isFinalStep) {
+              errorText = 'Stopped after repeated thinking loops. Try a different model or lower reasoning effort.';
+              onEvent({ type: 'notice', message: errorText, level: 'error' });
+              outcome = 'error';
+              break;
+            }
+            taskMessages.push({ role: 'user', content: 'Your previous response was interrupted because your reasoning repeated the same sentence. Change approach, use available evidence or a tool, or explain what is blocking progress.' });
+            continue;
+          }
           errorText = (err as Error).message;
           host.log('error', `provider error: ${errorText}`);
           onEvent({ type: 'notice', message: `Model call failed: ${errorText}`, level: 'error' });
           outcome = 'error';
           break;
+        } finally {
+          signal.removeEventListener('abort', abortAttempt);
         }
 
         // Close the thinking lane for this turn before the answer is shown.
@@ -573,33 +606,6 @@ export class HarnessSession {
             text: thinking,
             durationMs: thinkingStartedAt ? Date.now() - thinkingStartedAt : 0,
           });
-          // Track cross-step repetition: same thinking 3 times => nudge the model
-          const signature = normalizeThinkingSignature(thinking);
-          if (signature) {
-            this.thinkingHistory.push(signature);
-            if (this.thinkingHistory.length > 6) this.thinkingHistory.shift();
-            if (this.thinkingHistory.length >= 3) {
-              const last3 = this.thinkingHistory.slice(-3);
-              if (last3[0] === last3[1] && last3[1] === last3[2]) {
-                const nudge =
-                  'Your recent thinking has repeated verbatim for 3 consecutive turns. ' +
-                  'Stop repeating and take a concrete action: run list_files/search_text/read_file, or provide the final answer if you have enough information.';
-                host.log('warn', `thinking loop detected: ${signature.slice(0, 80)}`);
-                onEvent({ type: 'notice', message: `Thinking loop detected — nudging model: ${nudge}`, level: 'warn' });
-                // Inject a user nudge that the model will see next turn
-                taskMessages.push({ role: 'user', content: nudge });
-                // Clear history to avoid spamming
-                this.thinkingHistory = [];
-              }
-            }
-          }
-        } else if (thinking.trim()) {
-          // Even when showThinking is off, keep history for loop detection (no UI)
-          const signature = normalizeThinkingSignature(thinking);
-          if (signature) {
-            this.thinkingHistory.push(signature);
-            if (this.thinkingHistory.length > 6) this.thinkingHistory.shift();
-          }
         }
 
         const trimmed = text.trim();
@@ -649,6 +655,7 @@ export class HarnessSession {
         }
 
         onEvent({ type: 'status', status: 'executing' });
+        let toolLoopNotice: string | undefined;
         for (const call of calls) {
           if (signal.aborted) {
             // Still answer every requested call: a tool call with no result
@@ -664,6 +671,13 @@ export class HarnessSession {
           }
           const result = await this.executeToolCall(call, onEvent, signal);
           toolCallsRun++;
+          const streak = toolLoop.record(call, result);
+          if (streak === 1) toolLoopNotice = undefined;
+          if (streak >= 3 && streak % 3 === 0) {
+            toolLoopNotice = `Tool loop detected: ${call.name} was called ${streak} times consecutively with the same arguments and returned the same result. Identical output does not prove there were no side effects.`;
+            host.log('warn', toolLoopNotice);
+            onEvent({ type: 'notice', message: toolLoopNotice, level: 'warn' });
+          }
           taskMessages.push({
             role: 'tool',
             toolCallId: call.id,
@@ -675,6 +689,9 @@ export class HarnessSession {
         if (signal.aborted) {
           outcome = 'cancelled';
           break;
+        }
+        if (toolLoopNotice) {
+          taskMessages.push({ role: 'user', content: `${toolLoopNotice} Do not repeat the same call without a reason; inspect the result and try a different approach or explain the blocker.` });
         }
       }
     } catch (err) {
@@ -959,11 +976,6 @@ function trimHistory(history: ChatMessage[]): ChatMessage[] {
   const firstUser = out.findIndex((m) => m.role === 'user');
   if (firstUser > 0) out = out.slice(firstUser);
   return out;
-}
-
-function normalizeThinkingSignature(thinking: string): string {
-  // Lowercase, collapse whitespace, keep first ~120 chars for comparison
-  return thinking.toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 120);
 }
 
 function chunkString(text: string, size: number): string[] {
