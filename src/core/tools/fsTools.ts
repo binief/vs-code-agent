@@ -289,16 +289,18 @@ export const replaceInFileTool: Tool<{
 }> = {
   name: 'replace_in_file',
   description:
-    'Replace an exact text snippet inside an existing file. The default replaces the first occurrence; line endings ' +
-    'are matched independently of the platform and the file style is preserved. The call fails if old_text is not ' +
-    'found — you must read the file first and copy old_text verbatim, never invent it. Pass count to replace more occurrences, or an empty new_text to delete the snippet.',
+    'Replace an exact text snippet inside an existing file. Line endings are matched independently of the platform ' +
+    'and the file style is preserved. By default old_text must match exactly once; if it matches multiple times, ' +
+    'include more surrounding context to identify the intended location. Pass count to explicitly replace the first ' +
+    'N occurrences, or -1 for all. Read the file first and copy old_text verbatim, including indentation. ' +
+    'Use an empty new_text to delete the snippet.',
   parameters: {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'File to edit, workspace-relative.' },
       old_text: { type: 'string', description: 'Exact snippet to find, including indentation.' },
       new_text: { type: 'string', description: 'Replacement text (may be empty to delete).' },
-      count: { type: 'number', description: 'How many occurrences to replace. Default 1; use -1 for all.' },
+      count: { type: 'number', description: 'Explicitly replace the first N occurrences, or -1 for all. If omitted, the snippet must match exactly once.' },
     },
     required: ['path', 'old_text', 'new_text'],
   },
@@ -309,6 +311,9 @@ export const replaceInFileTool: Tool<{
       return fail(`"${target.rel}" does not exist. Use write_file to create it.`, 'missing file', { relPath: target.rel });
     }
     if (!args.old_text) return fail('"old_text" must not be empty; use write_file to rewrite the whole file.', 'bad arguments');
+    if (args.count !== undefined && (!Number.isInteger(args.count) || (args.count !== -1 && args.count < 1))) {
+      return fail('"count" must be a positive integer or -1 for all occurrences.', 'bad arguments');
+    }
 
     const fileEol = detectEol(original);
     // Match line endings independently of the platform. This lets a model
@@ -325,7 +330,17 @@ export const replaceInFileTool: Tool<{
       );
     }
 
-    const wanted = args.count === undefined ? 1 : args.count < 0 ? occurrences : args.count;
+    if (occurrences > 1 && args.count === undefined) {
+      return fail(
+        `old_text matches ${occurrences} occurrences in "${target.rel}". No changes were made. ` +
+          'Read the relevant lines and include more surrounding context to select one occurrence, ' +
+          'or explicitly pass count to replace the first N occurrences or -1 for all.',
+        'ambiguous snippet',
+        { relPath: target.rel, occurrences },
+      );
+    }
+
+    const wanted = args.count === undefined ? 1 : args.count === -1 ? occurrences : args.count;
     const logicalNext = replaceN(normalizedOriginal, needle, replacement, wanted);
     const writeEol = resolveEol(ctx.config.lineEndings, fileEol);
     const next = applyEol(logicalNext, writeEol);
