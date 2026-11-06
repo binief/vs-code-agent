@@ -100,9 +100,10 @@ export interface ChatRequest {
    * backend exposes one: DeepSeek `reasoning_content`, OpenRouter `reasoning`,
    * OpenAI-compatible reasoning models, or Anthropic extended thinking.
    * Kept separate from `onDelta` because it is shown in its own lane and is
-   * never fed back to the model as conversation content.
+   * never fed back to the model as conversation content. Providers set
+   * `completed` for a fully buffered response that cannot be interrupted.
    */
-  onThinking?: (text: string) => void;
+  onThinking?: (text: string, completed?: boolean) => void;
 }
 
 /** A model backend: OpenAI-compatible, Anthropic, or the offline mock planner. */
@@ -302,6 +303,8 @@ export interface HarnessConfig {
   stream: boolean;
   /** Show the model's reasoning stream, when the backend provides one. */
   showThinking: boolean;
+  /** Maximum streamed thinking characters per attempt; 0 disables this budget. */
+  thinkingMaxChars: number;
   /** Instructions loaded from agent.md/AGENTS.md files. There is no built-in prompt. */
   agentFiles: AgentFilesConfig;
   /** Which factual context is included in the system message. */
@@ -328,6 +331,7 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   lineEndings: 'auto',
   stream: true,
   showThinking: true,
+  thinkingMaxChars: 12_000,
   agentFiles: {
     enabled: true,
     names: ['AGENTS.md', 'agent.md', 'agents.md', 'copilot-instructions.md'],

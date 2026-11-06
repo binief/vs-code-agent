@@ -763,6 +763,7 @@ export class HarnessController {
       lineEndings: c.get('lineEndings'),
       stream: c.get('stream'),
       showThinking: c.get('showThinking'),
+      thinkingMaxChars: c.get('thinkingMaxChars'),
       agentFiles: {
         enabled: Boolean(agentEnabled),
         names: agentNames,

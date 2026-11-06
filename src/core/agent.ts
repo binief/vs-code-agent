@@ -2,10 +2,9 @@ import { agentFilesSummary, discoverAgentFiles, selectAgentFiles } from './agent
 import { CheckpointStore, type RevertReport } from './checkpoints';
 import { compactHistory, estimateMessagesTokens, estimateTokens, shouldCompact } from './compaction';
 import { isRetryableProviderError, retryDelayMs } from './providers/errors';
-import { ConsecutiveSentenceTracker, RepeatedToolCallTracker } from './loopTracking';
+import { ThinkingStreamGuard, RepeatedToolCallTracker, type ThinkingStopReason } from './loopTracking';
 import { buildSystemPrompt, summarizeDiagnostics } from './prompt';
 import { createDefaultTools, ToolRegistry } from './tools';
-import { detectRepetition, dedupeThinking, ThinkingMonitor } from './thinking';
 import { repairToolMessages } from './transcript';
 import {
   DEFAULT_CONFIG,
@@ -51,6 +50,7 @@ export interface AgentDeps {
 }
 
 const MAX_TOOL_RESULT_CHARS = 30_000;
+const MAX_THINKING_DISPLAY_CHARS = 12_000;
 const MAX_HISTORY_MESSAGES = 48;
 const MAX_HISTORY_CHARS = 140_000;
 /**
@@ -392,8 +392,28 @@ export class HarnessSession {
         let streamId = streamIdFor(1);
         let thinkingId = thinkingIdFor(1);
         const showThinking = this.deps.config.showThinking;
-        // Track thinking per step to detect loops / repetitions.
-        let thinkingMonitor: ThinkingMonitor | undefined;
+        const configuredThinkingLimit = this.deps.config.thinkingMaxChars;
+        const thinkingLimit = Number.isFinite(configuredThinkingLimit) && configuredThinkingLimit >= 0
+          ? Math.floor(configuredThinkingLimit) : DEFAULT_CONFIG.thinkingMaxChars;
+        let thinkingGuard = new ThinkingStreamGuard(thinkingLimit);
+        let receivedThinkingDelta = false;
+        let completedThinkingDisplayed = false;
+        let displayTruncated = false;
+        const appendThinkingDisplay = (delta: string): void => {
+          if (!showThinking || !this.deps.config.stream || !delta) return;
+          const remaining = Math.max(0, MAX_THINKING_DISPLAY_CHARS - thinking.length);
+          const displayed = delta.slice(0, remaining);
+          if (displayed) {
+            thinking += displayed;
+            onEvent({ type: 'thinking-delta', id: thinkingId, text: displayed });
+          }
+          if (delta.length > remaining && !displayTruncated) {
+            displayTruncated = true;
+            const marker = '\n… [thinking display truncated]';
+            thinking += marker;
+            onEvent({ type: 'thinking-delta', id: thinkingId, text: marker });
+          }
+        };
         let callStartedAt = 0;
         let callDurationMs = 0;
         let finishReason: string | undefined;
@@ -401,8 +421,7 @@ export class HarnessSession {
         const abortAttempt = () => attemptController.abort();
         signal.addEventListener('abort', abortAttempt, { once: true });
         if (signal.aborted) abortAttempt();
-        let thinkingInterrupted = false;
-        let sentenceTracker = new ConsecutiveSentenceTracker();
+        let thinkingInterrupted: ThinkingStopReason | undefined;
         try {
           callStartedAt = Date.now();
           const response = await this.callProvider(
@@ -416,9 +435,10 @@ export class HarnessSession {
               this.pendingAssistantText = '';
               thinking = '';
               thinkingStartedAt = 0;
-              sentenceTracker = new ConsecutiveSentenceTracker();
-              thinkingMonitor = showThinking ? new ThinkingMonitor() : undefined;
-              thinkingMonitor?.reset();
+              thinkingGuard = new ThinkingStreamGuard(thinkingLimit);
+              receivedThinkingDelta = false;
+              completedThinkingDisplayed = false;
+              displayTruncated = false;
               return {
                 model: this.deps.config.model,
                 messages,
@@ -436,23 +456,21 @@ export class HarnessSession {
                       onEvent({ type: 'assistant-delta', id: streamId, text: delta });
                     }
                   : undefined,
-                // Track reasoning even when the display lane is disabled.
+                // A completed JSON response cannot be aborted retroactively.
                 onThinking: this.deps.config.stream
-                  ? (delta: string) => {
+                  ? (delta: string, completed?: boolean) => {
                       if (thinkingInterrupted || signal.aborted) return;
                       if (!thinkingStartedAt) thinkingStartedAt = Date.now();
-                      const streak = sentenceTracker.add(delta);
-                      if (thinkingMonitor) {
-                        const res = thinkingMonitor.add(delta);
-                        thinking = thinkingMonitor.getRaw();
-                        if (res.notice) {
-                          host.log('warn', res.notice);
-                          onEvent({ type: 'notice', message: res.notice, level: 'warn' });
-                        }
-                        if (res.shouldEmit) onEvent({ type: 'thinking-delta', id: thinkingId, text: res.filteredDelta ?? delta });
+                      if (completed) {
+                        appendThinkingDisplay(delta);
+                        completedThinkingDisplayed = true;
+                        return;
                       }
-                      if (streak.looping) {
-                        thinkingInterrupted = true;
+                      receivedThinkingDelta = true;
+                      const result = thinkingGuard.add(delta);
+                      appendThinkingDisplay(result.accepted);
+                      if (result.reason) {
+                        thinkingInterrupted = result.reason;
                         abortAttempt();
                       }
                     }
@@ -483,32 +501,16 @@ export class HarnessSession {
           text = response.text ?? '';
           calls = isFinalStep ? [] : response.toolCalls ?? [];
           finishReason = response.finishReason;
-          if (!thinking && response.thinking) {
-            thinking = response.thinking;
-            // A completed non-streaming response cannot be interrupted, but can be reported.
-            const streak = new ConsecutiveSentenceTracker().add(thinking);
-            const check = detectRepetition(thinking);
-            if (streak.looping || check.isRepeating || check.isTooLong) {
-              const msg = streak.looping
-                ? `Thinking repeated the same sentence ${streak.count} consecutive times in a completed response.`
-                : check.isRepeating
-                  ? `Thinking is repeating: ${check.reason} — collapsed for display.`
-                  : `Thinking exceeded limit: ${check.reason}`;
+          if (!receivedThinkingDelta && response.thinking) {
+            // The provider returned a complete JSON response; do not discard its answer or tools.
+            const completedGuard = new ThinkingStreamGuard(0);
+            const result = completedGuard.add(response.thinking);
+            if (result.reason) {
+              const msg = `Possible thinking loop detected in a completed response (${result.reason}); the response was retained.`;
               host.log('warn', msg);
               onEvent({ type: 'notice', message: msg, level: 'warn' });
-              if (check.isRepeating) thinking = dedupeThinking(thinking);
             }
-            // Keep monitor in sync so the final `thinking` event uses the same deduped text.
-            if (thinkingMonitor) {
-              // Prime the monitor with the full text if it wasn't streamed
-              for (const chunk of chunkString(thinking, 400)) thinkingMonitor.add(chunk);
-              thinking = thinkingMonitor.getDeduped();
-            }
-          } else if (thinkingMonitor) {
-            // Streaming case: prefer the monitor's deduped view if it flagged repetition
-            const state = thinkingMonitor.snapshot();
-            if (state.isRepeating) thinking = thinkingMonitor.getDeduped();
-            else thinking = thinkingMonitor.getRaw();
+            if (!completedThinkingDisplayed) appendThinkingDisplay(response.thinking);
           }
           if (response.usage) {
             // Compute tokens per second
@@ -577,16 +579,23 @@ export class HarnessSession {
               if (attemptText.trim()) taskMessages.push({ role: 'assistant', content: attemptText });
             }
             this.pendingAssistantText = '';
-            const message = 'Thinking loop detected: the same sentence repeated 3 consecutive times. The model stream was interrupted.';
+            const isBudget = thinkingInterrupted === 'budget';
+            const detail = isBudget
+              ? `Thinking reached the ${thinkingLimit}-character safety budget (codingHarness.thinkingMaxChars).`
+              : `Thinking loop detected (${thinkingInterrupted} repetition).`;
+            const message = `${detail} The model stream was interrupted.`;
             host.log('warn', message);
             onEvent({ type: 'notice', message, level: 'warn' });
             if (thinkingInterruptions >= 3 || isFinalStep) {
-              errorText = 'Stopped after repeated thinking loops. Try a different model or lower reasoning effort.';
+              errorText = 'Stopped after repeated thinking interruptions. Try a different model or adjust the thinking budget.';
               onEvent({ type: 'notice', message: errorText, level: 'error' });
               outcome = 'error';
               break;
             }
-            taskMessages.push({ role: 'user', content: 'Your previous response was interrupted because your reasoning repeated the same sentence. Change approach, use available evidence or a tool, or explain what is blocking progress.' });
+            const nudge = isBudget
+              ? 'Your previous response was interrupted after reaching the thinking length budget. Proceed concisely using available evidence or a tool, or explain what is blocking progress.'
+              : 'Your previous response was interrupted because your reasoning repeated. Change approach, use available evidence or a tool, or explain what is blocking progress.';
+            taskMessages.push({ role: 'user', content: nudge });
             continue;
           }
           errorText = (err as Error).message;
@@ -978,11 +987,6 @@ function trimHistory(history: ChatMessage[]): ChatMessage[] {
   return out;
 }
 
-function chunkString(text: string, size: number): string[] {
-  const out: string[] = [];
-  for (let i = 0; i < text.length; i += size) out.push(text.slice(i, i + size));
-  return out;
-}
 
 export function defaultHarnessConfig(): HarnessConfig {
   return DEFAULT_CONFIG;

@@ -541,3 +541,66 @@ test('streaming can be switched off and the task still completes', async () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+for (const kind of ['openai', 'anthropic'] as const) {
+  test(`${kind} SSE loop is interrupted and retried through the real provider parser`, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-sse-loop-'));
+    try {
+      const a = 'First I will inspect files. ';
+      const b = 'Next I will check the project. ';
+      const deltas = Array.from((a + b).repeat(12)).map((ch) => kind === 'openai'
+        ? sseChunk({ choices: [{ delta: { reasoning_content: ch } }] })
+        : sseChunk({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: ch } }));
+      let turn = 0;
+      const stub = stubFetch(() => {
+        turn++;
+        if (turn === 1) return sseResponse(deltas);
+        return kind === 'openai'
+          ? sseResponse([sseChunk({ choices: [{ delta: { content: 'Recovered.' }, finish_reason: 'stop' }] })])
+          : sseResponse([sseChunk({ type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'Recovered.' } }), sseChunk({ type: 'message_delta', delta: { stop_reason: 'end_turn' } })]);
+      });
+      const provider = kind === 'openai'
+        ? new OpenAiCompatibleProvider({ apiKey: 'k', baseUrl: 'https://example.test/v1' })
+        : new AnthropicProvider({ apiKey: 'k', baseUrl: 'https://example.test' });
+      const events: HarnessEvent[] = [];
+      const session = new HarnessSession({ host: new FakeHost(dir), provider, config: { ...DEFAULT_CONFIG, stream: true, maxSteps: 5 } });
+      const result = await session.runTask('test', (e) => events.push(e));
+      assert.equal(result.outcome, 'complete');
+      assert.equal(result.summary, 'Recovered.');
+      assert.equal(stub.calls.length, 2);
+      assert.ok(events.some((e) => e.type === 'notice' && e.message.includes('block repetition')));
+      assert.ok(events.filter((e) => e.type === 'thinking-delta').length < deltas.length);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test(`${kind} completed JSON fallback keeps answer and tool calls despite repeated thinking`, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-json-loop-'));
+    try {
+      let turn = 0;
+      const repeat = 'I need to inspect the project. '.repeat(3);
+      const json = (body: unknown) => new Response(JSON.stringify(body), { headers: { 'content-type': 'application/json' } });
+      const stub = stubFetch(() => {
+        turn++;
+        if (turn === 1) return kind === 'openai'
+          ? json({ choices: [{ message: { content: '', reasoning_content: repeat, tool_calls: [{ id: 'call1', type: 'function', function: { name: 'list_files', arguments: '{}' } }] }, finish_reason: 'tool_calls' }] })
+          : json({ content: [{ type: 'thinking', thinking: repeat }, { type: 'tool_use', id: 'call1', name: 'list_files', input: {} }], stop_reason: 'tool_use' });
+        return kind === 'openai'
+          ? json({ choices: [{ message: { content: 'Done.' }, finish_reason: 'stop' }] })
+          : json({ content: [{ type: 'text', text: 'Done.' }], stop_reason: 'end_turn' });
+      });
+      const provider = kind === 'openai'
+        ? new OpenAiCompatibleProvider({ apiKey: 'k', baseUrl: 'https://example.test/v1' })
+        : new AnthropicProvider({ apiKey: 'k', baseUrl: 'https://example.test' });
+      const events: HarnessEvent[] = [];
+      const session = new HarnessSession({ host: new FakeHost(dir), provider, config: { ...DEFAULT_CONFIG, stream: true, thinkingMaxChars: 10, maxSteps: 5 } });
+      const result = await session.runTask('test', (e) => events.push(e));
+      assert.equal(result.outcome, 'complete');
+      assert.equal(result.toolCalls, 1);
+      assert.equal(result.summary, 'Done.');
+      assert.equal(stub.calls.length, 2);
+      assert.ok(events.some((e) => e.type === 'notice' && e.message.includes('completed response')));
+      assert.ok(!events.some((e) => e.type === 'notice' && e.message.includes('stream was interrupted')));
+      assert.ok(events.some((e) => e.type === 'thinking-delta'));
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+}
