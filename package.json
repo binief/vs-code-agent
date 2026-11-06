@@ -479,6 +479,11 @@
           "minimum": 2,
           "maximum": 50,
           "markdownDescription": "Number of recent messages to keep uncompacted when compaction occurs."
+        },
+        "codingHarness.compaction.summaryModel": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional model on the configured provider to summarize older conversation messages. Empty uses the current model. Summarization makes an additional API request."
         }
       }
     }

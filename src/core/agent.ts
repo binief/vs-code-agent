@@ -1,6 +1,6 @@
 import { agentFilesSummary, discoverAgentFiles, selectAgentFiles } from './agentFiles';
 import { CheckpointStore, type RevertReport } from './checkpoints';
-import { compactHistory, estimateMessagesTokens, estimateTokens, shouldCompact } from './compaction';
+import { compactHistory, estimateRequestTokens, estimateTokens } from './compaction';
 import { isRetryableProviderError, retryDelayMs } from './providers/errors';
 import { ThinkingStreamGuard, RepeatedToolCallTracker, type ThinkingStopReason } from './loopTracking';
 import { buildSystemPrompt, summarizeDiagnostics } from './prompt';
@@ -51,8 +51,6 @@ export interface AgentDeps {
 
 const MAX_TOOL_RESULT_CHARS = 30_000;
 const MAX_THINKING_DISPLAY_CHARS = 12_000;
-const MAX_HISTORY_MESSAGES = 48;
-const MAX_HISTORY_CHARS = 140_000;
 /**
  * Attempts per model call. Transient failures (429, 5xx, a dropped connection)
  * are retried with backoff instead of ending the task where it stands.
@@ -82,6 +80,8 @@ export class HarnessSession {
   private controller?: AbortController;
   private busy = false;
   private cumulativeUsage: Usage = {};
+  private inputCalibration = 1;
+  private lastSystemPrompt = '';
 
   constructor(private deps: AgentDeps) {
     this.registry = deps.registry ?? deps.tools ?? new ToolRegistry(createDefaultTools());
@@ -129,6 +129,7 @@ export class HarnessSession {
   }
 
   updateConfig(config: HarnessConfig): void {
+    if (config.model !== this.deps.config.model || config.provider !== this.deps.config.provider || config.baseUrl !== this.deps.config.baseUrl) this.inputCalibration = 1;
     this.deps.config = config;
   }
 
@@ -154,6 +155,8 @@ export class HarnessSession {
     this.history = [];
     this.checkpoints.clear();
     this.cumulativeUsage = {};
+    this.inputCalibration = 1;
+    this.lastSystemPrompt = '';
   }
 
   cancel(): void {
@@ -167,26 +170,28 @@ export class HarnessSession {
 
   /** Estimate current context usage */
   getContextUsage(systemPrompt?: string): { tokens: number; window: number; percent: number } {
-    const sysTokens = systemPrompt ? estimateTokens(systemPrompt) : 0;
-    const histTokens = estimateMessagesTokens(this.history);
-    const total = sysTokens + histTokens;
+    const system = systemPrompt ?? this.lastSystemPrompt;
+    const messages: ChatMessage[] = system ? [{ role: 'system', content: system }, ...this.history] : [...this.history];
+    const total = Math.ceil(estimateRequestTokens(messages, this.registry.specs()) * this.inputCalibration) + Math.max(0, this.deps.config.maxOutputTokens);
     const window = this.deps.config.compaction.contextWindowTokens;
     const percent = window > 0 ? (total / window) * 100 : 0;
     return { tokens: total, window, percent };
   }
 
-  /** Manually compact the conversation history */
-  compact(): { compacted: boolean; originalTokens: number; newTokens: number; removed: number } {
-    const { newHistory, result } = compactHistory(this.history, this.deps.config);
-    if (result.compacted) {
-      this.history = newHistory;
+  /** Manually compact conversation history using the configured provider. */
+  async compact(): Promise<{ compacted: boolean; originalTokens: number; newTokens: number; removed: number; reason: string }> {
+    if (this.busy) throw new Error('Cannot compact while a task is running.');
+    this.busy = true;
+    this.controller = new AbortController();
+    try {
+      const { newHistory, result } = await compactHistory(this.history, this.deps.config, this.deps.provider, this.controller.signal);
+      if (result.usage) this.cumulativeUsage = mergeUsage(this.cumulativeUsage, result.usage);
+      if (result.compacted) this.history = newHistory;
+      return { compacted: result.compacted, originalTokens: result.originalTokens, newTokens: result.newTokens, removed: result.removedMessages, reason: result.summary };
+    } finally {
+      this.busy = false;
+      this.controller = undefined;
     }
-    return {
-      compacted: result.compacted,
-      originalTokens: result.originalTokens,
-      newTokens: result.newTokens,
-      removed: result.removedMessages,
-    };
   }
 
   async runTask(
@@ -222,6 +227,8 @@ export class HarnessSession {
     let lastTokensPerSecond = 0;
     const toolLoop = new RepeatedToolCallTracker();
     let thinkingInterruptions = 0;
+    let autoCompactRetryAt = 0;
+    let contextOverflowRetried = false;
 
     try {
       const workspace = await this.collectWorkspaceContext();
@@ -294,28 +301,30 @@ export class HarnessSession {
         agentFiles: selected,
       });
 
-      // Check if we should compact before starting
-      if (this.deps.config.compaction.enabled && this.deps.config.compaction.autoCompact) {
-        const check = shouldCompact([...this.history, ...taskMessages], system, this.deps.config);
-        onEvent({
-          type: 'context',
-          contextTokens: check.tokens,
-          contextWindow: this.deps.config.compaction.contextWindowTokens,
-          contextPercent: check.percent,
-        });
-        if (check.should) {
-          const { newHistory, result } = compactHistory(this.history, this.deps.config);
-          if (result.compacted) {
-            this.history = newHistory;
-            onEvent({
-              type: 'notice',
-              message: `Compacted conversation: removed ${result.removedMessages} old messages, freed ${result.originalTokens - result.newTokens} tokens (${Math.round((result.newTokens / this.deps.config.compaction.contextWindowTokens) * 100)}% context now).`,
-              level: 'info',
-            });
-            host.log('info', `auto-compacted: ${result.originalTokens} -> ${result.newTokens} tokens`);
-          }
+      this.lastSystemPrompt = system;
+
+      // Compact both prior history and the current task. Keep the shared pending
+      // array so autosave sees exactly the context that will be sent next.
+      const compactTask = async (): Promise<boolean> => {
+        onEvent({ type: 'notice', message: 'Checking context for LLM compaction; summarization may require an additional provider request.', level: 'info' });
+        const { newHistory, result } = await compactHistory([...this.history, ...taskMessages], this.deps.config, this.deps.provider, signal);
+        if (result.usage) {
+          this.cumulativeUsage = mergeUsage(this.cumulativeUsage, result.usage);
+          usage = mergeUsage(usage, result.usage);
+          onEvent({ type: 'usage', step: steps, usage: result.usage, cumulative: { ...this.cumulativeUsage } });
         }
-      }
+        if (!result.compacted) {
+          // Retry only after the conversation has grown, not on every step.
+          autoCompactRetryAt = this.history.length + taskMessages.length + 2;
+          onEvent({ type: 'notice', message: `Could not compact conversation: ${result.summary} Original context was retained.`, level: 'warn' });
+          return false;
+        }
+        this.history = [];
+        taskMessages.splice(0, taskMessages.length, ...newHistory);
+        onEvent({ type: 'notice', message: `LLM compacted conversation: removed ${result.removedMessages} messages, saved approximately ${result.originalTokens - result.newTokens} tokens.`, level: 'info' });
+        host.log('info', `LLM compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens`);
+        return true;
+      };
 
       for (let step = 1; step <= maxSteps; step++) {
         if (signal.aborted) {
@@ -349,37 +358,28 @@ export class HarnessSession {
 
         let messages = buildMessages();
 
-        // Estimate context usage for this step
-        const contextTokens = estimateMessagesTokens(messages) + estimateTokens(system);
+        // Reserve room for output and account for the tool definitions actually sent.
+        const toolsForStep = isFinalStep ? [] : this.registry.specs();
         const contextWindow = this.deps.config.compaction.contextWindowTokens;
-        const contextPercent = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
-        onEvent({
-          type: 'context',
-          contextTokens,
-          contextWindow,
-          contextPercent,
-        });
-
-        // Auto-compact if we're approaching limit mid-task
-        if (
-          this.deps.config.compaction.enabled &&
-          this.deps.config.compaction.autoCompact &&
-          contextPercent >= this.deps.config.compaction.threshold * 100 &&
-          this.history.length > this.deps.config.compaction.keepLastMessages
-        ) {
-          const { newHistory, result } = compactHistory(this.history, this.deps.config);
-          if (result.compacted) {
-            this.history = newHistory;
-            onEvent({
-              type: 'notice',
-              message: `Auto-compacted during task: freed ${result.originalTokens - result.newTokens} tokens. Context now ${Math.round((estimateMessagesTokens([...this.history, ...taskMessages]) / contextWindow) * 100)}%.`,
-              level: 'warn',
-            });
-            // Rebuild the prompt from the compacted history (never splice: the
-            // compacted history has a different length than the slice it replaces).
+        const outputReserve = Math.max(0, this.deps.config.maxOutputTokens);
+        const measureContext = () => {
+          const input = estimateRequestTokens(messages, toolsForStep);
+          const tokens = Math.ceil(input * this.inputCalibration) + outputReserve;
+          return { input, tokens, percent: contextWindow > 0 ? (tokens / contextWindow) * 100 : 0 };
+        };
+        let context = measureContext();
+        if (this.deps.config.compaction.enabled && this.deps.config.compaction.autoCompact &&
+            this.history.length + taskMessages.length >= autoCompactRetryAt &&
+            context.percent >= this.deps.config.compaction.threshold * 100 &&
+            this.history.length + taskMessages.length > this.deps.config.compaction.keepLastMessages) {
+          if (await compactTask()) {
             messages = buildMessages();
+            context = measureContext();
           }
         }
+        let contextTokens = context.tokens;
+        let contextPercent = context.percent;
+        onEvent({ type: 'context', contextTokens, contextWindow, contextPercent });
 
         let text = '';
         let calls: ToolCall[] = [];
@@ -442,7 +442,7 @@ export class HarnessSession {
               return {
                 model: this.deps.config.model,
                 messages,
-                tools: isFinalStep ? [] : this.registry.specs(),
+                tools: toolsForStep,
                 signal: attemptController.signal,
                 temperature: this.deps.config.temperature,
                 maxTokens: this.deps.config.maxOutputTokens,
@@ -513,6 +513,13 @@ export class HarnessSession {
             if (!completedThinkingDisplayed) appendThinkingDisplay(response.thinking);
           }
           if (response.usage) {
+            const reportedInput = response.usage.inputTokens;
+            if (typeof reportedInput === 'number' && reportedInput > 0 && context.input > 0) {
+              this.inputCalibration = Math.max(this.inputCalibration, reportedInput / context.input);
+              contextTokens = reportedInput + outputReserve;
+              contextPercent = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
+              onEvent({ type: 'context', contextTokens, contextWindow, contextPercent });
+            }
             // Compute tokens per second
             const outputTokens = response.usage.outputTokens ?? estimateTokens(text);
             const tokensPerSecond = callDurationMs > 0 ? (outputTokens / callDurationMs) * 1000 : 0;
@@ -598,7 +605,14 @@ export class HarnessSession {
             taskMessages.push({ role: 'user', content: nudge });
             continue;
           }
-          errorText = (err as Error).message;
+          const providerMessage = (err as Error).message;
+          if (!contextOverflowRetried && !attemptText && this.deps.config.compaction.enabled &&
+              /context.{0,30}(?:length|window|exceed|limit)|maximum.{0,30}(?:context|tokens)|too many tokens|token limit exceeded|(?:input|prompt).{0,30}too (?:long|large)/i.test(providerMessage)) {
+            contextOverflowRetried = true;
+            onEvent({ type: 'notice', message: 'Provider rejected the context as too large; attempting LLM compaction and one retry.', level: 'warn' });
+            if (await compactTask()) { step--; continue; }
+          }
+          errorText = providerMessage;
           host.log('error', `provider error: ${errorText}`);
           onEvent({ type: 'notice', message: `Model call failed: ${errorText}`, level: 'error' });
           outcome = 'error';
@@ -704,10 +718,14 @@ export class HarnessSession {
         }
       }
     } catch (err) {
-      errorText = (err as Error).message;
-      host.log('error', `task failed: ${errorText}`);
-      onEvent({ type: 'notice', message: `Task failed: ${errorText}`, level: 'error' });
-      outcome = 'error';
+      if (signal.aborted) {
+        outcome = 'cancelled';
+      } else {
+        errorText = (err as Error).message;
+        host.log('error', `task failed: ${errorText}`);
+        onEvent({ type: 'notice', message: `Task failed: ${errorText}`, level: 'error' });
+        outcome = 'error';
+      }
     } finally {
       this.busy = false;
       this.controller = undefined;
@@ -719,7 +737,7 @@ export class HarnessSession {
       // A run that was cancelled or failed part-way can leave an unanswered
       // tool call behind; repairing here keeps the *next* task runnable
       // instead of shipping the provider a transcript it will refuse.
-      this.history = repairToolMessages(trimHistory([...this.history, ...taskMessages]));
+      this.history = repairToolMessages([...this.history, ...taskMessages]);
       this.pendingMessages = undefined;
       this.pendingAssistantText = '';
     }
@@ -749,7 +767,7 @@ export class HarnessSession {
       filesChanged,
       usage: this.cumulativeUsage,
       tokensPerSecond: lastTokensPerSecond,
-      contextTokens: estimateMessagesTokens(this.history),
+      contextTokens: this.getContextUsage().tokens,
     };
   }
 
@@ -920,7 +938,8 @@ export function parseToolArguments(raw: string): Record<string, unknown> {
 function mergeUsage(a: Usage, b: Usage): Usage {
   const inputTokens = (a.inputTokens ?? 0) + (b.inputTokens ?? 0);
   const outputTokens = (a.outputTokens ?? 0) + (b.outputTokens ?? 0);
-  const totalTokens = (a.totalTokens ?? 0) + (b.totalTokens ?? 0) || inputTokens + outputTokens;
+  const totalTokens = (a.totalTokens ?? ((a.inputTokens ?? 0) + (a.outputTokens ?? 0))) +
+    (b.totalTokens ?? ((b.inputTokens ?? 0) + (b.outputTokens ?? 0)));
   const cachedTokens = (a.cachedTokens ?? 0) + (b.cachedTokens ?? 0);
   return {
     inputTokens: inputTokens || undefined,
@@ -953,38 +972,6 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     };
     signal?.addEventListener('abort', onAbort, { once: true });
   });
-}
-
-/**
- * Keep the tail of the conversation, never starting on an orphaned tool result
- * and never starting on an assistant turn: Anthropic rejects a conversation
- * whose first message is not from the user, and a history that opens with the
- * assistant talking to itself is not a useful prompt either way.
- */
-function trimHistory(history: ChatMessage[]): ChatMessage[] {
-  let out = history;
-  if (out.length > MAX_HISTORY_MESSAGES) {
-    let drop = out.length - MAX_HISTORY_MESSAGES;
-    const firstUser = out.findIndex((m, i) => i >= drop && m.role === 'user');
-    if (firstUser !== -1) {
-      drop = firstUser;
-    } else {
-      while (drop < out.length && out[drop].role !== 'user') drop++;
-    }
-    out = out.slice(drop);
-  }
-  let chars = out.reduce((sum, m) => sum + m.content.length + 64, 0);
-  while (out.length > 2 && chars > MAX_HISTORY_CHARS) {
-    const removed = out.shift()!;
-    chars -= removed.content.length + 64;
-    while (out.length > 0 && out[0].role === 'tool') {
-      const extra = out.shift()!;
-      chars -= extra.content.length + 64;
-    }
-  }
-  const firstUser = out.findIndex((m) => m.role === 'user');
-  if (firstUser > 0) out = out.slice(firstUser);
-  return out;
 }
 
 

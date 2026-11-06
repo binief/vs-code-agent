@@ -20,7 +20,7 @@ interface AnthropicBlock {
 interface AnthropicResponse {
   content?: AnthropicBlock[];
   stop_reason?: string;
-  usage?: { input_tokens?: number; output_tokens?: number };
+  usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
   error?: { message?: string };
 }
 
@@ -128,10 +128,20 @@ export class AnthropicProvider implements Provider {
       text,
       toolCalls,
       finishReason: json.stop_reason,
-      usage: json.usage ? { inputTokens: json.usage.input_tokens, outputTokens: json.usage.output_tokens } : undefined,
+      usage: json.usage ? anthropicUsage(json.usage) : undefined,
       thinking: thinking || undefined,
     };
   }
+}
+
+function anthropicUsage(usage: NonNullable<AnthropicResponse['usage']>): import('../types').Usage {
+  const cached = usage.cache_read_input_tokens ?? 0;
+  const created = usage.cache_creation_input_tokens ?? 0;
+  return {
+    inputTokens: (usage.input_tokens ?? 0) + cached + created,
+    outputTokens: usage.output_tokens,
+    ...(cached ? { cachedTokens: cached } : {}),
+  };
 }
 
 /* --------------------------------------------------------------- streaming */
@@ -160,6 +170,7 @@ export async function readAnthropicStream(
   let thinking = '';
   let stopReason: string | undefined;
   let inputTokens: number | undefined;
+  let cachedTokens: number | undefined;
   let outputTokens: number | undefined;
   let errorMessage: string | undefined;
 
@@ -174,9 +185,15 @@ export async function readAnthropicStream(
     }
 
     switch (event.type) {
-      case 'message_start':
-        inputTokens = event.message?.usage?.input_tokens ?? inputTokens;
+      case 'message_start': {
+        const usage = event.message?.usage;
+        if (usage) {
+          const normalized = anthropicUsage(usage);
+          inputTokens = normalized.inputTokens;
+          cachedTokens = normalized.cachedTokens;
+        }
         break;
+      }
       case 'content_block_start': {
         const block = event.content_block ?? {};
         if (block.type === 'tool_use') {
@@ -256,7 +273,7 @@ export async function readAnthropicStream(
     text,
     toolCalls,
     finishReason: stopReason,
-    usage: inputTokens || outputTokens ? { inputTokens, outputTokens } : undefined,
+    usage: inputTokens || outputTokens ? { inputTokens, outputTokens, ...(cachedTokens ? { cachedTokens } : {}) } : undefined,
     thinking: thinking || undefined,
   };
 }

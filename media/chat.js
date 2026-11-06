@@ -386,8 +386,8 @@
     }
     if (chipContext) {
       const pct = contextPercent || 0;
-      chipContext.textContent = 'ctx ' + Math.round(pct) + '%';
-      chipContext.title = 'Context: ' + contextTokens + ' / ' + contextWindow + ' tokens (' + Math.round(pct) + '%) — click to preview the system message';
+      chipContext.textContent = 'ctx ~' + Math.round(pct) + '%';
+      chipContext.title = 'Estimated context: ' + contextTokens + ' / ' + contextWindow + ' tokens (~' + Math.round(pct) + '%). During requests, the estimate includes tools and output reserve; before the first request it may be incomplete. Verify your model’s configured window — click to preview the system message';
       chipContext.classList.toggle('warn', pct >= 75 && pct < 90);
       chipContext.classList.toggle('error', pct >= 90);
       if (compactBanner && compactText) {
@@ -395,8 +395,8 @@
           compactBanner.hidden = false;
           compactText.textContent =
             pct >= 90
-              ? 'Context ' + Math.round(pct) + '% full (' + contextTokens + '/' + contextWindow + ' tokens). Compact to avoid truncation.'
-              : 'Context ' + Math.round(pct) + '% used. Compacting frees space for the next task.';
+              ? 'Estimated context ~' + Math.round(pct) + '% full (' + contextTokens + '/' + contextWindow + ' tokens). Compact to avoid truncation.'
+              : 'Estimated context ~' + Math.round(pct) + '% used. Compacting frees space for the next task.';
         } else if (pct < 70) {
           compactBanner.hidden = true;
         }

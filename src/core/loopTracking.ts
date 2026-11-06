@@ -93,6 +93,10 @@ export class ThinkingStreamGuard {
         // A threefold exact, contiguous phrase cycle; compare only a bounded suffix.
         for (let size = 40; size <= Math.min(512, Math.floor(this.recent.length / 3)); size++) {
           const n = this.recent.length;
+          // Most candidate periods fail at the last character. Check it before
+          // allocating any substrings, especially for token-by-token streams.
+          if (this.recent[n - 1] !== this.recent[n - size - 1] ||
+              this.recent[n - 1] !== this.recent[n - size * 2 - 1]) continue;
           const a = this.recent.slice(n - size);
           if (a === this.recent.slice(n - size * 2, n - size) && a === this.recent.slice(n - size * 3, n - size * 2)) {
             return { accepted, reason: 'phrase', chars: this.length };

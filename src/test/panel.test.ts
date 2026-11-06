@@ -138,7 +138,7 @@ test('the panel boots with an empty transcript and honest status chips', () => {
   assert.ok(h.doc.getElementById('empty'), 'an empty transcript offers the starting point');
   assert.equal(h.doc.getElementById('chip-provider').textContent, 'anthropic · claude-test');
   assert.equal(h.doc.getElementById('chip-agents').textContent, 'agents: 1');
-  assert.equal(h.doc.getElementById('chip-context').textContent, 'ctx 33%');
+  assert.equal(h.doc.getElementById('chip-context').textContent, 'ctx ~33%');
   assert.equal(h.doc.getElementById('status-text').textContent, 'Idle');
   assert.equal(h.doc.getElementById('status-dot').dataset.status, 'idle');
   h.close();

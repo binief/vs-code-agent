@@ -437,6 +437,7 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.compaction.threshold` | `0.75` | Utilisation that triggers auto-compaction |
 | `codingHarness.compaction.contextWindowTokens` | `128000` | Context window estimate for the meter |
 | `codingHarness.compaction.keepLastMessages` | `10` | Recent messages kept intact |
+| `codingHarness.compaction.summaryModel` | `""` | Optional model on the current provider for LLM summaries; empty uses the active model |
 
 ## Commands
 
@@ -486,7 +487,15 @@ error the provider will not accept twice. Everything that used to stop a task ea
 - **Compaction cuts on tool-call boundaries.** The kept tail never starts with a tool result whose
   request was summarised away, the summary is a user turn (Anthropic rejects a conversation that
   starts with the assistant), and a mid-task compaction rebuilds the prompt instead of splicing the
-  message list with the wrong length.
+  message list with the wrong length. Compaction sends older history to the configured provider for an
+  LLM summary, including during an active task. It incurs an additional API call and may lose details;
+  the original context is retained if summarization fails or produces no useful size reduction. A
+  context-limit rejection also triggers one compaction attempt and retry. The offline mock cannot
+  produce LLM summaries. Very large histories may still exceed the summarizer's own context limit.
+- **Context usage is an estimate.** The `ctx ~` meter includes estimated tool schemas and reserved
+  output tokens, and uses reported input usage when available. Tokenizers, images, provider accounting,
+  and model context sizes vary: set `codingHarness.compaction.contextWindowTokens` to the actual limit
+  of the model and endpoint. An inaccurate window setting can still lead to a context-limit error.
 
 Streaming is SSE parsing in both providers (`readOpenAiStream`, `readAnthropicStream`). Some gateways
 ignore `stream: true` and answer with plain JSON; that is detected from the response Content-Type and
@@ -542,7 +551,7 @@ balance, and colours come from theme variables only.
 By default, the current conversation is saved automatically in VS Code's **workspace-specific
 extension storage**, outside the project. Reopen the same folder or workspace after restarting VS Code
 to see it again and send a follow-up. Both the visible transcript and the model's conversation history
-are restored, including images and tool results; normal history trimming and compaction still apply.
+are restored, including images and tool results; LLM compaction can still apply.
 If VS Code closes during a task, the latest saved progress is shown as interrupted. Tools and approval
 requests are not restarted or applied automatically.
 
@@ -628,7 +637,7 @@ Layout:
 
 ```
 src/core/            no vscode imports — unit-testable, reusable
-  agent.ts           the loop (HarnessSession), retries, transcript trimming
+  agent.ts           the loop (HarnessSession), retries, context management
   prompt.ts          context-only system message (environment/workspace/files/tools)
   agentFiles.ts      agent.md discovery, scoping, budgets and rendering
   transcript.ts      tool-call/result pairing repair

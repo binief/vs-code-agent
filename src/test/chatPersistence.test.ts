@@ -157,6 +157,7 @@ function makeController(name: string) {
 function toolProvider(requests: ChatMessage[][]): (request: ChatRequest) => Promise<ProviderResponse> {
   return async (request) => {
     requests.push(JSON.parse(JSON.stringify(request.messages)) as ChatMessage[]);
+    if (request.messages[0]?.content.startsWith('Summarize the following conversation')) return { text: 'Earlier tasks inspected sample.txt.', toolCalls: [] };
     let lastUser = request.messages.length - 1;
     while (lastUser >= 0 && request.messages[lastUser].role !== 'user') lastUser--;
     const task = request.messages.slice(lastUser + 1);
