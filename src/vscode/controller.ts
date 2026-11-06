@@ -9,6 +9,7 @@ import { agentFilesSummary, discoverAgentFiles, selectAgentFiles, type AgentFile
 import { buildSystemPrompt, summarizeDiagnostics } from '../core/prompt';
 import { apiKeyFromEnv, createProvider } from '../core/providers';
 import { createDefaultTools, ToolRegistry } from '../core/tools';
+import { resolveAgentToolPolicy } from '../core/toolPolicy';
 import { McpManager, sanitizeMcpServers } from '../core/tools/mcp';
 import {
   loadMcpConfigFiles,
@@ -720,7 +721,7 @@ export class HarnessController {
     const mcpLoadFromFiles = c.get<boolean>('mcp.loadFromFiles') ?? DEFAULT_CONFIG.mcp.loadFromFiles;
     const mcpConfigFiles = HarnessController.arrayOfStrings(c.get('mcp.configFiles')) ?? DEFAULT_CONFIG.mcp.configFiles;
 
-    // Agent instruction files: there is no built-in prompt, so this config is
+    // Agent instruction files: project-specific instructions are configured here, so this is
     // the only source of behavioural instructions.
     const agentEnabled = c.get<boolean>('agentFiles.enabled') ?? DEFAULT_CONFIG.agentFiles.enabled;
     const agentNames = HarnessController.arrayOfStrings(c.get('agentFiles.names')) ?? DEFAULT_CONFIG.agentFiles.names;
@@ -1467,31 +1468,15 @@ export class HarnessController {
     return discovered;
   }
 
-  /**
-   * Drop pinned paths that no longer exist. A selection silently shrinking to
-   * nothing would run the agent with no instructions at all, so an empty
-   * remainder falls back to "every discovered file" and says so.
-   */
+  /** Keep missing pins intact: silently falling back could widen permissions. */
   private pruneStaleAgentSelection(discovered: AgentFilesResult): void {
     if (!this.agentSelection) return;
     const known = new Set(discovered.files.map((file) => file.displayPath));
-    const kept = this.agentSelection.filter((path) => known.has(path));
-    if (kept.length === this.agentSelection.length) return;
-
-    const dropped = this.agentSelection.filter((path) => !known.has(path));
-    this.log.warn(`agent selection: dropping ${dropped.length} missing file(s): ${dropped.join(', ')}`);
-    if (kept.length === 0) {
-      this.agentSelection = undefined;
-      void this.persistAgentSelection();
-      this.pushNotice(
-        'warn',
-        `The pinned instruction file(s) were not found (${dropped.join(', ')}). Using every discovered file again.`,
-      );
-      return;
+    const missing = this.agentSelection.filter((file) => !known.has(file));
+    if (missing.length) {
+      this.log.warn(`Selected agent file(s) are missing: ${missing.join(', ')}`);
+      this.pushNotice('warn', `Selected agent file(s) could not be loaded (${missing.join(', ')}). Restore them or choose a different selection before running.`);
     }
-    this.agentSelection = kept;
-    void this.persistAgentSelection();
-    this.pushNotice('info', `Instruction file(s) no longer found and removed from the selection: ${dropped.join(', ')}.`);
   }
 
   /** Everything the agents dialog needs: discovered files plus the current pin. */
@@ -1588,7 +1573,7 @@ export class HarnessController {
     }
     if (result.files.length === 0) {
       const create = await vscode.window.showInformationMessage(
-        'No instruction files were found. The extension has no built-in prompt — instructions come from these files (any .md file under .agents/ works).',
+        'No instruction files were found. Add an agent file to provide project instructions (any .md file under .agents/ works).',
         'Create agent.md',
       );
       if (create === 'Create agent.md') await this.createAgentFile();
@@ -1625,7 +1610,7 @@ export class HarnessController {
     const template = [
       '# Agent instructions',
       '',
-      '<!-- Everything below is sent with every task; the extension has no built-in prompt. -->',
+      '<!-- Everything below is sent with every task when this file is selected. -->',
       '<!-- Add project conventions, commands to run, style rules and things to avoid. -->',
       '',
       '## Project',
@@ -1681,7 +1666,13 @@ export class HarnessController {
         /* no diagnostics available */
       }
     }
-    const tools = this.session?.toolSpecs ?? new ToolRegistry(createDefaultTools()).specs();
+    let tools;
+    try {
+      tools = resolveAgentToolPolicy(agentFiles, this.session?.toolSpecs ?? new ToolRegistry(createDefaultTools()).specs()).tools;
+    } catch (err) {
+      void vscode.window.showWarningMessage(`Cannot preview agent tool policy: ${(err as Error).message}`);
+      return;
+    }
     const prompt = buildSystemPrompt({ root, config, tools, diagnostics, workspace, agentFiles });
     const doc = await vscode.workspace.openTextDocument({ content: prompt, language: 'markdown' });
     await vscode.window.showTextDocument(doc, { preview: false });
@@ -1906,17 +1897,8 @@ export class HarnessController {
           this.agentNoticeShown = true;
           this.pushNotice(
             'info',
-            'No instruction files found. This extension has no built-in prompt — add AGENTS.md / agent.md, or any .md file under .agents/, to tell the agent how to work in this workspace.',
+            'No instruction files found. Add AGENTS.md / agent.md, or any .md file under .agents/, to tell the agent how to work in this workspace.',
           );
-        }
-        // A pin that filtered everything out means the files it named are gone.
-        // Drop it here as well, so the next task is not silently instruction-free.
-        if (this.agentSelection && event.files.length === 0 && available > 0) {
-          this.log.warn('agent selection matched no discovered file; falling back to every file');
-          this.agentSelection = undefined;
-          void this.persistAgentSelection();
-          this.session?.setAgentSelection(undefined);
-          void this.refreshAgentFiles();
         }
         if (event.files.length > 0) {
           this.log.info(

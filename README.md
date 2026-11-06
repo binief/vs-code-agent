@@ -5,10 +5,11 @@ set of coding tools — create, read, search and edit files, run shell commands,
 diagnostics and call MCP servers — plus a factual snapshot of the environment, the workspace and the
 files you have open.
 
-It ships **no built-in prompt**. Every instruction the model receives comes from instruction files
-in your workspace (or an optional user-level file) — `AGENTS.md`, `agent.md`, or any Markdown file
-you put in `.agents/` (for example `code-review.md`, `test.md`). Edit those files to change how the
-agent behaves; there is no hidden personality or rule set to fight.
+General agent instructions come from files in your workspace (or an optional user-level file) —
+`AGENTS.md`, `agent.md`, or any Markdown file you put in `.agents/` (for example `code-review.md`,
+`test.md`). The harness also sends tool schemas and operational messages for recovery, loop handling,
+and LLM summarization; it is not literally free of all model-facing prompts. Edit your agent files
+to define the task behavior.
 
 It works with any OpenAI-compatible endpoint, Anthropic, or the offline planner, so you can use a
 cloud API, a local model through Ollama/LM Studio, or no API key at all.
@@ -85,9 +86,9 @@ backend exposes a reasoning stream it renders in its own **thinking lane** above
 
 ## Agent instruction files
 
-This is the only source of behavioural instructions. There is no built-in prompt to fall back on:
-if no agent file is found, the model receives context and tools but no instructions, and the panel
-shows an `agents: none` chip. The extension still works — it is simply waiting for you to say how.
+Agent files define project-specific instructions and optional tool permissions. If none is found,
+the panel shows an `agents: none` chip and the model receives context, tools, and any operational
+recovery messages, but no project-specific agent instructions.
 
 ### Discovery rules
 
@@ -200,13 +201,45 @@ the rest were deliberately left out.
 
 - The pin is stored in `workspaceState`, so it survives a window reload but does not leak into other
   repositories the way a global setting would. "Use every discovered file" clears it.
-- A file that has been renamed or deleted is dropped from the pin automatically; if that leaves
-  nothing, the extension falls back to all discovered files and says so, rather than quietly running
-  the agent with no instructions at all.
+- If a pinned file is missing or unreadable, the task stops instead of silently changing the
+  selection and potentially broadening permissions. Restore the file or explicitly choose another selection.
 - Discovery is unchanged, so nothing needs a fixed name and nothing outside the workspace is read
   unless it was opted in.
 - *Preview System Context* shows exactly the pinned set, which is the quickest way to check what the
   model will actually be told.
+
+### Tool permissions in agent files
+
+An agent file can declare permitted tool groups in YAML front matter (block or inline lists):
+
+```yaml
+---
+description: Read-only reviewer
+tools:
+  - read
+  - search
+---
+Review the code and report findings without modifying files.
+```
+
+The list is enforced both when presenting tools to the model and when executing its calls. Available
+groups are `read` (`list_files`, `read_file`, `get_diagnostics`, `open_file`), `search` (`list_files`,
+`search_text`), `edit` (`create_file`, `write_file`, `replace_in_file`, `delete_file`), `execute`
+(`run_command`), and `mcp` (all registered `mcp_` tools). You may instead name an exact registered
+tool. Groups without any currently registered tools permit none. `tools: []` permits no tools.
+
+When several selected files declare `tools`, their permissions intersect, even for files whose
+instructions have a narrower directory scope: the policy applies to the whole task. A file with no
+`tools` declaration imposes no additional restriction, preserving older configurations; if none
+have one, all registered tools remain available. Agent files are reloaded for each task. Unknown or
+malformed tool metadata, truncated selected files, missing pins, and skipped files in the default
+all-files mode stop the task rather than silently grant access.
+
+**Important:** This is a tool-name allowlist, not a sandbox. `execute` can run shell commands that
+modify files, and MCP servers may have arbitrary side effects, even when `edit` is absent. Existing
+command, edit and approval settings still apply to their respective built-in tools. Natural-language
+instructions alone do not enforce read-only access. In particular, a list that includes `edit`,
+`execute`, and `mcp` explicitly permits those capabilities; remove them for a read-only reviewer.
 
 ### Commands
 
@@ -237,8 +270,9 @@ section is a readable catalogue on top of that. Turn individual context sections
 does not need them — for example `context.workspace: false` for a tiny local model with a small
 context window.
 
-Nothing in this message is an instruction except the agent files. The extension does not inject a
-persona, workflow rules, tone guidance or a response format.
+The system message does not add a general persona or response format; the harness can also send
+operational recovery and loop-handling messages during a task and a dedicated summarization prompt
+when compacting history.
 
 ## Tools the agent can use
 
@@ -412,7 +446,7 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.thinkingMaxChars` | `12000` | Interrupt a streamed reasoning attempt at this character budget; `0` disables the budget (loop detection remains active) |
 | `codingHarness.chat.saveEnabled` | `true` | Automatically save and restore the current workspace chat |
 | `codingHarness.chat.saveFolder` | `""` | Folder for automatic saves; empty uses VS Code workspace storage |
-| `codingHarness.agentFiles.enabled` | `true` | Load instructions from agent files (no built-in prompt) |
+| `codingHarness.agentFiles.enabled` | `true` | Load agent instructions and tool permissions |
 | `codingHarness.agentFiles.names` | `["AGENTS.md","agent.md","agents.md","copilot-instructions.md"]` | Exact names searched (case-insensitive) |
 | `codingHarness.agentFiles.patterns` | `["*.instructions.md"]` | Workspace-relative globs, so files can have any name |
 | `codingHarness.agentFiles.includeUser` | `false` | Load a user-level agent file in every workspace |
@@ -492,6 +526,10 @@ error the provider will not accept twice. Everything that used to stop a task ea
   the original context is retained if summarization fails or produces no useful size reduction. A
   context-limit rejection also triggers one compaction attempt and retry. The offline mock cannot
   produce LLM summaries. Very large histories may still exceed the summarizer's own context limit.
+  Summary budgets are based on the older text being replaced; an oversized or incomplete first
+  summary is retried once with a shorter target. If both fail, the original history stays intact and
+  the warning remains: consider reducing `codingHarness.compaction.keepLastMessages`, choosing a
+  different `codingHarness.compaction.summaryModel`, or continuing until more old text is available.
 - **Context usage is an estimate.** The `ctx ~` meter includes estimated tool schemas and reserved
   output tokens, and uses reported input usage when available. Tokenizers, images, provider accounting,
   and model context sizes vary: set `codingHarness.compaction.contextWindowTokens` to the actual limit
@@ -695,9 +733,9 @@ in `createProvider()` (`src/core/providers/index.ts`). `mock.ts` is a compact re
 
 ## Limitations worth knowing
 
-- **No built-in prompt means no default behaviour.** An empty workspace with no `agent.md` gives the
-  model tools and context but no guidance on how to use them. Write a short `agent.md` first; it is
-  the highest-leverage file in the project.
+- **Agent files define general behavior.** An empty workspace with no `agent.md` gives the model
+  tools, context and operational recovery messages, but no project-specific guidance. Write a short
+  `agent.md` first; it is the highest-leverage file in the project.
 - **Agent file size matters.** Instructions are sent on every turn. Keep them focused (a few KB is
   usually plenty); the budgets are there to protect the context window, but a 100 KB instruction file
   will crowd out code.

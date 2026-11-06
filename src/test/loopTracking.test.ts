@@ -127,7 +127,8 @@ test('repeated tool calls produce a notice and a provider-safe nudge after all t
     assert.ok(isTranscriptWellFormed(seen[1]));
     assert.equal(seen[1].filter((m) => m.role === 'tool').length, 3);
     assert.equal(seen[1].at(-1)?.role, 'user');
-    assert.match(seen[1].at(-1)?.content ?? '', /Do not repeat/);
+    assert.match(seen[1].at(-1)?.content ?? '', /Tool loop detected/);
+    assert.doesNotMatch(seen[1].at(-1)?.content ?? '', /Do not repeat/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

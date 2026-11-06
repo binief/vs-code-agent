@@ -252,3 +252,51 @@ test('manual LLM compaction is cancellable and leaves history unchanged', async 
     assert.equal(session.isRunning, false);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('an oversized summary retries with a shorter target and aggregates both usages', async () => {
+  const requests: ChatRequest[] = [];
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+    requests.push(req);
+    return requests.length === 1
+      ? { text: 'Too long. '.repeat(1500), toolCalls: [], usage: { inputTokens: 100, outputTokens: 50, cachedTokens: 20 } }
+      : { text: 'Concise verified summary.', toolCalls: [], usage: { inputTokens: 80, outputTokens: 10, totalTokens: 90, cachedTokens: 10 } };
+  } };
+  const history = longHistory();
+  const result = await compactHistory(history, config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } }), provider);
+  assert.equal(result.result.compacted, true);
+  assert.equal(requests.length, 2);
+  const target = (request: ChatRequest) => Number(request.messages[0].content.match(/under approximately (\d+) tokens/)?.[1]);
+  assert.ok(target(requests[1]) < target(requests[0]));
+  assert.deepEqual(result.result.usage, { inputTokens: 180, outputTokens: 60, totalTokens: 240, cachedTokens: 30 });
+  assert.equal(result.newHistory[0].content.includes('Concise verified summary.'), true);
+  assert.deepEqual(result.newHistory.slice(-2), history.slice(-2));
+});
+
+test('two oversized or incomplete summaries retain original messages and report both costs', async () => {
+  for (const finishReason of [undefined, 'length']) {
+    let calls = 0;
+    const provider: Provider = { id: 'test', label: 'test', async chat() {
+      calls++;
+      return { text: 'Long. '.repeat(3000), toolCalls: [], finishReason, usage: { inputTokens: 10, outputTokens: 20 } };
+    } };
+    const history = longHistory();
+    const { newHistory, result } = await compactHistory(history, config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } }), provider);
+    assert.strictEqual(newHistory, history);
+    assert.equal(result.compacted, false);
+    assert.equal(calls, 2);
+    assert.equal(result.usage?.totalTokens, 60);
+    assert.match(result.summary, finishReason ? /incomplete summary twice/ : /did not reduce/);
+  }
+});
+
+test('summary budget depends on the compactable prefix, not a large retained tail', async () => {
+  const requests: ChatRequest[] = [];
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) { requests.push(req); return { text: 'Short summary.', toolCalls: [] }; } };
+  const history = longHistory();
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } });
+  await compactHistory(history, c, provider);
+  const enlarged = history.map((message, i) => i >= history.length - 2 ? { ...message, content: message.content.repeat(20000) } : message);
+  await compactHistory(enlarged, c, provider);
+  assert.equal(requests[0].maxTokens, requests[1].maxTokens);
+  assert.equal(requests[0].messages[0].content, requests[1].messages[0].content);
+});

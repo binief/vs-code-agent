@@ -305,7 +305,7 @@ export interface HarnessConfig {
   showThinking: boolean;
   /** Maximum streamed thinking characters per attempt; 0 disables this budget. */
   thinkingMaxChars: number;
-  /** Instructions loaded from agent.md/AGENTS.md files. There is no built-in prompt. */
+  /** Instructions loaded from agent.md/AGENTS.md files. */
   agentFiles: AgentFilesConfig;
   /** Which factual context is included in the system message. */
   context: ContextConfig;

@@ -1,7 +1,7 @@
 {
   "name": "coding-harness",
   "displayName": "Coding Harness",
-  "description": "A tool harness for VS Code: file create/edit/search, shell commands and MCP tools, with context about the environment and workspace. Instructions come from your agent.md files — no built-in prompt.",
+  "description": "A tool harness for VS Code: file create/edit/search, shell commands and MCP tools, with context about the environment and workspace. Project instructions come from your agent.md files.",
   "version": "0.3.6",
   "publisher": "binief",
   "license": "MIT",
@@ -330,7 +330,7 @@
         "codingHarness.agentFiles.enabled": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Load behavioural instructions from agent files. The extension has **no built-in prompt**, so when this is off the model receives only environment, workspace, file and tool context."
+          "markdownDescription": "Load project instructions and tool permissions from agent files."
         },
         "codingHarness.agentFiles.names": {
           "type": "array",
@@ -497,10 +497,14 @@
     "package": "vsce package --allow-missing-repository --skip-license --out coding-harness.vsix"
   },
   "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^20.11.30",
     "@types/vscode": "^1.85.0",
     "typescript": "^5.4.5",
     "@vscode/vsce": "^3.2.1",
     "jsdom": "^26.1.0"
+  },
+  "dependencies": {
+    "js-yaml": "^4.3.2"
   }
 }
