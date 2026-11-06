@@ -108,6 +108,12 @@ test('automatic LLM compaction can summarize the current task and keep a valid t
     assert.ok(finalRequest.messages.some((m) => /Conversation compacted/.test(m.content)));
     assert.ok(isTranscriptWellFormed(finalRequest.messages));
     assert.ok(session.transcript.some((m) => /Conversation compacted/.test(m.content)));
+    const original = session.originalConversationSnapshot;
+    assert.equal(original[0].content, 'Inspect the current task.');
+    assert.deepEqual(original.filter((m) => m.role === 'assistant' && m.toolCalls?.length).map((m) => m.content), ['Inspecting 1.', 'Inspecting 2.']);
+    assert.equal(original.filter((m) => m.role === 'tool').length, 2);
+    assert.equal(original.at(-1)?.content, 'Finished.');
+    assert.ok(!original.some((m) => /Conversation compacted/.test(m.content)), 'summaries never replace originals');
     assert.ok(events.some((e) => e.type === 'notice' && e.message.includes('LLM compacted')));
     assert.ok((session.usage.inputTokens ?? 0) >= 200, 'summary usage is counted');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -299,4 +305,243 @@ test('summary budget depends on the compactable prefix, not a large retained tai
   await compactHistory(enlarged, c, provider);
   assert.equal(requests[0].maxTokens, requests[1].maxTokens);
   assert.equal(requests[0].messages[0].content, requests[1].messages[0].content);
+});
+
+test('a huge single tool result is chunked into bounded LLM requests and compacted as a complete group', async () => {
+  const data = ('verified evidence 😀 <entry>\n').repeat(2000);
+  const history: ChatMessage[] = [
+    { role: 'user', content: 'Investigate and preserve the user constraints.' },
+    { role: 'assistant', content: '', toolCalls: [{ id: 'one', name: 'inspect', arguments: '{}' }] },
+    { role: 'tool', toolCallId: 'one', name: 'inspect', content: data },
+  ];
+  const requests: ChatRequest[] = [];
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+    requests.push(req);
+    assert.ok(estimateMessagesTokens(req.messages) + (req.maxTokens ?? 0) <= 1800, 'summary request stays within the safety budget');
+    return { text: 'Verified chunk and user context.', toolCalls: [], usage: { inputTokens: 12, outputTokens: 4 } };
+  } };
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, contextWindowTokens: 2000, keepLastMessages: 10 } });
+  const { newHistory, result } = await compactHistory(history, c, provider, undefined, { targetHistoryTokens: 600 });
+  assert.equal(result.compacted, true);
+  assert.ok(requests.length > 2);
+  assert.ok(isTranscriptWellFormed(newHistory));
+  assert.equal(newHistory.length, 1, 'the last complete tool group can be summarized under pressure');
+  assert.equal(result.usage?.inputTokens, requests.length * 12);
+  const parts = requests.map((req) => req.messages[0].content.split('Conversation JSON or consecutive fragment:\n')[1]);
+  assert.ok(parts.join('').includes('Investigate and preserve the user constraints'));
+  assert.ok(parts.join('').includes('verified evidence 😀'));
+});
+
+test('chunked summarization failure and cancellation preserve the complete original history', async () => {
+  const history: ChatMessage[] = [
+    { role: 'user', content: 'important text '.repeat(5000) },
+    { role: 'assistant', content: 'recent' },
+    { role: 'user', content: 'continue' },
+  ];
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, contextWindowTokens: 2000, keepLastMessages: 2 } });
+  let calls = 0;
+  const failure: Provider = { id: 'test', label: 'test', async chat() {
+    if (++calls === 3) throw new Error('summary service failed');
+    return { text: 'Chunk summary.', toolCalls: [], usage: { inputTokens: 10, outputTokens: 2 } };
+  } };
+  const result = await compactHistory(history, c, failure);
+  assert.strictEqual(result.newHistory, history);
+  assert.equal(result.result.compacted, false);
+  assert.match(result.result.summary, /summary service failed/);
+  assert.equal(result.result.usage?.totalTokens, 24);
+  const controller = new AbortController();
+  const cancelling: Provider = { id: 'test', label: 'test', async chat() { controller.abort(); throw new Error('cancelled'); } };
+  await assert.rejects(compactHistory(history, c, cancelling, controller.signal), /cancelled/);
+  assert.equal(history[0].content.includes('important text'), true);
+});
+
+test('chunked compaction preserves image attachments and summarizes them in bounded vision calls', async () => {
+  const image = { mediaType: 'image/png', data: 'YWJj', name: 'screen.png' };
+  const history: ChatMessage[] = [
+    { role: 'user', content: 'Screenshot context. '.repeat(3000), images: [image] },
+    { role: 'assistant', content: 'recent' },
+    { role: 'user', content: 'continue' },
+  ];
+  const requests: ChatRequest[] = [];
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+    requests.push(req);
+    return { text: req.messages[0].images ? 'Image showed a screenshot.' : 'Relevant context.', toolCalls: [] };
+  } };
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, contextWindowTokens: 3000, keepLastMessages: 2 } });
+  const { result, newHistory } = await compactHistory(history, c, provider);
+  assert.equal(result.compacted, true);
+  assert.ok(requests.some((request) => request.messages[0].images?.[0] === image));
+  assert.deepEqual(newHistory[0].images, [image]);
+});
+
+test('compaction splits a summary request further after provider context rejection', async () => {
+  const history = longHistory();
+  const requests: ChatRequest[] = [];
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+    requests.push(req);
+    if (estimateMessagesTokens(req.messages) > 550) throw new Error('maximum context length exceeded');
+    return { text: 'Compact verified summary.', toolCalls: [] };
+  } };
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, contextWindowTokens: 10000, keepLastMessages: 2 } });
+  const { result } = await compactHistory(history, c, provider);
+  assert.equal(result.compacted, true);
+  assert.ok(requests.length > 1);
+});
+
+test('large tool output is paged and retrievable without rerunning the tool', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-tool-pages-'));
+  try {
+    const source = ('α😀verified!\n').repeat(1300);
+    let executions = 0;
+    const tool: Tool = { name: 'inspect', description: 'Inspect once', parameters: { type: 'object' }, async run() { executions++; return { ok: true, content: source }; } };
+    let turn = 0;
+    let reconstructed = '';
+    let id = '';
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      turn++;
+      if (turn === 1) return { text: '', toolCalls: [{ id: 'inspect-1', name: 'inspect', arguments: '{}' }] };
+      assert.ok(isTranscriptWellFormed(req.messages));
+      const result = req.messages.filter((m) => m.role === 'tool').at(-1)!;
+      const marker = result.content.lastIndexOf('\n[');
+      assert.ok(marker >= 0, 'each output page has a continuation or end marker');
+      reconstructed += result.content.slice(0, marker);
+      const notice = result.content.slice(marker);
+      if (notice.includes('End of cached output')) return { text: 'Finished.', toolCalls: [] };
+      id ||= notice.match(/result_id=(output-\d+)/)?.[1] ?? '';
+      const offset = Number(notice.match(/next_offset=(\d+)/)?.[1]);
+      assert.ok(id && Number.isInteger(offset));
+      assert.ok(req.tools.some((spec) => spec.name === 'read_tool_output'));
+      return { text: '', toolCalls: [{ id: `page-${turn}`, name: 'read_tool_output', arguments: JSON.stringify({ result_id: id, offset }) }] };
+    } };
+    const c = config({ maxSteps: 15, compaction: { ...DEFAULT_CONFIG.compaction, enabled: false, contextWindowTokens: 20000 } });
+    const session = new HarnessSession({ host: new Host(dir), provider, tools: new ToolRegistry([tool]), config: c });
+    const result = await session.runTask('Inspect.', () => {});
+    assert.equal(result.outcome, 'complete');
+    assert.equal(executions, 1);
+    assert.equal(reconstructed, source);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('adaptive compaction happens even with fewer messages than keepLastMessages', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-adaptive-'));
+  try {
+    let taskCalls = 0;
+    let summaryCalls = 0;
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      if (isSummary(req)) { summaryCalls++; return { text: 'Earlier user requirements summarized.', toolCalls: [] }; }
+      taskCalls++;
+      return { text: 'Complete.', toolCalls: [] };
+    } };
+    const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, contextWindowTokens: 5000, keepLastMessages: 10, threshold: 0.65 } });
+    const session = new HarnessSession({ host: new Host(dir), provider, tools: new ToolRegistry([]), config: c });
+    session.restoreConversation([{ role: 'user', content: 'Long verified task. '.repeat(650) }]);
+    const result = await session.runTask('Continue.', () => {});
+    assert.equal(result.outcome, 'complete');
+    assert.equal(taskCalls, 1);
+    assert.ok(summaryCalls >= 1);
+    assert.ok(session.transcript.some((m) => m.content.includes('Conversation compacted')));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('multiple large file reads are paginated under a shared budget with valid tool results', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-read-budget-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'large.txt'), ('😀 enormous line '.repeat(2500) + '\nsecond line\n'));
+    const { readFileTool } = await import('../core/tools/fsTools');
+    const providerRequests: ChatRequest[] = [];
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      providerRequests.push(req);
+      if (providerRequests.length === 1) return { text: '', toolCalls: [
+        { id: 'a', name: 'read_file', arguments: '{"path":"large.txt"}' },
+        { id: 'b', name: 'read_file', arguments: '{"path":"large.txt","start_line":1}' },
+      ] };
+      return { text: 'Done.', toolCalls: [] };
+    } };
+    const c = config({ maxSteps: 4, compaction: { ...DEFAULT_CONFIG.compaction, enabled: false, contextWindowTokens: 6000 } });
+    const session = new HarnessSession({ host: new Host(dir), provider, tools: new ToolRegistry([readFileTool]), config: c });
+    const result = await session.runTask('Read the file.', () => {});
+    assert.equal(result.outcome, 'complete');
+    const request = providerRequests[1];
+    assert.ok(isTranscriptWellFormed(request.messages));
+    const results = request.messages.filter((m) => m.role === 'tool');
+    assert.equal(results.length, 2);
+    assert.ok(results.every((m) => /next_line=1, next_column=\d+/.test(m.content)));
+    assert.ok(estimateRequestTokens(request.messages, request.tools) + c.maxOutputTokens < 6000);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('cached output cannot be retrieved after its task ends', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-expired-page-'));
+  try {
+    let phase = 0;
+    const tool: Tool = { name: 'inspect', description: '', parameters: { type: 'object' }, async run() { return { ok: true, content: 'x'.repeat(20000) }; } };
+    let followup: ChatRequest | undefined;
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      phase++;
+      if (phase === 1) return { text: '', toolCalls: [{ id: 'first', name: 'inspect', arguments: '{}' }] };
+      if (phase === 2) return { text: 'Finished.', toolCalls: [] };
+      if (phase === 3) { followup = req; return { text: '', toolCalls: [{ id: 'expired', name: 'read_tool_output', arguments: '{"result_id":"output-1"}' }] }; }
+      assert.match(req.messages.filter((m) => m.role === 'tool').at(-1)?.content ?? '', /not allowed/);
+      return { text: 'No access.', toolCalls: [] };
+    } };
+    const session = new HarnessSession({ host: new Host(dir), provider, tools: new ToolRegistry([tool]), config: config({ compaction: { ...DEFAULT_CONFIG.compaction, enabled: false } }) });
+    await session.runTask('First.', () => {});
+    await session.runTask('Next.', () => {});
+    assert.ok(followup && !followup.tools.some((tool) => tool.name === 'read_tool_output'));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('cancelling after a completed summary chunk retains its reported usage', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-cancel-chunks-'));
+  try {
+    let calls = 0;
+    let session: HarnessSession;
+    const provider: Provider = { id: 'test', label: 'test', async chat() {
+      if (++calls === 1) return { text: 'First chunk summary.', toolCalls: [], usage: { inputTokens: 50, outputTokens: 8 } };
+      session.cancel();
+      throw new Error('cancelled');
+    } };
+    const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, contextWindowTokens: 2000, keepLastMessages: 2 } });
+    session = new HarnessSession({ host: new Host(dir), provider, tools: new ToolRegistry([]), config: c });
+    const original: ChatMessage[] = [
+      { role: 'user', content: 'Important task details. '.repeat(3000) },
+      { role: 'assistant', content: 'Recent.' },
+      { role: 'user', content: 'Continue.' },
+    ];
+    session.restoreConversation(original);
+    await assert.rejects(session.compact(), /cancelled/);
+    assert.deepEqual(session.transcript, original);
+    assert.equal(session.usage.totalTokens, 58);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('chunked compaction has a bounded provider request count', async () => {
+  const history: ChatMessage[] = [
+    { role: 'user', content: 'A'.repeat(250000) },
+    { role: 'assistant', content: 'recent' },
+    { role: 'user', content: 'continue' },
+  ];
+  let calls = 0;
+  const provider: Provider = { id: 'test', label: 'test', async chat() { calls++; return { text: 'Summary.', toolCalls: [] }; } };
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, contextWindowTokens: 1000, keepLastMessages: 2 } });
+  const result = await compactHistory(history, c, provider);
+  assert.equal(result.result.compacted, false);
+  assert.strictEqual(result.newHistory, history);
+  assert.equal(calls, 0, 'fail before incurring costs if the minimum number of chunks exceeds the cap');
+  assert.match(result.result.summary, /64-request safety limit/);
+});
+
+test('summary target fits the reserved output capacity of a small configured window', async () => {
+  const history = longHistory();
+  const requests: ChatRequest[] = [];
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) { requests.push(req); return { text: 'Short verified summary.', toolCalls: [] }; } };
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, contextWindowTokens: 1000, keepLastMessages: 2 } });
+  const { result } = await compactHistory(history, c, provider);
+  assert.equal(result.compacted, true);
+  assert.ok(requests.length > 0);
+  for (const req of requests) {
+    const target = Number(req.messages[0].content.match(/under approximately (\d+) tokens/)?.[1]);
+    assert.ok(target <= (req.maxTokens ?? 0), `summary target ${target} must fit ${req.maxTokens} output tokens`);
+    assert.ok(estimateMessagesTokens(req.messages) + (req.maxTokens ?? 0) <= 900);
+  }
 });

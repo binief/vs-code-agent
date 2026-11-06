@@ -16,6 +16,9 @@ export interface ChatArchive {
   inProgress: boolean;
   items: TranscriptItem[];
   history: ChatMessage[];
+  /** Original uncompacted messages; absent in older archives. */
+  originalHistory?: ChatMessage[];
+  originalHistoryComplete?: boolean;
   usage: Usage;
 }
 
@@ -178,5 +181,13 @@ export function parseChatArchive(text: string): ChatArchive {
   for (const entry of archive.history) message(entry);
   if (archive.history.length && archive.history[0].role !== 'user') invalid('history must start with a user message.');
   if (!isTranscriptWellFormed(archive.history)) invalid('history contains unpaired tool calls or results.');
+  optionalBoolean(archive.originalHistoryComplete, 'originalHistoryComplete');
+  if (archive.originalHistory !== undefined) {
+    if (!Array.isArray(archive.originalHistory)) invalid('originalHistory must be an array.');
+    for (const entry of archive.originalHistory) message(entry);
+    if (archive.originalHistory.length && archive.originalHistory[0].role !== 'user') invalid('originalHistory must start with a user message.');
+  } else if (archive.originalHistoryComplete !== undefined) {
+    invalid('originalHistoryComplete requires originalHistory.');
+  }
   return archive as ChatArchive;
 }

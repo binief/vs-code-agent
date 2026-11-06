@@ -178,8 +178,8 @@ export interface HarnessHost {
   workspaceRoot: string;
   log(level: 'debug' | 'info' | 'warn' | 'error', message: string): void;
   requestApproval(req: ApprovalRequest): Promise<ApprovalDecision>;
-  /** Preferred file-writing path (e.g. a VS Code WorkspaceEdit so undo works). */
-  applyFileWrite?(absPath: string, content: string): Promise<void>;
+  /** Write text; preserveBytes requests exact UTF-8 output without save-time formatting. */
+  applyFileWrite?(absPath: string, content: string, options?: { preserveBytes?: boolean }): Promise<void>;
   getDiagnostics?(relPath?: string): Promise<Diagnostic[]>;
   openFile?(absPath: string, line?: number): Promise<void>;
   notify?(message: string, kind?: 'info' | 'warn' | 'error'): void;
@@ -508,6 +508,8 @@ export interface ToolContext {
   config: HarnessConfig;
   checkpoints: import('./checkpoints').CheckpointStore;
   signal?: AbortSignal;
+  /** Approximate per-result budget for tools that can page output. */
+  outputTokenBudget?: number;
   /**
    * Ask the user to authorise the action a tool is *about* to perform.
    * Supplied by the agent loop, which also emits the matching UI events.

@@ -181,6 +181,7 @@ export interface McpSettingsSnapshot {
 const MAX_ITEMS = 400;
 const CHAT_FILE = 'current-chat.json';
 const CHAT_SAVE_DELAY_MS = 1500;
+const CHAT_STORAGE_LIMIT_MESSAGE = 'Chat exceeds the 512 MB storage limit; start a new conversation to continue saving.';
 
 interface ChatSaveLocation {
   directory: vscode.Uri;
@@ -216,6 +217,8 @@ export class HarnessController {
   private items: TranscriptItem[] = [];
   /** Restored before the first session is created, then handed to the agent. */
   private restoredHistory: ChatMessage[] = [];
+  private restoredOriginalHistory: ChatMessage[] = [];
+  private restoredOriginalComplete = true;
   private readonly ready: Promise<void>;
   private chatSaveSettings: ChatSaveSettings;
   /** Invalidates queued writes when saving is disabled or the destination changes. */
@@ -327,6 +330,21 @@ export class HarnessController {
 
   /* -------------------------------------------------------- chat storage */
 
+  /** Show the actual extension-host path without exposing chat contents. */
+  async showChatStorageLocation(): Promise<void> {
+    await this.whenReady();
+    const settings = this.readChatSaveSettings();
+    if (!settings.enabled) {
+      void vscode.window.showInformationMessage('Automatic chat saving is disabled. Previously saved files are not deleted.');
+    } else if (settings.error || !settings.location) {
+      void vscode.window.showWarningMessage(settings.error ?? 'No chat storage location is available until a workspace is open.');
+    } else {
+      const file = settings.location.file.fsPath;
+      const choice = await vscode.window.showInformationMessage(`Coding Harness chat storage: ${file}`, 'Copy Path');
+      if (choice === 'Copy Path') await vscode.env.clipboard.writeText(file);
+    }
+  }
+
   /** Resolve paths on the extension host, preserving the workspace's remote filesystem. */
   private readChatSaveSettings(): ChatSaveSettings {
     const config = vscode.workspace.getConfiguration('codingHarness');
@@ -409,6 +427,7 @@ export class HarnessController {
       }
       try {
         if (readError) throw readError;
+        if (bytes!.byteLength > MAX_CHAT_ARCHIVE_BYTES) throw new Error('Chat exceeds the 512 MB storage limit.');
         const archive = parseChatArchive(Buffer.from(bytes!).toString('utf8'));
         const interrupted = this.applyChatArchive(archive);
         // Replace transient running/approval states with their interrupted forms.
@@ -470,6 +489,8 @@ export class HarnessController {
       inProgress: this.state.busy,
       items: this.items,
       history: this.session ? this.session.conversationSnapshot : this.restoredHistory,
+      originalHistory: this.session ? this.session.originalConversationSnapshot : this.restoredOriginalHistory,
+      originalHistoryComplete: this.session ? this.session.isOriginalConversationComplete : this.restoredOriginalComplete,
       usage: this.session ? this.session.usage : this.cumulativeUsage,
     };
   }
@@ -507,12 +528,23 @@ export class HarnessController {
     this.trimItems();
     this.cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0, ...archive.usage };
     this.lastTokensPerSecond = 0;
+    const original = archive.originalHistory ?? archive.history;
+    const originalComplete = !interrupted && (archive.originalHistoryComplete ?? (archive.history.length === 0));
+    const incompleteNotice = 'Original conversation history may be incomplete because this chat predates archival or was interrupted.';
+    if (!originalComplete && !this.items.some((item) => item.kind === 'notice' && item.message === incompleteNotice)) {
+      this.items.push({ id: randomUUID(), kind: 'notice', level: 'warn', message: incompleteNotice });
+      this.trimItems();
+    }
     if (this.session) {
       this.session.reset(); // Checkpoints and live approvals do not belong to the imported chat.
-      this.session.restoreConversation(archive.history, this.cumulativeUsage);
+      this.session.restoreConversation(archive.history, this.cumulativeUsage, original, originalComplete);
       this.restoredHistory = [];
+      this.restoredOriginalHistory = [];
+      this.restoredOriginalComplete = true;
     } else {
       this.restoredHistory = [...archive.history];
+      this.restoredOriginalHistory = [...original];
+      this.restoredOriginalComplete = originalComplete;
     }
     const contextTokens = estimateMessagesTokens(archive.history);
     const contextWindow = this.readConfig().compaction.contextWindowTokens;
@@ -561,6 +593,7 @@ export class HarnessController {
       if (!this.isCurrentChatSave(location, generation) || this.chatRevision === this.savedChatRevision) return;
       const revision = this.chatRevision;
       const data = Buffer.from(JSON.stringify(this.currentChatArchive()), 'utf8');
+      if (data.byteLength > MAX_CHAT_ARCHIVE_BYTES) throw new Error(CHAT_STORAGE_LIMIT_MESSAGE);
       const temp = vscode.Uri.joinPath(location.directory, `.current-chat-${randomUUID()}.tmp`);
       await vscode.workspace.fs.createDirectory(location.directory);
       if (!this.isCurrentChatSave(location, generation)) return;
@@ -592,7 +625,9 @@ export class HarnessController {
     this.log.warn(`could not save chat: ${String(error)}`);
     if (!this.saveErrorNotified) {
       this.saveErrorNotified = true;
-      void vscode.window.showWarningMessage('Coding Harness could not save the current chat. See the Coding Harness log for details.');
+      void vscode.window.showWarningMessage(error instanceof Error && error.message === CHAT_STORAGE_LIMIT_MESSAGE
+        ? `Coding Harness could not save the current chat. ${CHAT_STORAGE_LIMIT_MESSAGE}`
+        : 'Coding Harness could not save the current chat. See the Coding Harness log for details.');
     }
   }
 
@@ -887,6 +922,8 @@ export class HarnessController {
 
     if (!this.session || !this.host || this.host.workspaceRoot !== root) {
       const history = this.session?.conversationSnapshot ?? this.restoredHistory;
+      const original = this.session?.originalConversationSnapshot ?? this.restoredOriginalHistory;
+      const originalComplete = this.session?.isOriginalConversationComplete ?? this.restoredOriginalComplete;
       this.host = new VsCodeHost({ root, log: this.log, approvals: this.approvals });
       this.session = new HarnessSession({
         host: this.host,
@@ -895,8 +932,10 @@ export class HarnessController {
         registry: toolRegistry,
         agentSelection: this.agentSelection,
       });
-      this.session.restoreConversation(history, this.cumulativeUsage);
+      this.session.restoreConversation(history, this.cumulativeUsage, original, originalComplete);
       this.restoredHistory = [];
+      this.restoredOriginalHistory = [];
+      this.restoredOriginalComplete = true;
       this.log.info(`session created for ${root} using ${provider.label} with ${toolRegistry.size} tools`);
     } else {
       this.session.updateConfig(config);
@@ -906,6 +945,8 @@ export class HarnessController {
       if (toolRegistry && toolRegistry.size !== this.session.toolNames.length) {
         this.host = new VsCodeHost({ root, log: this.log, approvals: this.approvals });
         const oldHistory = this.session.transcript;
+        const oldOriginal = this.session.originalConversationSnapshot;
+        const oldOriginalComplete = this.session.isOriginalConversationComplete;
         this.session = new HarnessSession({
           host: this.host,
           config,
@@ -913,7 +954,7 @@ export class HarnessController {
           registry: toolRegistry,
           agentSelection: this.agentSelection,
         });
-        this.session.restoreConversation(oldHistory, this.cumulativeUsage);
+        this.session.restoreConversation(oldHistory, this.cumulativeUsage, oldOriginal, oldOriginalComplete);
         this.log.info(`session recreated with ${toolRegistry.size} tools (MCP updated)`);
       }
     }
@@ -1133,6 +1174,8 @@ export class HarnessController {
     }
     this.session?.reset();
     this.restoredHistory = [];
+    this.restoredOriginalHistory = [];
+    this.restoredOriginalComplete = true;
     this.approvals.forgetAll();
     this.cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
     this.lastTokensPerSecond = 0;
@@ -1251,6 +1294,8 @@ export class HarnessController {
       if (this.session && this.host) {
         const registry = new ToolRegistry([...createDefaultTools(), ...(this.mcpManager?.getTools() ?? [])]);
         const oldHistory = this.session.transcript;
+        const oldOriginal = this.session.originalConversationSnapshot;
+        const oldOriginalComplete = this.session.isOriginalConversationComplete;
         this.session = new HarnessSession({
           host: this.host,
           config,
@@ -1258,7 +1303,7 @@ export class HarnessController {
           registry,
           agentSelection: this.agentSelection,
         });
-        this.session.restoreConversation(oldHistory, this.cumulativeUsage);
+        this.session.restoreConversation(oldHistory, this.cumulativeUsage, oldOriginal, oldOriginalComplete);
         this.state = { ...this.state, toolCount: registry.size };
         this.post({ type: 'state', state: this.state });
       }
@@ -1366,6 +1411,8 @@ export class HarnessController {
         const config = this.readConfig();
         const registry = new ToolRegistry(createDefaultTools());
         const oldHistory = this.session.transcript;
+        const oldOriginal = this.session.originalConversationSnapshot;
+        const oldOriginalComplete = this.session.isOriginalConversationComplete;
         this.session = new HarnessSession({
           host: this.host,
           config,
@@ -1373,7 +1420,7 @@ export class HarnessController {
           registry,
           agentSelection: this.agentSelection,
         });
-        this.session.restoreConversation(oldHistory, this.cumulativeUsage);
+        this.session.restoreConversation(oldHistory, this.cumulativeUsage, oldOriginal, oldOriginalComplete);
         this.state = { ...this.state, toolCount: registry.size };
         this.post({ type: 'state', state: this.state });
       }

@@ -157,6 +157,10 @@ function registerCommands(
       await controller.compactHistory();
     }),
 
+    vscode.commands.registerCommand('codingHarness.showChatStorageLocation', async () => {
+      await controller.showChatStorageLocation();
+    }),
+
     vscode.commands.registerCommand('codingHarness.exportChat', async () => {
       await controller.exportChat();
     }),

@@ -3,8 +3,8 @@ import type { ToolSpec } from './types';
 
 /** Built-in group names used in agent-file `tools` metadata. */
 const GROUPS: Record<string, readonly string[]> = {
-  read: ['list_files', 'read_file', 'get_diagnostics', 'open_file'],
-  search: ['list_files', 'search_text'],
+  read: ['list_files', 'read_file', 'get_diagnostics', 'open_file', 'search_conversation', 'read_conversation'],
+  search: ['list_files', 'search_text', 'search_conversation'],
   edit: ['create_file', 'write_file', 'replace_in_file', 'delete_file'],
   execute: ['run_command'],
 };
@@ -14,7 +14,7 @@ const GROUPS: Record<string, readonly string[]> = {
  * metadata is neutral for backward compatibility. Never interpret prose as a
  * security policy; malformed, unknown or incomplete metadata fails closed.
  */
-export function resolveAgentToolPolicy(selected: SelectedAgentFiles, available: readonly ToolSpec[]): {
+export function resolveAgentToolPolicy(selected: SelectedAgentFiles, available: readonly ToolSpec[], archiveTools: ReadonlySet<string> = new Set()): {
   tools: ToolSpec[];
   restricted: boolean;
 } {
@@ -35,7 +35,11 @@ export function resolveAgentToolPolicy(selected: SelectedAgentFiles, available: 
       if (entry === 'mcp') {
         for (const name of names) if (name.startsWith('mcp_')) current.add(name);
       } else if (Object.prototype.hasOwnProperty.call(GROUPS, entry)) {
-        for (const name of GROUPS[entry]) if (names.has(name)) current.add(name);
+        for (const name of GROUPS[entry]) {
+          // A custom tool with a reserved helper name is not implicitly granted.
+          if ((name === 'search_conversation' || name === 'read_conversation') && !archiveTools.has(name)) continue;
+          if (names.has(name)) current.add(name);
+        }
       } else if (names.has(entry)) {
         current.add(entry);
       } else {

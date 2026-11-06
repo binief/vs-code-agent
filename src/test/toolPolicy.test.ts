@@ -91,7 +91,7 @@ test('only allowed tools reach the provider, and invented denied calls never exe
     const result = await session.runTask('Review.', () => {});
     assert.equal(result.outcome, 'complete');
     assert.deepEqual(executed, ['read_file']);
-    assert.deepEqual(seen[0].tools.map((tool) => tool.name), ['list_files', 'read_file', 'search_text', 'get_diagnostics', 'open_file']);
+    assert.deepEqual(seen[0].tools.map((tool) => tool.name), ['list_files', 'read_file', 'search_text', 'get_diagnostics', 'open_file', 'search_conversation', 'read_conversation']);
     const system = seen[0].messages.find((message) => message.role === 'system')?.content ?? '';
     assert.doesNotMatch(system, /`replace_in_file`/);
     assert.ok(isTranscriptWellFormed(seen[1].messages));

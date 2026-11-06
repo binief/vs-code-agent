@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { after, test } from 'node:test';
 import { HarnessSession, parseToolArguments } from '../core/agent';
 import { CheckpointStore, diffPreview } from '../core/checkpoints';
-import { applyEol, detectEol, NATIVE_EOL, normalizeEol, resolveEol } from '../core/lineEndings';
+import { applyEol, detectEol, NATIVE_EOL, normalizeEol, replaceNormalizedPreservingEol, resolveEol } from '../core/lineEndings';
 import { globToRegExp, matchesGlob, resolveWorkspacePath, PathError } from '../core/paths';
 import { evaluateCommand } from '../core/policy';
 import { MockPlannerProvider } from '../core/providers/mock';
@@ -603,4 +603,227 @@ test('a pinned agent selection decides which instructions reach the model', asyn
   assert.match(third, /root rules/);
   assert.match(third, /review rules/);
   assert.doesNotMatch(third, /pinned this selection/);
+});
+
+test('replace preserves untouched mixed endings, Unicode and BOM; uses local endings for inserted lines', async () => {
+  const original = '\uFEFF😀 top\r\nfirst\nneedle\rsecond\r\nlast\n';
+  const root = makeTempWorkspace({ 'mixed.txt': original });
+  const ctx = makeContext(root, new FakeHost(root));
+  const result = await replaceInFileTool.run({ path: 'mixed.txt', old_text: 'needle\nsecond', new_text: 'one\ntwo' }, ctx);
+  assert.equal(result.ok, true);
+  assert.match(result.content, /Mixed line endings/);
+  assert.equal(fs.readFileSync(path.join(root, 'mixed.txt'), 'utf8'), '\uFEFF😀 top\r\nfirst\none\rtwo\r\nlast\n');
+});
+
+test('multiple replacements preserve each location, final newline, and ambiguity safeguards', async () => {
+  const original = 'a\r\nX\r\nb\nX\nc\rX\rend';
+  const root = makeTempWorkspace({ 'mixed.txt': original });
+  const ctx = makeContext(root, new FakeHost(root));
+  const ambiguous = await replaceInFileTool.run({ path: 'mixed.txt', old_text: 'X', new_text: 'foo\nbar' }, ctx);
+  assert.equal(ambiguous.ok, false);
+  assert.equal(fs.readFileSync(path.join(root, 'mixed.txt'), 'utf8'), original);
+  const result = await replaceInFileTool.run({ path: 'mixed.txt', old_text: 'X', new_text: 'foo\nbar', count: -1 }, ctx);
+  assert.equal(result.ok, true);
+  assert.equal(fs.readFileSync(path.join(root, 'mixed.txt'), 'utf8'), 'a\r\nfoo\r\nbar\r\nb\nfoo\nbar\nc\rfoo\rbar\rend');
+});
+
+test('append auto preserves existing mixed endings; explicit replacement override normalizes file', async () => {
+  const root = makeTempWorkspace({ 'mixed.txt': 'a\r\nb\nc\r', 'forced.txt': 'a\r\nb\nc\r' });
+  const ctx = makeContext(root, new FakeHost(root));
+  const append = await writeFileTool.run({ path: 'mixed.txt', content: 'd\ne', mode: 'append' }, ctx);
+  assert.equal(append.ok, true);
+  assert.equal(fs.readFileSync(path.join(root, 'mixed.txt'), 'utf8'), 'a\r\nb\nc\rd\r\ne');
+  const force = await replaceInFileTool.run({ path: 'forced.txt', old_text: 'b', new_text: 'B' }, makeContext(root, new FakeHost(root), { lineEndings: 'lf' }));
+  assert.equal(force.ok, true);
+  assert.equal(fs.readFileSync(path.join(root, 'forced.txt'), 'utf8'), 'a\nB\nc\n');
+});
+
+test('replace rejects invalid UTF-8 and files changed while awaiting approval', async () => {
+  const root = makeTempWorkspace({ 'bad.bin': 'a', 'race.txt': 'old\r\n' });
+  const invalid = Buffer.from([0x61, 0xff, 0x0a]);
+  fs.writeFileSync(path.join(root, 'bad.bin'), invalid);
+  const bad = await replaceInFileTool.run({ path: 'bad.bin', old_text: 'a', new_text: 'x' }, makeContext(root, new FakeHost(root)));
+  assert.equal(bad.ok, false);
+  assert.match(bad.content, /not valid UTF-8/);
+  assert.deepEqual(fs.readFileSync(path.join(root, 'bad.bin')), invalid);
+  const host = new FakeHost(root, { onApproval() { fs.writeFileSync(path.join(root, 'race.txt'), 'user changed\r\n'); } });
+  const race = await replaceInFileTool.run({ path: 'race.txt', old_text: 'old', new_text: 'new' }, makeContext(root, host));
+  assert.equal(race.ok, false);
+  assert.match(race.content, /changed since/);
+  assert.equal(fs.readFileSync(path.join(root, 'race.txt'), 'utf8'), 'user changed\r\n');
+});
+
+test('search behaves identically across LF, CRLF, CR and mixed line endings', async () => {
+  const root = makeTempWorkspace({ 'lf.txt': 'one\nborder-radius: 12px\nlast\n', 'crlf.txt': 'one\r\nborder-radius: 12px\r\nlast\r\n', 'cr.txt': 'one\rborder-radius: 12px\rlast\r', 'mixed.txt': 'one\r\nborder-radius: 12px\nlast\r' });
+  const ctx = makeContext(root, new FakeHost(root));
+  const result = await searchTextTool.run({ query: 'border-radius:\\s+\\d+px', is_regex: true }, ctx);
+  assert.equal(result.ok, true);
+  for (const file of ['lf.txt', 'crlf.txt', 'cr.txt', 'mixed.txt']) assert.match(result.content, new RegExp(`${file}:2: border-radius`));
+  assert.match(result.content, /line-by-line; JavaScript regex; line endings normalized to LF/);
+});
+
+test('multiline search supports normalized literal and regex matches and remains opt-in', async () => {
+  const root = makeTempWorkspace({ 'sample.txt': 'alpha\r\nbeta\rgamma\nlast' });
+  const ctx = makeContext(root, new FakeHost(root));
+  const regular = await searchTextTool.run({ path: 'sample.txt', query: 'alpha\\s+beta', is_regex: true }, ctx);
+  assert.match(regular.content, /No matches/);
+  const multi = await searchTextTool.run({ path: 'sample.txt', query: '^alpha\\s+beta\\s+gamma$', is_regex: true, multiline: true, context_lines: 1 }, ctx);
+  assert.match(multi.content, /sample.txt:1: alpha/);
+  assert.match(multi.content, /sample.txt:2: beta/);
+  assert.match(multi.content, /sample.txt:3: gamma/);
+  assert.match(multi.content, /sample.txt-4- last/);
+  assert.match(multi.content, /multiline; JavaScript regex/);
+  const literal = await searchTextTool.run({ path: 'sample.txt', query: 'alpha\r\nbeta\rgamma', multiline: true }, ctx);
+  assert.match(literal.content, /1 match\(es\)/);
+  const noDotAll = await searchTextTool.run({ path: 'sample.txt', query: 'alpha.*beta', is_regex: true, multiline: true }, ctx);
+  assert.match(noDotAll.content, /No matches/);
+  const emptyMatches = await searchTextTool.run({ path: 'sample.txt', query: '^', is_regex: true, multiline: true, max_results: 3 }, ctx);
+  assert.match(emptyMatches.content, /3\+ match\(es\)/);
+  assert.match(emptyMatches.content, /Stopped at the 3-match limit/);
+});
+
+test('search explains skipped files, binary files, output limits and invalid regex', async () => {
+  const root = makeTempWorkspace({ '.hidden.txt': 'needle', 'big.txt': 'needle' + 'x'.repeat(100), 'small.txt': 'needle\nneedle\n', 'binary.txt': 'needle\u0000' });
+  const ctx = makeContext(root, new FakeHost(root), { maxFileBytes: 40 });
+  const result = await searchTextTool.run({ query: 'needle', max_results: 1 }, ctx);
+  assert.match(result.content, /skipped by filters/);
+  assert.match(result.content, /binary file\(s\) skipped/);
+  assert.match(result.content, /Stopped at the 1-match limit/);
+  const tooLarge = await searchTextTool.run({ query: 'needle', path: 'big.txt' }, ctx);
+  assert.match(tooLarge.content, /specified file exceeds the 40-byte file size limit/);
+  const malformed = await searchTextTool.run({ query: '[', is_regex: true }, ctx);
+  assert.equal(malformed.ok, false);
+  assert.match(malformed.content, /Invalid regular expression/);
+  const manyLines = makeTempWorkspace({ 'many.txt': Array(35).fill('x').join('\n') });
+  const clipped = await searchTextTool.run({ query: 'x[\\s\\S]*x', is_regex: true, multiline: true }, makeContext(manyLines, new FakeHost(manyLines)));
+  assert.match(clipped.content, /Some matching or context lines were omitted/);
+});
+
+test('search reports depth limits, non-UTF-8 files, context and cancellation', async () => {
+  const deep = Array(14).fill('dir').join('/') + '/hidden.txt';
+  const root = makeTempWorkspace({ [deep]: 'needle', 'context.txt': 'before\r\nneedle\nafter\r' });
+  fs.writeFileSync(path.join(root, 'encoded.txt'), Buffer.from([0x6e, 0xff, 0x0a]));
+  const ctx = makeContext(root, new FakeHost(root));
+  const result = await searchTextTool.run({ query: 'needle', context_lines: 1 }, ctx);
+  assert.match(result.content, /context.txt-1- before/);
+  assert.match(result.content, /context.txt:2: needle/);
+  assert.match(result.content, /context.txt-3- after/);
+  assert.match(result.content, /depth limit \(12\)/);
+  assert.match(result.content, /non-UTF-8 file\(s\) skipped/);
+  const controller = new AbortController();
+  controller.abort();
+  const cancelled = await searchTextTool.run({ query: 'needle' }, { ...ctx, signal: controller.signal });
+  assert.match(cancelled.content, /Search was cancelled/);
+});
+
+test('append rejects non-UTF-8 files and writes do not overwrite approval-time changes', async () => {
+  const root = makeTempWorkspace({ 'bad.txt': 'ok', 'race.txt': 'original' });
+  const bytes = Buffer.from([0x66, 0xff]);
+  fs.writeFileSync(path.join(root, 'bad.txt'), bytes);
+  const bad = await writeFileTool.run({ path: 'bad.txt', content: 'x', mode: 'append' }, makeContext(root, new FakeHost(root)));
+  assert.equal(bad.ok, false);
+  assert.deepEqual(fs.readFileSync(path.join(root, 'bad.txt')), bytes);
+  const host = new FakeHost(root, { onApproval() { fs.writeFileSync(path.join(root, 'race.txt'), 'user changed'); } });
+  const race = await writeFileTool.run({ path: 'race.txt', content: 'agent' }, makeContext(root, host));
+  assert.equal(race.ok, false);
+  assert.match(race.content, /changed since/);
+  assert.equal(fs.readFileSync(path.join(root, 'race.txt'), 'utf8'), 'user changed');
+});
+
+test('search skip diagnostics separate hidden, ignored, glob, and oversized entries', async () => {
+  const root = makeTempWorkspace({ '.hidden.txt': 'x', 'node_modules/skip.txt': 'x', 'small.md': 'x', 'large.txt': 'x'.repeat(100), 'find.txt': 'x' });
+  const result = await searchTextTool.run({ query: 'x', glob: '*.txt' }, makeContext(root, new FakeHost(root), { maxFileBytes: 40 }));
+  assert.match(result.content, /1 hidden, 1 ignored directories, 1 glob, 1 oversized/);
+  assert.match(result.content, /find.txt:1:/);
+});
+
+test('read_file refuses non-UTF-8 bytes rather than reporting replacement characters', async () => {
+  const root = makeTempWorkspace({ 'bad.txt': 'placeholder' });
+  const bytes = Buffer.from([0x61, 0xff, 0x0a]);
+  fs.writeFileSync(path.join(root, 'bad.txt'), bytes);
+  const result = await readFileTool.run({ path: 'bad.txt' }, makeContext(root, new FakeHost(root)));
+  assert.equal(result.ok, false);
+  assert.match(result.content, /not valid UTF-8/);
+  assert.deepEqual(fs.readFileSync(path.join(root, 'bad.txt')), bytes);
+});
+
+test('normalized match offsets map back to untouched mixed-ending text', () => {
+  let seed = 1234567;
+  const random = (max: number): number => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed % max; };
+  const atoms = ['x', 'A', '😀', '\uFEFF', '\r\n', '\n', '\r', '\t'];
+  for (let trial = 0; trial < 300; trial++) {
+    let original = '';
+    for (let i = 0; i < 30; i++) original += atoms[random(atoms.length)];
+    const normalized = normalizeEol(original);
+    // Independent reference map: one raw offset per UTF-16 boundary.
+    const map = [0];
+    let logical = '';
+    for (let i = 0; i < original.length;) {
+      if (original[i] === '\r' && original[i + 1] === '\n') { logical += '\n'; i += 2; }
+      else { logical += original[i] === '\r' ? '\n' : original[i]; i++; }
+      map.push(i);
+    }
+    assert.equal(logical, normalized);
+    const start = random(normalized.length - 1);
+    const needle = normalized.slice(start, Math.min(normalized.length, start + 1 + random(5)));
+    let rawCursor = 0;
+    let logicalCursor = 0;
+    let expected = '';
+    for (let count = 0; count < 3; count++) {
+      const index = normalized.indexOf(needle, logicalCursor);
+      if (index < 0) break;
+      expected += original.slice(rawCursor, map[index]) + 'Z';
+      rawCursor = map[index + needle.length];
+      logicalCursor = index + needle.length;
+    }
+    expected += original.slice(rawCursor);
+    assert.equal(replaceNormalizedPreservingEol(original, needle, 'Z', 3), expected);
+  }
+});
+
+test('search reports the directory traversal entry limit', async () => {
+  const root = makeTempWorkspace();
+  for (let i = 0; i < 6002; i++) fs.writeFileSync(path.join(root, `${String(i).padStart(4, '0')}.txt`), 'x');
+  const result = await searchTextTool.run({ query: 'not present' }, makeContext(root, new FakeHost(root)));
+  assert.match(result.content, /No matches/);
+  assert.match(result.content, /6000-entry limit; results may be incomplete/);
+});
+
+test('text tools reject unpaired surrogates instead of corrupting Unicode', async () => {
+  const root = makeTempWorkspace({ 'unicode.txt': '😀\r\nuntouched' });
+  const ctx = makeContext(root, new FakeHost(root));
+  const badOld = await replaceInFileTool.run({ path: 'unicode.txt', old_text: '\uD83D', new_text: 'x' }, ctx);
+  const badNew = await replaceInFileTool.run({ path: 'unicode.txt', old_text: '😀', new_text: '\uDE00' }, ctx);
+  const badWrite = await writeFileTool.run({ path: 'unicode.txt', content: '\uD83D' }, ctx);
+  for (const result of [badOld, badNew, badWrite]) {
+    assert.equal(result.ok, false);
+    assert.match(result.content, /well-formed Unicode/);
+  }
+  assert.equal(fs.readFileSync(path.join(root, 'unicode.txt'), 'utf8'), '😀\r\nuntouched');
+});
+
+test('read_file paginates long Unicode lines without losing text and reports continuation', async () => {
+  const line = '😀éZ'.repeat(700);
+  const root = makeTempWorkspace({ 'long.txt': `${line}\r\nnext\r\n` });
+  const ctx = { ...makeContext(root, new FakeHost(root)), outputTokenBudget: 256 };
+  let startLine = 1;
+  let startColumn = 1;
+  let reconstructed = '';
+  let pages = 0;
+  while (startLine === 1) {
+    const result = await readFileTool.run({ path: 'long.txt', start_line: startLine, start_column: startColumn, end_line: 1 }, ctx);
+    assert.equal(result.ok, true);
+    const lineText = result.content.split('\n')[1].replace(/^\s*1\| /, '');
+    reconstructed += lineText;
+    pages++;
+    startLine = Number(result.meta?.nextLine ?? 2);
+    startColumn = Number(result.meta?.nextColumn ?? 1);
+    assert.ok(pages < 100);
+  }
+  assert.ok(pages > 1);
+  assert.equal(reconstructed, line);
+  assert.equal(startLine, 2);
+  const next = await readFileTool.run({ path: 'long.txt', start_line: startLine, start_column: startColumn }, ctx);
+  assert.match(next.content, /2\| next/);
+  assert.equal(fs.readFileSync(path.join(root, 'long.txt'), 'utf8'), `${line}\r\nnext\r\n`);
 });
