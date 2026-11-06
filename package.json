@@ -39,6 +39,7 @@
     "onCommand:codingHarness.showLog",
     "onCommand:codingHarness.askAboutSelection",
     "onCommand:codingHarness.compactConversation",
+    "onCommand:codingHarness.showChatStorageLocation",
     "onCommand:codingHarness.exportChat",
     "onCommand:codingHarness.importChat",
     "onCommand:codingHarness.reloadMcpServers",
@@ -102,6 +103,10 @@
         "command": "codingHarness.compactConversation",
         "title": "Coding Harness: Compact Conversation",
         "icon": "$(compress)"
+      },
+      {
+        "command": "codingHarness.showChatStorageLocation",
+        "title": "Coding Harness: Show Chat Storage Location"
       },
       {
         "command": "codingHarness.exportChat",
@@ -465,7 +470,7 @@
           "default": 0.75,
           "minimum": 0.1,
           "maximum": 0.95,
-          "markdownDescription": "Context utilization threshold (0-1) at which auto-compaction triggers. 0.75 = compact when 75% of context window is used."
+          "markdownDescription": "Context utilization target (0-1); auto-compaction starts earlier to reserve space for tool results."
         },
         "codingHarness.compaction.contextWindowTokens": {
           "type": "number",
@@ -478,12 +483,12 @@
           "default": 10,
           "minimum": 2,
           "maximum": 50,
-          "markdownDescription": "Number of recent messages to keep uncompacted when compaction occurs."
+          "markdownDescription": "Preferred number of recent messages to keep intact; may be reduced to meet the context budget."
         },
         "codingHarness.compaction.summaryModel": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Optional model on the configured provider to summarize older conversation messages. Empty uses the current model. Summarization makes an additional API request."
+          "markdownDescription": "Optional model on the configured provider to summarize older conversation messages. Empty uses the current model. Summarization may make multiple additional API requests."
         }
       }
     }

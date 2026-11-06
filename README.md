@@ -223,15 +223,17 @@ Review the code and report findings without modifying files.
 ```
 
 The list is enforced both when presenting tools to the model and when executing its calls. Available
-groups are `read` (`list_files`, `read_file`, `get_diagnostics`, `open_file`), `search` (`list_files`,
-`search_text`), `edit` (`create_file`, `write_file`, `replace_in_file`, `delete_file`), `execute`
+groups are `read` (`list_files`, `read_file`, `get_diagnostics`, `open_file`, `search_conversation`,
+`read_conversation`), `search` (`list_files`, `search_text`, `search_conversation`), `edit` (`create_file`, `write_file`, `replace_in_file`, `delete_file`), `execute`
 (`run_command`), and `mcp` (all registered `mcp_` tools). You may instead name an exact registered
-tool. Groups without any currently registered tools permit none. `tools: []` permits no tools.
+tool or either conversation helper. Groups without any currently registered tools permit none. `tools: []` permits no tools.
 
 When several selected files declare `tools`, their permissions intersect, even for files whose
 instructions have a narrower directory scope: the policy applies to the whole task. A file with no
 `tools` declaration imposes no additional restriction, preserving older configurations; if none
-have one, all registered tools remain available. Agent files are reloaded for each task. Unknown or
+have one, all registered tools remain available. A temporary `read_tool_output` helper is exposed only
+when an allowed tool has produced a cached paged result; it can access only this task’s cached output
+and cannot invoke the original tool again. Agent files are reloaded for each task. Unknown or
 malformed tool metadata, truncated selected files, missing pins, and skipped files in the default
 all-files mode stop the task rather than silently grant access.
 
@@ -280,7 +282,7 @@ when compacting history.
 | --- | --- | --- |
 | `list_files` | List files/dirs, glob filters, skips `node_modules`, `dist`, `.git`, … | never |
 | `read_file` | Line-numbered reads (slices, size/binary guards, directory listing); displays CRLF/CR files as LF | never |
-| `search_text` | Ripgrep-style content search with `path:line:` results | never |
+| `search_text` | Text/JavaScript-regex search with `path:line:` results, optional multiline matching and skip/limit diagnostics | never |
 | `create_file` | Create a new file; fails if the path already exists | per `editPolicy` |
 | `write_file` | Overwrite or append a whole file; preserves existing line endings | per `editPolicy` |
 | `replace_in_file` | Exact-snippet replacement with line-ending-aware matching; preserves the file style | per `editPolicy` |
@@ -289,6 +291,18 @@ when compacting history.
 | `get_diagnostics` | Current errors/warnings from the editor's language servers | never |
 | `open_file` | Reveal a file/line in the editor | never |
 
+`read_file` returns budget-aware pages rather than silently clipping a long line. When a result says
+`next_line` and `next_column`, call `read_file` again with those values as `start_line` and
+`start_column` (columns count Unicode code points). The per-file `codingHarness.maxFileBytes` limit
+still applies even to a slice. Files can change between page requests.
+
+Oversized results from other tools are paged to fit the approximate context budget. When possible,
+`read_tool_output` retrieves the rest by its `result_id` and `next_offset` (UTF-16 offsets), without
+re-executing the original tool. This helper is available only during that task; the in-memory cache is
+cleared at task end and is not restored with saved chats. The cache is limited to 16 MiB per task; if
+it cannot retain output, the panel and result explicitly warn that the remainder is unavailable.
+Tools can also apply their own output limits before the harness sees their result.
+
 Every write shows a diff — inline in the chat card and, on request, in VS Code's native diff editor.
 
 Tools from MCP servers join this set, prefixed `mcp_<server>_<tool>` (see
@@ -296,16 +310,45 @@ Tools from MCP servers join this set, prefixed `mcp_<server>_<tool>` (see
 
 ### Cross-platform line endings
 
-The file tools use a canonical LF representation for model matching and display. A CRLF or CR file
-can therefore be edited with the LF snippet returned by `read_file`; `replace_in_file` accepts either
-LF or CRLF or CR in `old_text` and writes the replacement back using the file's dominant existing
-style. `write_file` also preserves the existing style when overwriting or appending. New files use the
-host OS style by default. Use `codingHarness.lineEndings` to force `lf`, `crlf`, `cr`, or `native`
-when a project requires a specific format.
+The file tools read UTF-8 from disk and use a canonical LF representation for matching and display.
+With `codingHarness.lineEndings: auto`, `replace_in_file` matches regardless of LF, CRLF or CR and
+preserves all text outside each replacement, including mixed line endings. Newlines inside replacement
+text use the first existing line ending at or after the match (or the preceding one, or the native
+style if the file has none). Append preserves existing mixed endings and uses the dominant style for
+new text. A full `write_file` overwrite replaces the entire body and uses the dominant existing style;
+new files use the host OS style. Explicit `lf`, `crlf`, `cr`, or `native` settings normalize the whole
+written file intentionally.
 
-By default, `replace_in_file` requires a unique match and makes no changes if the snippet occurs
-more than once. Include surrounding lines to identify the intended location. To replace multiple
-matches deliberately, pass `count` as a positive integer (the first N matches) or `-1` (all matches).
+`replace_in_file` still requires exact text (apart from line-ending normalization) and a unique match
+by default; ambiguous snippets are rejected unless `count` explicitly specifies the first N or `-1`
+for all. Text edits and appends reject invalid UTF-8 rather than silently corrupting bytes. Writes
+are refused if the file changed while awaiting approval. The VS Code host also refuses to overwrite an
+open document with unsaved changes. Save it before using these tools; reads and searches see disk, not
+unsaved editor contents.
+
+VS Code text edits and save-time formatters can alter line endings or other text. Replacements and
+appends therefore write directly to disk. So do mixed/CR-only or BOM content, newly created files,
+and writes where the editor's line ending or encoding differs from the requested UTF-8 content
+(or its encoding cannot be determined). Such writes bypass the editor's text undo stack; the harness checkpoint/revert
+still applies. Shell commands and MCP tools use their own file and line-ending behavior.
+
+### Text search
+
+`search_text` defaults to a line-by-line search. Set `is_regex: true` for JavaScript regular
+expressions. Set `multiline: true` to search the entire LF-normalized file and allow matches across
+lines; in this mode `^` and `$` match line boundaries, while `.` does not match newlines. For example,
+`border-radius:\s+12px` searches whitespace within a line, and `first\s+second` with multiline enabled
+can match across a line break. Regex patterns see LF rather than CRLF; use `\n` rather than `\r\n`
+for a line break. `context_lines` includes surrounding lines. Default mode counts matching lines;
+multiline mode counts matches.
+
+Results report search mode, skipped entries by reason, unreadable/binary/non-UTF-8 files, directory
+traversal limits, cancellation, and clipped output. Directory searches skip hidden and ignored paths
+and apply the glob and file-size filters; direct file searches also enforce
+`codingHarness.maxFileBytes`. Traversal is limited to 12 directory levels and 6000 entries, and output
+is bounded. An empty result can therefore mean the relevant file was not scanned, not just that the
+pattern was absent. Regexes run with JavaScript's engine, not ripgrep's; complex expressions can be
+slow. Search and read tools do not inspect unsaved editor changes.
 
 ## MCP servers (Model Context Protocol)
 
@@ -468,9 +511,9 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.mcp.configFiles` | `[".vscode/mcp.json",".mcp.json","mcp.json"]` | Files scanned for servers |
 | `codingHarness.compaction.enabled` | `true` | Enable conversation compaction |
 | `codingHarness.compaction.autoCompact` | `true` | Compact automatically near the context limit |
-| `codingHarness.compaction.threshold` | `0.75` | Utilisation that triggers auto-compaction |
+| `codingHarness.compaction.threshold` | `0.75` | Utilisation target; auto-compaction starts earlier to reserve tool-result headroom |
 | `codingHarness.compaction.contextWindowTokens` | `128000` | Context window estimate for the meter |
-| `codingHarness.compaction.keepLastMessages` | `10` | Recent messages kept intact |
+| `codingHarness.compaction.keepLastMessages` | `10` | Preferred recent messages to keep; may be reduced under context pressure |
 | `codingHarness.compaction.summaryModel` | `""` | Optional model on the current provider for LLM summaries; empty uses the active model |
 
 ## Commands
@@ -518,18 +561,22 @@ error the provider will not accept twice. Everything that used to stop a task ea
   skipped because the task was cancelled — and `repairToolMessages()` drops any orphaned half before
   the list is sent. Providers reject a transcript with a dangling `tool_calls` entry, so one aborted
   turn used to make the *next* task fail with HTTP 400 before it could run a single tool.
-- **Compaction cuts on tool-call boundaries.** The kept tail never starts with a tool result whose
-  request was summarised away, the summary is a user turn (Anthropic rejects a conversation that
-  starts with the assistant), and a mid-task compaction rebuilds the prompt instead of splicing the
-  message list with the wrong length. Compaction sends older history to the configured provider for an
-  LLM summary, including during an active task. It incurs an additional API call and may lose details;
-  the original context is retained if summarization fails or produces no useful size reduction. A
-  context-limit rejection also triggers one compaction attempt and retry. The offline mock cannot
-  produce LLM summaries. Very large histories may still exceed the summarizer's own context limit.
-  Summary budgets are based on the older text being replaced; an oversized or incomplete first
-  summary is retried once with a shorter target. If both fail, the original history stays intact and
-  the warning remains: consider reducing `codingHarness.compaction.keepLastMessages`, choosing a
-  different `codingHarness.compaction.summaryModel`, or continuing until more old text is available.
+- **Compaction uses bounded LLM summaries.** It summarizes complete tool-call groups, choosing how
+  much history to compact against an estimated post-compaction budget rather than blindly keeping a
+  fixed number of messages. Under pressure even the latest complete group can be summarized. The
+  retained tail stays protocol-valid, and original images remain attached. Large history is split
+  into bounded requests and summaries may be summarized again. Image attachments may require separate
+  vision requests. Summary calls cost time and tokens, may lose detail, and are capped at 64 requests
+  per compaction; the active history is unchanged if any stage fails or is cancelled. The original
+  messages are also kept separately for optional retrieval, as described under Saved chats. The offline
+  mock cannot produce LLM summaries. A rejected summary input can be split further and retried.
+  Summary-model capacity is assumed to match `contextWindowTokens`; a smaller provider/model window,
+  image overhead, output reservations, huge fixed instructions or inaccurate estimates can still
+  prevent compaction. If this happens, choose a compatible summary model, lower the threshold, reduce
+  fixed context or start a new conversation.
+- **Tool results have headroom.** The harness estimates space for the current request, output and a
+  safety margin, and budgets tool results across each batch. Limits are approximate; especially large
+  batches, schema overhead or provider tokenization can still exceed the real context window.
 - **Context usage is an estimate.** The `ctx ~` meter includes estimated tool schemas and reserved
   output tokens, and uses reported input usage when available. Tokenizers, images, provider accounting,
   and model context sizes vary: set `codingHarness.compaction.contextWindowTokens` to the actual limit
@@ -589,7 +636,8 @@ balance, and colours come from theme variables only.
 By default, the current conversation is saved automatically in VS Code's **workspace-specific
 extension storage**, outside the project. Reopen the same folder or workspace after restarting VS Code
 to see it again and send a follow-up. Both the visible transcript and the model's conversation history
-are restored, including images and tool results; LLM compaction can still apply.
+are restored, including images and tool results; LLM compaction can still apply. Use **Coding Harness:
+Show Chat Storage Location** in the Command Palette to see and copy the exact path on the extension host.
 If VS Code closes during a task, the latest saved progress is shown as interrupted. Tools and approval
 requests are not restarted or applied automatically.
 
@@ -606,6 +654,34 @@ preferences:
   as needed, and files are named `coding-harness-chat-<workspace-id>.json` so workspaces using the
   same folder do not overwrite one another.
 
+#### Original conversation and retrieval
+
+The JSON file contains both compacted active `history` and a separate `originalHistory` of the
+recorded model-visible user, assistant and tool messages, tool-call arguments, and attached images.
+Compaction replaces only active history, so repeated compactions do not replace those original messages
+with summaries. Original messages are kept in memory even with automatic saving disabled. Reopening,
+importing, exporting and session recreation carry the original history as well as the active history.
+A new conversation clears both from the live chat and, if automatic saving is enabled, overwrites the
+current saved chat; exports and files in former save folders are not deleted.
+
+The original archive is **not** automatically sent to the model. The `search_conversation` tool finds
+literal text in the current conversation's original messages and tool-call arguments; `read_conversation`
+returns bounded pages of a selected message. Search work is bounded per call and returns `next_start_index` and `next_start_offset` when more
+messages or text remain; reads use UTF-16 `next_offset` values. The tools do not open other conversations or files. Image attachments are
+stored in the archive but the text reader reports only their count. Results are historical, untrusted
+content, and the model must choose to use the tools. Agent-file permissions apply: the `search` group
+allows archive search; `read` allows search and reading; individual helper names may be listed explicitly.
+An exact `read_file` or `search_text` permission alone does not grant either archive helper. The final
+step has no tools, as with other tools.
+
+The archive preserves the messages the harness recorded, **not** unseen data: outputs clipped inside a
+tool, unrequested pages, expired unpaged output, unsent reasoning or previously compacted-away messages
+cannot be reconstructed. Display-only reasoning remains in the visible transcript (which is capped at
+400 items), not in `originalHistory`. Existing old-format chats load normally, but their available
+history may already be incomplete; the extension records that limitation and shows a warning. Older
+extension versions may discard the new archive field when they save, so export a copy before downgrading.
+An interrupted autosave may likewise contain only the progress saved before the interruption.
+
 Changes take effect without restarting. Enabling saving or changing its folder saves the current chat
 at the selected destination, replacing that workspace's existing file there. It does not load or
 replace the live chat, and it leaves the previous destination's file in place. If the current chat
@@ -616,7 +692,10 @@ chat first if you need to keep it before replacing it.
 Use the **Export chat** and **Import chat** buttons in the panel header, or the corresponding commands
 in the Command Palette. Manual import and export work even when automatic saving is off. Export creates
 a versioned JSON file; import validates the file and asks for confirmation before replacing an
-existing chat. Finish or stop a running task before importing or exporting. Files are limited to 512 MB.
+existing chat. Finish or stop a running task before importing or exporting. Automatic saves and
+imports/exports are limited to 512 MB. If an automatic snapshot exceeds the limit, saving warns and
+leaves the previous file intact; start a new conversation to resume saving. An oversized chat also
+cannot be exported through the extension, so copy any unsaved details before resetting.
 **New conversation** clears the current saved chat when automatic saving is enabled, so export it first
 if you want to keep it. File-change checkpoints are not included in exports or restored after a restart.
 API credentials are stored separately in VS Code, not in chat archives; imported chats do not change

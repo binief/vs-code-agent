@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { matchesGlob, toPosix } from '../paths';
+import { isInside, matchesGlob, toPosix } from '../paths';
 
 /** Directories the tools refuse to walk into (build output, deps, VCS). */
 export const SKIP_DIRS = new Set([
@@ -54,12 +54,23 @@ export interface WalkOptions {
   signal?: AbortSignal;
 }
 
+export interface WalkSkipReasons {
+  hidden: number;
+  ignored: number;
+  glob: number;
+  oversized: number;
+  outsideSymlink: number;
+}
+
 export interface WalkResult {
   entries: WalkEntry[];
   truncated: boolean;
   /** Files that were visited but filtered out by glob / hidden / size rules. */
   skipped: number;
+  skipReasons: WalkSkipReasons;
   depthLimited: boolean;
+  /** Directories or entries that could not be accessed. */
+  inaccessible: number;
 }
 
 /**
@@ -85,6 +96,9 @@ export function walk(options: WalkOptions): WalkResult {
   let truncated = false;
   let skipped = 0;
   let depthLimited = false;
+  let inaccessible = 0;
+  const skipReasons: WalkSkipReasons = { hidden: 0, ignored: 0, glob: 0, oversized: 0, outsideSymlink: 0 };
+  const skip = (reason: keyof WalkSkipReasons): void => { skipped++; skipReasons[reason]++; };
 
   while (queue.length > 0) {
     if (signal?.aborted) break;
@@ -93,6 +107,7 @@ export function walk(options: WalkOptions): WalkResult {
     try {
       dirents = fs.readdirSync(dir, { withFileTypes: true });
     } catch {
+      inaccessible++;
       continue;
     }
     dirents.sort((a, b) => a.name.localeCompare(b.name));
@@ -105,37 +120,46 @@ export function walk(options: WalkOptions): WalkResult {
 
       if (d.isSymbolicLink()) {
         // Follow only if the link stays inside the workspace and points at a file.
-        const real = fs.realpathSync.native(abs);
-        const realRoot = fs.realpathSync.native(rootAbs);
-        if (!real.startsWith(realRoot)) continue;
-        const st = fs.statSync(abs);
+        let real: string;
+        let st: fs.Stats;
+        try {
+          real = fs.realpathSync.native(abs);
+          st = fs.statSync(abs);
+        } catch {
+          inaccessible++;
+          continue;
+        }
+        if (!isInside(fs.realpathSync.native(rootAbs), real)) { skip('outsideSymlink'); continue; }
         if (st.isDirectory()) {
+          if (!includeHidden && hidden) { skip('hidden'); continue; }
           if (depth + 1 <= maxDepth) queue.push({ dir: abs, depth: depth + 1 });
+          else depthLimited = true;
           continue;
         }
         if (!includeHidden && hidden) {
-          skipped++;
+          skip('hidden');
           continue;
         }
         if (maxFileBytes > 0 && st.size > maxFileBytes) {
-          skipped++;
+          skip('oversized');
           continue;
         }
         if (!matchesGlob(rel, glob)) {
-          skipped++;
+          skip('glob');
           continue;
         }
+        if (entries.length >= maxEntries) { truncated = true; continue; }
         entries.push({ abs, rel, isDirectory: false, size: st.size });
         continue;
       }
 
       if (d.isDirectory()) {
         if (SKIP_DIRS.has(d.name)) {
-          skipped++;
+          skip('ignored');
           continue;
         }
         if (!includeHidden && hidden) {
-          skipped++;
+          skip('hidden');
           continue;
         }
         if (depth + 1 > maxDepth) {
@@ -153,21 +177,22 @@ export function walk(options: WalkOptions): WalkResult {
 
       if (!d.isFile()) continue;
       if (!includeHidden && hidden) {
-        skipped++;
+        skip('hidden');
         continue;
       }
       let size = 0;
       try {
         size = fs.statSync(abs).size;
       } catch {
+        inaccessible++;
         continue;
       }
       if (maxFileBytes > 0 && size > maxFileBytes) {
-        skipped++;
+        skip('oversized');
         continue;
       }
       if (!matchesGlob(rel, glob)) {
-        skipped++;
+        skip('glob');
         continue;
       }
       if (entries.length >= maxEntries) {
@@ -178,15 +203,19 @@ export function walk(options: WalkOptions): WalkResult {
     }
   }
 
-  return { entries, truncated, skipped, depthLimited };
+  return { entries, truncated, skipped, skipReasons, depthLimited, inaccessible };
 }
 
 /** Files only (used by the text search tool). */
-export function walkFiles(options: WalkOptions): { files: WalkEntry[]; truncated: boolean; scanned: number } {
+export function walkFiles(options: WalkOptions): { files: WalkEntry[]; truncated: boolean; scanned: number; skipped: number; skipReasons: WalkSkipReasons; depthLimited: boolean; inaccessible: number } {
   const res = walk(options);
   return {
     files: res.entries.filter((e) => !e.isDirectory),
     truncated: res.truncated,
     scanned: res.entries.length,
+    skipped: res.skipped,
+    skipReasons: res.skipReasons,
+    depthLimited: res.depthLimited,
+    inaccessible: res.inaccessible,
   };
 }

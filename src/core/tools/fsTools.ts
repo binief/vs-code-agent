@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { diffPreview, readIfExists } from '../checkpoints';
-import { applyEol, detectEol, eolName, normalizeEol, resolveEol } from '../lineEndings';
+import { applyEol, detectEol, eolName, hasMixedEol, isWellFormedText, normalizeEol, replaceNormalizedPreservingEol, resolveEol } from '../lineEndings';
 import { ensureDir, fileSize, formatBytes, looksBinary, resolveWorkspacePath, toPosix } from '../paths';
 import { fail, ok, type Tool, type ToolContext, type ToolResult } from '../types';
 import { walk } from './walk';
@@ -95,18 +95,20 @@ export const listFilesTool: Tool<{
 export const readFileTool: Tool<{
   path: string;
   start_line?: number;
+  start_column?: number;
   end_line?: number;
   max_lines?: number;
 }> = {
   name: 'read_file',
   description:
     'Read a text file (line-numbered) or list a directory. Line endings are shown as LF so snippets match on ' +
-    'Windows and Unix. Supports start_line/end_line for reading a slice of a large file.',
+    'Windows and Unix. Paged results report next_line and next_column; start_column counts Unicode code points.',
   parameters: {
     type: 'object',
     properties: {
       path: { type: 'string', description: 'File path, workspace-relative (relative paths are preferred).' },
       start_line: { type: 'number', description: 'First line to return (1-based, inclusive).' },
+      start_column: { type: 'number', description: 'First Unicode code point on start_line (1-based); use with the next_line/next_column continuation.' },
       end_line: { type: 'number', description: 'Last line to return (1-based, inclusive).' },
       max_lines: { type: 'number', description: `Cap on returned lines. Default ${MAX_READ_LINES}.` },
     },
@@ -134,7 +136,7 @@ export const readFileTool: Tool<{
     if (size > maxBytes(ctx)) {
       return fail(
         `"${target.rel}" is ${formatBytes(size)}, larger than the ${formatBytes(maxBytes(ctx))} tool limit. ` +
-          'Use read_file with start_line/end_line, or search_text to locate the relevant part.',
+          'Increase codingHarness.maxFileBytes or inspect the file outside the harness.',
         'file too large',
         { relPath: target.rel },
       );
@@ -147,7 +149,11 @@ export const readFileTool: Tool<{
 
     let raw: string;
     try {
-      raw = fs.readFileSync(target.abs, 'utf8');
+      const bytes = fs.readFileSync(target.abs);
+      raw = bytes.toString('utf8');
+      if (!Buffer.from(raw, 'utf8').equals(bytes)) {
+        return fail(`"${target.rel}" is not valid UTF-8; refusing to read it as text.`, 'unsupported encoding');
+      }
     } catch (err) {
       return fail(`Cannot read "${target.rel}": ${(err as Error).message}`, 'read failed');
     }
@@ -156,21 +162,45 @@ export const readFileTool: Tool<{
     const allLines = normalizeEol(raw).split('\n');
     const total = allLines.length;
     const cap = Math.max(1, Math.min(args.max_lines ?? MAX_READ_LINES, 5000));
-    const from = Math.max(1, args.start_line ?? 1);
+    const from = Math.max(1, Math.trunc(args.start_line ?? 1));
+    const column = Math.max(1, Math.trunc(args.start_column ?? 1));
     const to = Math.min(args.end_line ?? total, from + cap - 1, total);
-    const slice = allLines.slice(from - 1, to);
-
-    const numbered = slice.map((line, i) => `${String(from + i).padStart(5)}| ${line}`).join('\n');
-    const clipped = clip(numbered, 40_000);
+    // Leave room for the header and continuation metadata. Count UTF-8 bytes,
+    // not JavaScript characters, so multibyte code is budgeted consistently.
+    const byteBudget = Math.max(64, Math.min(39_000, (ctx.outputTokenBudget ?? 13_500) * 3 - 500));
+    const rendered: string[] = [];
+    let used = 0;
+    let nextLine: number | undefined;
+    let nextColumn: number | undefined;
+    for (let lineNo = from; lineNo <= to; lineNo++) {
+      const codepoints = Array.from(allLines[lineNo - 1]);
+      const start = lineNo === from ? column - 1 : 0;
+      if (start > codepoints.length) return fail('start_column is past the end of start_line.', 'bad arguments');
+      const prefix = `${String(lineNo).padStart(5)}| `;
+      const room = byteBudget - used - Buffer.byteLength(prefix, 'utf8') - 1;
+      if (room < 4 && rendered.length) { nextLine = lineNo; nextColumn = start + 1; break; }
+      let text = '';
+      let consumed = 0;
+      let bytes = 0;
+      for (let i = start; i < codepoints.length; i++) {
+        const size = Buffer.byteLength(codepoints[i], 'utf8');
+        if (bytes + size > Math.max(4, room)) break;
+        text += codepoints[i]; bytes += size; consumed++;
+      }
+      rendered.push(prefix + text);
+      used += Buffer.byteLength(prefix, 'utf8') + bytes + 1;
+      if (start + consumed < codepoints.length) {
+        nextLine = lineNo; nextColumn = start + consumed + 1; break;
+      }
+      if (lineNo === to && lineNo < total) { nextLine = lineNo + 1; nextColumn = 1; }
+    }
     const notes: string[] = [`${total} lines total`];
     if (fileEol && fileEol !== '\n') notes.push(`${eolName(fileEol)} line endings shown as LF for editing`);
-    if (to < total) notes.push(`showing ${from}-${to}; request more with start_line/end_line`);
-    if (clipped.truncated) notes.push('output clipped by size');
-
+    if (nextLine !== undefined) notes.push(`partial result; next_line=${nextLine}, next_column=${nextColumn}`);
     return ok(
-      `${target.rel} (${notes.join(', ')})\n${clipped.text}`,
-      `read ${slice.length} line(s) of ${target.rel}`,
-      { relPath: target.rel, lines: total },
+      `${target.rel} (${notes.join(', ')})\n${rendered.join('\n')}`,
+      `read ${rendered.length} line(s) of ${target.rel}`,
+      { relPath: target.rel, lines: total, ...(nextLine !== undefined ? { nextLine, nextColumn } : {}) },
     );
   },
 };
@@ -203,7 +233,7 @@ export const writeFileTool: Tool<{
   async run(args, ctx): Promise<ToolResult> {
     const target = resolveWorkspacePath(ctx.root, args.path, { allowOutside: ctx.config.allowOutsideWorkspace });
     const mode = args.mode ?? 'overwrite';
-    if (typeof args.content !== 'string') return fail('"content" must be a string.', 'bad arguments');
+    if (typeof args.content !== 'string' || !isWellFormedText(args.content)) return fail('"content" must be a well-formed Unicode string.', 'bad arguments');
 
     const existing = readIfExists(target.abs);
 
@@ -217,16 +247,24 @@ export const writeFileTool: Tool<{
     if (mode === 'append' && existing === null) {
       return fail(`"${target.rel}" does not exist, so there is nothing to append to.`, 'missing file');
     }
+    if (mode === 'append' && existing !== null) {
+      try {
+        if (!Buffer.from(existing, 'utf8').equals(fs.readFileSync(target.abs))) {
+          return fail(`"${target.rel}" is not valid UTF-8 or changed while being read; refusing to append.`, 'unsupported encoding');
+        }
+      } catch (err) {
+        return fail(`Cannot read "${target.rel}": ${(err as Error).message}`, 'read failed');
+      }
+    }
 
     // Model text is canonicalized to LF, then written using the existing
     // file's style. New files use the host OS style unless the setting
     // overrides it.
     const existingEol = existing === null ? null : detectEol(existing);
-    const logicalNext = mode === 'append'
-      ? `${normalizeEol(existing ?? '')}${normalizeEol(args.content)}`
-      : normalizeEol(args.content);
     const writeEol = resolveEol(ctx.config.lineEndings, existingEol);
-    const next = applyEol(logicalNext, writeEol);
+    const next = mode === 'append' && ctx.config.lineEndings === 'auto'
+      ? `${existing ?? ''}${applyEol(args.content, writeEol)}`
+      : applyEol(mode === 'append' ? `${existing ?? ''}${args.content}` : args.content, writeEol);
     const diff = diffPreview(target.rel, existing, next);
     ctx.host.log('debug', `write_file ${target.rel} (${mode}) ${diff.length} chars of diff`);
 
@@ -236,8 +274,11 @@ export const writeFileTool: Tool<{
       if (decision === 'reject') {
         return fail('User rejected this file write. Do not retry it verbatim; ask what to change instead.', 'rejected by user');
       }
+      if (readIfExists(target.abs) !== existing) {
+        return fail(`"${target.rel}" changed since the write was prepared. No changes were made.`, 'file changed');
+      }
       const previous = checkpoint(ctx, target.abs, target.rel);
-      await applyWrite(ctx, target.abs, next, previous);
+      await applyWrite(ctx, target.abs, next, previous, mode === 'append');
     } catch (err) {
       return fail(`Failed to write "${target.rel}": ${(err as Error).message}`, 'write failed');
     }
@@ -245,7 +286,7 @@ export const writeFileTool: Tool<{
     const lineCount = normalizeEol(next).split('\n').length;
     const verb = existing === null ? 'Created' : mode === 'append' ? 'Appended to' : 'Overwrote';
     return ok(
-      `${verb} "${target.rel}" (${formatBytes(Buffer.byteLength(next, 'utf8'))}, ${lineCount} lines, ${eolName(writeEol)} line endings).`,
+      `${verb} "${target.rel}" (${formatBytes(Buffer.byteLength(next, 'utf8'))}, ${lineCount} lines, ${hasMixedEol(next) ? 'mixed line endings' : detectEol(next) ? `${eolName(detectEol(next))} line endings` : 'no line endings'}).`,
       `${verb.toLowerCase()} ${target.rel}`,
       { relPath: target.rel, change: existing === null ? 'created' : 'modified', lines: lineCount },
     );
@@ -304,11 +345,23 @@ export const replaceInFileTool: Tool<{
   },
   async run(args, ctx) {
     const target = resolveWorkspacePath(ctx.root, args.path, { allowOutside: ctx.config.allowOutsideWorkspace });
-    const original = readIfExists(target.abs);
-    if (original === null) {
-      return fail(`"${target.rel}" does not exist. Use write_file to create it.`, 'missing file', { relPath: target.rel });
+    let original: string;
+    try {
+      const bytes = fs.readFileSync(target.abs);
+      original = bytes.toString('utf8');
+      if (!Buffer.from(original, 'utf8').equals(bytes)) {
+        return fail(`"${target.rel}" is not valid UTF-8; refusing to rewrite its bytes as text.`, 'unsupported encoding');
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return fail(`"${target.rel}" does not exist. Use write_file to create it.`, 'missing file', { relPath: target.rel });
+      }
+      return fail(`Cannot read "${target.rel}": ${(err as Error).message}`, 'read failed');
     }
-    if (!args.old_text) return fail('"old_text" must not be empty; use write_file to rewrite the whole file.', 'bad arguments');
+    if (typeof args.old_text !== 'string' || !args.old_text) return fail('"old_text" must be a non-empty string.', 'bad arguments');
+    if (typeof args.new_text !== 'string' || !isWellFormedText(args.old_text) || !isWellFormedText(args.new_text)) {
+      return fail('old_text and new_text must be well-formed Unicode strings.', 'bad arguments');
+    }
     if (args.count !== undefined && (!Number.isInteger(args.count) || (args.count !== -1 && args.count < 1))) {
       return fail('"count" must be a positive integer or -1 for all occurrences.', 'bad arguments');
     }
@@ -339,9 +392,10 @@ export const replaceInFileTool: Tool<{
     }
 
     const wanted = args.count === undefined ? 1 : args.count === -1 ? occurrences : args.count;
-    const logicalNext = replaceN(normalizedOriginal, needle, replacement, wanted);
     const writeEol = resolveEol(ctx.config.lineEndings, fileEol);
-    const next = applyEol(logicalNext, writeEol);
+    const next = ctx.config.lineEndings === 'auto'
+      ? replaceNormalizedPreservingEol(original, needle, replacement, wanted)
+      : applyEol(replaceN(normalizedOriginal, needle, replacement, wanted), writeEol);
     const replaced = Math.min(wanted, occurrences);
 
     const diff = diffPreview(target.rel, original, next);
@@ -355,9 +409,12 @@ export const replaceInFileTool: Tool<{
       return fail('User rejected this edit. Do not retry it verbatim; ask what to change instead.', 'rejected by user');
     }
 
+    if (readIfExists(target.abs) !== original) {
+      return fail(`"${target.rel}" changed since the edit was prepared. No changes were made.`, 'file changed');
+    }
     const previous = checkpoint(ctx, target.abs, target.rel);
     try {
-      await applyWrite(ctx, target.abs, next, previous);
+      await applyWrite(ctx, target.abs, next, previous, true);
     } catch (err) {
       return fail(`Failed to edit "${target.rel}": ${(err as Error).message}`, 'write failed');
     }
@@ -365,7 +422,7 @@ export const replaceInFileTool: Tool<{
     const remaining = occurrences - replaced;
     const note = remaining > 0 ? ` ${remaining} further occurrence(s) left untouched.` : '';
     return ok(
-      `Replaced ${replaced} occurrence(s) in "${target.rel}".${note} Written with ${eolName(writeEol)} line endings.`,
+      `Replaced ${replaced} occurrence(s) in "${target.rel}".${note} ${hasMixedEol(next) ? 'Mixed line endings preserved outside the replacement.' : detectEol(next) ? `Written with ${eolName(detectEol(next))} line endings.` : 'Result has no line endings.'}`,
       `edited ${target.rel}`,
       {
         relPath: target.rel,
@@ -450,16 +507,16 @@ function checkpoint(ctx: ToolContext, abs: string, rel: string): string | null {
 }
 
 /**
- * Write through the host when it offers a better mechanism (VS Code uses a
- * WorkspaceEdit so Ctrl+Z works), otherwise fall back to plain fs.
+ * Delegate to the host, requesting exact writes for targeted edits/appends;
+ * otherwise fall back to plain fs.
  */
-async function applyWrite(ctx: ToolContext, abs: string, content: string, previous: string | null): Promise<void> {
+async function applyWrite(ctx: ToolContext, abs: string, content: string, previous: string | null, preserveBytes = false): Promise<void> {
   if (previous === null && fs.existsSync(abs)) {
     throw new Error(`refusing to overwrite "${toPosix(abs)}" (it appeared after the tool started)`);
   }
   ensureDir(path.dirname(abs));
   if (ctx.host.applyFileWrite) {
-    await ctx.host.applyFileWrite(abs, content);
+    await ctx.host.applyFileWrite(abs, content, { preserveBytes });
     return;
   }
   fs.writeFileSync(abs, content, 'utf8');

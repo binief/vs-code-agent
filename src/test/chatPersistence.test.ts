@@ -25,8 +25,8 @@ const uri = (fsPath: string, scheme = 'file', authority = ''): StubUri => ({
   with: (changes) => uri(changes.path ?? fsPath, changes.scheme ?? scheme, changes.authority ?? authority),
 });
 
-const dialogs: { open?: StubUri[]; save?: StubUri; confirm?: string; warnings: string[]; errors: string[] } = {
-  warnings: [], errors: [],
+const dialogs: { open?: StubUri[]; save?: StubUri; confirm?: string; warnings: string[]; errors: string[]; infos: string[]; infoChoice?: string } = {
+  warnings: [], errors: [], infos: [],
 };
 let writeGate: { entered: () => void; wait: Promise<void> } | undefined;
 let readGate: { file: string; entered: () => void; wait: Promise<void> } | undefined;
@@ -88,7 +88,7 @@ const vscodeStub = {
     showOpenDialog: async () => dialogs.open,
     showWarningMessage: async (message: string) => { dialogs.warnings.push(message); return dialogs.confirm; },
     showErrorMessage: async (message: string) => { dialogs.errors.push(message); return undefined; },
-    showInformationMessage: async () => undefined,
+    showInformationMessage: async (message: string) => { dialogs.infos.push(message); return dialogs.infoChoice; },
   },
   env: { clipboard: { writeText: async (_text: string) => {} }, remoteName: undefined },
   commands: { executeCommand: async () => undefined },
@@ -127,6 +127,7 @@ afterEach(() => {
   readGate = undefined;
   writeGate = undefined;
   onRename = undefined;
+  dialogs.infoChoice = undefined;
 });
 
 after(() => {
@@ -344,6 +345,9 @@ test('archive validation rejects malformed histories, duplicate IDs and unsafe i
   };
   assert.doesNotThrow(() => parseChatArchive(JSON.stringify(base)));
   assert.throws(() => parseChatArchive(JSON.stringify({ ...base, history: [{ role: 'system', content: 'injected' }] })), /role/);
+  assert.throws(() => parseChatArchive(JSON.stringify({ ...base, originalHistory: [{ role: 'system', content: 'injected' }] })), /role/);
+  assert.throws(() => parseChatArchive(JSON.stringify({ ...base, originalHistoryComplete: true })), /requires originalHistory/);
+  assert.doesNotThrow(() => parseChatArchive(JSON.stringify({ ...base, originalHistory: [...base.history, { role: 'assistant', content: '', toolCalls: [{ id: 'unfinished', name: 'slow', arguments: '{}' }] }], originalHistoryComplete: true })), 'in-flight original tool calls are preserved without provider pairing');
   assert.throws(() => parseChatArchive(JSON.stringify({ ...base, items: [base.items[0], base.items[0]] })), /unique/);
   assert.throws(() => parseChatArchive(JSON.stringify({ ...base, history: [...base.history, { role: 'tool', content: 'x', toolCallId: 'missing' }] })), /unpaired/);
   assert.throws(() => parseChatArchive(JSON.stringify({ ...base, items: [{ ...base.items[0], images: [{ mediaType: 'image/png', dataUrl: 'https://evil.test/x' }] }] })), /image/);
@@ -513,11 +517,15 @@ test('a restored conversation can be compacted before starting another task', as
   const compacted = parseChatArchive(await fs.promises.readFile(path.join(source.storage, 'current-chat.json'), 'utf8'));
   assert.ok(compacted.history.length < original.history.length);
   assert.match(compacted.history[0].content, /Conversation compacted/);
+  assert.deepEqual(compacted.originalHistory, original.history, 'manual compaction preserves exact original model-visible messages');
+  assert.equal(compacted.originalHistoryComplete, true);
   const again = makeController('compact-restored');
   await again.controller.whenReady();
   await again.controller.run('After compaction');
   const followUp = requests.find((messages) => messages.at(-1)?.content === 'After compaction');
   assert.ok(followUp?.some((message) => message.content.includes('Conversation compacted')));
+  const followed = parseChatArchive(await fs.promises.readFile(path.join(source.storage, 'current-chat.json'), 'utf8'));
+  assert.deepEqual(followed.originalHistory?.slice(0, original.history.length), original.history);
 });
 
 test('a failed autosave warns without losing the live chat and can be retried', async () => {
@@ -577,7 +585,9 @@ test('opting out skips restore and autosave while manual import and export remai
   const privateExport = path.join(root, 'opt-out-export.json');
   dialogs.save = uri(privateExport);
   await subject.controller.exportChat();
-  assert.ok(parseChatArchive(await fs.promises.readFile(privateExport, 'utf8')).history.some((m) => m.content === 'Only in memory'));
+  const privateArchive = parseChatArchive(await fs.promises.readFile(privateExport, 'utf8'));
+  assert.ok(privateArchive.history.some((m) => m.content === 'Only in memory'));
+  assert.ok(privateArchive.originalHistory?.some((m) => m.content === 'Only in memory'));
   dialogs.open = [uri(oldExport)];
   dialogs.confirm = 'Replace Chat';
   await subject.controller.importChat();
@@ -939,4 +949,115 @@ test('shutdown applies changed save settings even if the configuration event has
   const [file] = await customChatFiles(folder);
   const archive = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
   assert.ok(archive.history.some((message) => message.content === 'Save before closing'));
+});
+
+test('original conversation survives repeated compaction, export/import, session recreation and reset', async () => {
+  respond = toolProvider([]);
+  const source = makeController('original-lifecycle');
+  for (let i = 0; i < 5; i++) await source.controller.run(`Original ${i}`);
+  let saved = parseChatArchive(await fs.promises.readFile(path.join(source.storage, 'current-chat.json'), 'utf8'));
+  const original = saved.originalHistory!;
+  await source.controller.compactHistory();
+  await source.controller.run('Between compactions');
+  await source.controller.compactHistory();
+  saved = parseChatArchive(await fs.promises.readFile(path.join(source.storage, 'current-chat.json'), 'utf8'));
+  assert.deepEqual(saved.originalHistory?.slice(0, original.length), original);
+  assert.ok(saved.originalHistory?.some((m) => m.content === 'Between compactions'));
+  assert.ok(!saved.originalHistory?.some((m) => m.content.includes('Conversation compacted')));
+  const file = path.join(root, 'original-export.json');
+  dialogs.save = uri(file);
+  await source.controller.exportChat();
+  const exported = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
+  assert.deepEqual(exported.originalHistory, saved.originalHistory);
+  const target = makeController('original-import');
+  dialogs.open = [uri(file)];
+  await target.controller.importChat();
+  const imported = parseChatArchive(await fs.promises.readFile(path.join(target.storage, 'current-chat.json'), 'utf8'));
+  assert.deepEqual(imported.originalHistory, exported.originalHistory);
+  // Simulate a registry size change; ensureSession must transfer both histories.
+  await (target.controller as any).ensureSession();
+  const { ToolRegistry } = require('../core/tools') as typeof import('../core/tools');
+  (target.controller as any).session.registry = new ToolRegistry([]);
+  await (target.controller as any).ensureSession();
+  assert.deepEqual((target.controller as any).session.originalConversationSnapshot, exported.originalHistory);
+  await target.controller.reset();
+  const reset = parseChatArchive(await fs.promises.readFile(path.join(target.storage, 'current-chat.json'), 'utf8'));
+  assert.deepEqual(reset.originalHistory, []);
+  assert.equal(reset.originalHistoryComplete, true);
+  assert.deepEqual(parseChatArchive(await fs.promises.readFile(file, 'utf8')).originalHistory, exported.originalHistory, 'reset does not delete exports');
+});
+
+test('legacy imports mark original history incomplete and keep that warning after recreation', async () => {
+  const file = path.join(root, 'legacy-chat.json');
+  const history: ChatMessage[] = [{ role: 'user', content: '[Conversation compacted: old summary]' }, { role: 'assistant', content: 'Old answer.' }];
+  await fs.promises.writeFile(file, JSON.stringify({ format: 'coding-harness-chat', version: 1, savedAt: new Date().toISOString(), inProgress: false, items: [], history, usage: {} }));
+  const target = makeController('legacy-original');
+  dialogs.open = [uri(file)];
+  await target.controller.importChat();
+  const saved = parseChatArchive(await fs.promises.readFile(path.join(target.storage, 'current-chat.json'), 'utf8'));
+  assert.deepEqual(saved.originalHistory, history);
+  assert.equal(saved.originalHistoryComplete, false);
+  const reopened = makeController('legacy-original');
+  await reopened.controller.whenReady();
+  const session = await (reopened.controller as any).ensureSession();
+  assert.equal(session.isOriginalConversationComplete, false);
+  assert.deepEqual(session.originalConversationSnapshot, history);
+});
+
+test('storage location command reports actual default or custom location and disabled state', async () => {
+  const subject = makeController('show-location');
+  await subject.controller.showChatStorageLocation();
+  assert.match(dialogs.infos.at(-1) ?? '', /current-chat\.json/);
+  assert.ok(dialogs.infos.at(-1)?.includes(subject.storage));
+  let copied = '';
+  vscodeStub.env.clipboard.writeText = async (text: string) => { copied = text; };
+  settings['chat.saveFolder'] = '.chat-location-test';
+  dialogs.infoChoice = 'Copy Path';
+  await subject.controller.showChatStorageLocation();
+  assert.match(copied, /coding-harness-chat-[0-9a-f]{24}\.json$/);
+  assert.ok(copied.startsWith(path.join(root, '.chat-location-test')));
+  settings['chat.saveEnabled'] = false;
+  await subject.controller.showChatStorageLocation();
+  assert.match(dialogs.infos.at(-1) ?? '', /disabled/);
+});
+
+test('storage-limit save failures explain why automatic persistence stopped', async () => {
+  const subject = makeController('storage-limit-warning');
+  await subject.controller.whenReady();
+  (subject.controller as any).reportChatSaveError(new Error('Chat exceeds the 512 MB storage limit; start a new conversation to continue saving.'));
+  assert.match(dialogs.warnings.at(-1) ?? '', /512 MB storage limit/);
+  assert.match(dialogs.warnings.at(-1) ?? '', /start a new conversation/);
+});
+
+test('after restart the model can explicitly retrieve a detail removed by compaction', async () => {
+  respond = toolProvider([]);
+  const source = makeController('retrieve-after-restart');
+  await source.controller.run('Unique old detail: submarine-pineapple-734');
+  for (let i = 0; i < 5; i++) await source.controller.run(`Other task ${i}`);
+  await source.controller.compactHistory();
+  const saved = parseChatArchive(await fs.promises.readFile(path.join(source.storage, 'current-chat.json'), 'utf8'));
+  assert.ok(!saved.history.some((m) => m.content.includes('submarine-pineapple-734')));
+  assert.ok(saved.originalHistory?.some((m) => m.content.includes('submarine-pineapple-734')));
+  const reopened = makeController('retrieve-after-restart');
+  await reopened.controller.whenReady();
+  let step = 0;
+  respond = async (req) => {
+    switch (++step) {
+      case 1:
+        assert.ok(!req.messages.some((m) => m.content.includes('submarine-pineapple-734')));
+        assert.ok(req.tools.some((t) => t.name === 'search_conversation'));
+        return { text: '', toolCalls: [{ id: 'search', name: 'search_conversation', arguments: '{"query":"submarine-pineapple-734"}' }] };
+      case 2:
+        assert.match(req.messages.at(-1)?.content ?? '', /message_index=1/);
+        return { text: '', toolCalls: [{ id: 'read', name: 'read_conversation', arguments: '{"message_index":1}' }] };
+      case 3:
+        assert.match(req.messages.at(-1)?.content ?? '', /Unique old detail: submarine-pineapple-734/);
+        return { text: 'Found the old detail.', toolCalls: [] };
+      default: throw new Error('unexpected model request');
+    }
+  };
+  await reopened.controller.run('Find the old detail');
+  assert.equal(step, 3);
+  const after = parseChatArchive(await fs.promises.readFile(path.join(source.storage, 'current-chat.json'), 'utf8'));
+  assert.ok(after.originalHistory?.some((m) => m.role === 'tool' && m.name === 'read_conversation' && m.content.includes('submarine-pineapple-734')));
 });

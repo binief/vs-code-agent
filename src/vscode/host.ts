@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { detectEol, hasMixedEol } from '../core/lineEndings';
 import { isInside } from '../core/paths';
 import type {
   ApprovalDecision,
@@ -11,6 +12,16 @@ import type {
   WorkspaceContext,
 } from '../core/types';
 import type { Logger } from './log';
+
+/** Compare editor and disk paths even when they use different symlink aliases. */
+function sameFilePath(left: string, right: string): boolean {
+  const canonical = (value: string): string => {
+    let result = path.resolve(value);
+    try { result = fs.realpathSync.native(result); } catch { /* new/unavailable path */ }
+    return process.platform === 'win32' ? result.toLowerCase() : result;
+  };
+  return canonical(left) === canonical(right);
+}
 
 export const APPROVAL_KINDS = ['write', 'delete', 'command'] as const;
 
@@ -101,9 +112,9 @@ export interface VsCodeHostOptions {
 /**
  * VS Code implementation of the core {@link HarnessHost}.
  *
- * File writes go through a WorkspaceEdit so the editor's undo stack and the
- * file watchers stay consistent instead of the file changing behind VS Code's
- * back; diagnostics and file opening come from the language services.
+ * Ordinary file writes use a WorkspaceEdit for editor undo. Mixed and CR-only
+ * line endings require filesystem writes because VS Code normalizes text edits.
+ * Diagnostics and file opening come from the language services.
  */
 export class VsCodeHost implements HarnessHost {
   readonly workspaceRoot: string;
@@ -126,30 +137,52 @@ export class VsCodeHost implements HarnessHost {
     else void vscode.window.showInformationMessage(message);
   }
 
-  /** Write through a WorkspaceEdit when the document is open in the editor. */
-  async applyFileWrite(absPath: string, content: string): Promise<void> {
+  /** Preserve mixed/CR endings on disk; VS Code text edits normalize them. */
+  async applyFileWrite(absPath: string, content: string, options?: { preserveBytes?: boolean }): Promise<void> {
     const uri = vscode.Uri.file(absPath);
+    const openDocument = vscode.workspace.textDocuments?.find((doc) => doc.uri.scheme === 'file' && sameFilePath(doc.uri.fsPath, absPath));
+    if (openDocument?.isDirty) throw new Error('File has unsaved editor changes; save or discard them before editing.');
+
+    const eol = detectEol(content);
+    if (options?.preserveBytes || content.startsWith('\uFEFF') || hasMixedEol(content) || eol === '\r' || !fs.existsSync(absPath)) {
+      // The document model normalizes LF/CRLF and can treat a BOM as an
+      // encoding marker. Direct writes preserve bytes but bypass editor undo.
+      fs.mkdirSync(path.dirname(absPath), { recursive: true });
+      fs.writeFileSync(absPath, content, 'utf8');
+      this.log('info', `Wrote ${absPath} directly to preserve line endings.`);
+      return;
+    }
+
+    let applied = false;
     try {
       const edit = new vscode.WorkspaceEdit();
       if (fs.existsSync(absPath)) {
         const doc = await vscode.workspace.openTextDocument(uri);
+        if (doc.isDirty) throw new Error('File has unsaved editor changes; save or discard them before editing.');
+        const editorEol = doc.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+        if ((eol && eol !== editorEol) || doc.encoding !== 'utf8') {
+          // WorkspaceEdit or save could change line style or text encoding.
+          fs.writeFileSync(absPath, content, 'utf8');
+          this.log('info', `Wrote ${absPath} directly to preserve its requested line endings.`);
+          return;
+        }
         const fullRange = new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length));
         edit.replace(uri, fullRange, content);
-        const applied = await vscode.workspace.applyEdit(edit);
-        if (!applied) throw new Error('applyEdit returned false');
-        const updated = await vscode.workspace.openTextDocument(uri);
-        await updated.save();
-        return;
+      } else {
+        fs.mkdirSync(path.dirname(absPath), { recursive: true });
+        edit.createFile(uri, { ignoreIfExists: false });
+        edit.insert(uri, new vscode.Position(0, 0), content);
       }
-
-      fs.mkdirSync(path.dirname(absPath), { recursive: true });
-      edit.createFile(uri, { ignoreIfExists: true });
-      edit.insert(uri, new vscode.Position(0, 0), content);
-      const applied = await vscode.workspace.applyEdit(edit);
+      applied = await vscode.workspace.applyEdit(edit);
       if (!applied) throw new Error('applyEdit returned false');
-      const created = await vscode.workspace.openTextDocument(uri);
-      await created.save();
+      const updated = await vscode.workspace.openTextDocument(uri);
+      if (!await updated.save()) throw new Error('VS Code could not save the edited file.');
     } catch (err) {
+      // Never bypass unsaved editor changes or overwrite an applied edit after a
+      // failed save. Only fall back when the editor operation never applied.
+      if (applied || (err as Error).message.includes('unsaved editor changes')) throw err;
+      const current = vscode.workspace.textDocuments?.find((doc) => doc.uri.scheme === 'file' && sameFilePath(doc.uri.fsPath, absPath));
+      if (current?.isDirty) throw new Error('File has unsaved editor changes; save or discard them before editing.');
       this.log('warn', `WorkspaceEdit failed for ${absPath} (${(err as Error).message}); falling back to the filesystem`);
       fs.mkdirSync(path.dirname(absPath), { recursive: true });
       fs.writeFileSync(absPath, content, 'utf8');
