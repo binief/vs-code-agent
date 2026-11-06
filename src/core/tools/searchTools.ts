@@ -16,8 +16,7 @@ export const searchTextTool: Tool<{
 }> = {
   name: 'search_text',
   description:
-    'Search file contents in the workspace (like ripgrep) and return "path:line: text" matches. ' +
-    'Use it to find where a symbol, string or config key lives before reading or editing files. Prefer this over guessing file locations.',
+    'Search file contents in the workspace (like ripgrep) and return "path:line: text" matches.',
   parameters: {
     type: 'object',
     properties: {

@@ -14,10 +14,10 @@ Detection requires reasoning text that the provider exposes. It cannot interrupt
 
 ## Repeated tool calls
 
-`RepeatedToolCallTracker` compares each consecutive tool name, JSON arguments (with object keys canonicalized), success status and full result text. After three identical calls returning identical results, the harness logs and displays a warning and sends a nudge to the model **after all tool results in the batch**, preserving the provider transcript. It warns again at six, nine, and so on if the streak continues. A different call, arguments, status or result resets the counter; each new task starts fresh.
+`RepeatedToolCallTracker` compares each consecutive tool name, JSON arguments (with object keys canonicalized), success status and full result text. After three identical calls returning identical results, the harness logs and displays a warning and sends a factual notice to the model **after all tool results in the batch**, preserving the provider transcript. It warns again at six, nine, and so on if the streak continues. A different call, arguments, status or result resets the counter; each new task starts fresh.
 
 Identical output is only a signal of possible lack of progress. It does **not** prove that the workspace or external systems did not change: commands and other tools can have side effects even if their output is identical. For that reason this detector does not suppress or replay tool calls and does not skip approvals. Similarly, changing output does not prove useful progress. Tool calls that alternate between different operations are not detected as a consecutive identical-call loop.
 
 ## Verification
 
-Run `npm test`. `src/test/loopTracking.test.ts` exercises fragmented reasoning, reset behavior, interruption and recovery with the display on and off, the interruption limit, canonical tool arguments, and transcript-safe tool-loop nudges. Loop thresholds are code defaults; `codingHarness.thinkingMaxChars` configures the separate safety budget. Existing task step and output-token limits remain separate safeguards.
+Run `npm test`. `src/test/loopTracking.test.ts` exercises fragmented reasoning, reset behavior, interruption and recovery with the display on and off, the interruption limit, canonical tool arguments, and transcript-safe tool-loop notices. Loop thresholds are code defaults; `codingHarness.thinkingMaxChars` configures the separate safety budget. Existing task step and output-token limits remain separate safeguards.

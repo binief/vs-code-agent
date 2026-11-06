@@ -276,7 +276,6 @@ test('an empty workspace renders a factual "none found" note, never built-in rul
   const result = discoverAgentFiles({ root, config: config() });
   const text = formatAgentInstructions(result);
   assert.match(text, /No agent instruction files were found/);
-  assert.match(text, /no built-in prompt/i);
   assert.doesNotMatch(text, /You are|You must|Always |add an agent file/i);
 });
 

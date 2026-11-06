@@ -1,9 +1,8 @@
 /**
  * Agent instruction files.
  *
- * This module only *finds and renders* instructions. It deliberately contains
- * no rules of its own: the harness ships no built-in prompt, so whatever the
- * model is told to do has to come from one of these files (or from the user).
+ * This module finds and renders agent instructions and their metadata.
+ * Operational recovery messages elsewhere in the harness are separate.
  *
  * File names are not fixed. A file is treated as instructions when any of these
  * is true:
@@ -19,12 +18,13 @@
  *   - workspace files from the root outwards, then
  *   - files added explicitly from outside the workspace.
  *
- * An optional YAML front matter block (`description`, `applyTo`) is used as a
- * label in the prompt; it is not sent as instruction text.
+ * Optional YAML front matter provides labels and enforced tool permissions;
+ * it is not sent as instruction text.
  */
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { load as loadYaml } from 'js-yaml';
 import { normalizeEol } from './lineEndings';
 import { formatBytes, globToRegExp, isInside, toPosix } from './paths';
 import { SKIP_DIRS } from './tools/walk';
@@ -45,6 +45,10 @@ export interface AgentFileInfo {
   content: string;
   /** `description:` from optional front matter. */
   description?: string;
+  /** Explicit tool groups/names from front matter; undefined means no restriction. */
+  tools?: string[];
+  /** Invalid tool metadata must fail closed, not be ignored. */
+  toolPolicyError?: string;
   /** `applyTo:` from optional front matter, e.g. `**\/*.ts`. */
   applyTo?: string;
 }
@@ -269,18 +273,40 @@ function readLimited(abs: string, maxBytes: number): ReadResult | undefined {
 export function parseAgentFrontMatter(text: string): {
   description?: string;
   applyTo?: string;
+  tools?: string[];
+  toolPolicyError?: string;
   body: string;
 } {
   const lines = text.split('\n');
   if ((lines[0] ?? '').trim() !== '---') return { body: text };
   let end = -1;
-  for (let i = 1; i < lines.length && i <= 40; i += 1) {
+  for (let i = 1; i < lines.length; i += 1) {
     if (lines[i].trim() === '---') {
       end = i;
       break;
     }
   }
-  if (end === -1) return { body: text };
+  if (end === -1) {
+    return /(?:^|[\s{,])['"]?tools['"]?\s*:/m.test(text)
+      ? { body: text, toolPolicyError: 'Unclosed front matter containing tools.' } : { body: text };
+  }
+
+  let tools: string[] | undefined;
+  let toolPolicyError: string | undefined;
+  const header = lines.slice(1, end).join('\n');
+  try {
+    const parsed = loadYaml(header);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.prototype.hasOwnProperty.call(parsed, 'tools')) {
+      const value = (parsed as Record<string, unknown>).tools;
+      if (!Array.isArray(value) || value.some((item) => typeof item !== 'string' || !item.trim())) {
+        toolPolicyError = 'tools must be a list of non-empty tool names or groups.';
+      } else tools = value.map((item: string) => item.trim());
+    }
+  } catch {
+    // A malformed document could conceal a tool declaration; never broaden the
+    // policy just because its exact spelling could not be parsed.
+    toolPolicyError = 'Invalid YAML front matter; tool permissions cannot be determined.';
+  }
 
   let description: string | undefined;
   let applyTo: string | undefined;
@@ -302,8 +328,8 @@ export function parseAgentFrontMatter(text: string): {
     if (key === 'description') description = value;
     else if (key === 'applyto' || key === 'scope') applyTo = value;
   }
-  if (!description && !applyTo) return { body: text };
-  return { description, applyTo, body: lines.slice(end + 1).join('\n').replace(/^\n+/, '') };
+  if (!description && !applyTo && tools === undefined && !toolPolicyError) return { body: text };
+  return { description, applyTo, tools, toolPolicyError, body: lines.slice(end + 1).join('\n').replace(/^\n+/, '') };
 }
 
 /**
@@ -638,6 +664,8 @@ export function discoverAgentFiles(options: DiscoverAgentFilesOptions): AgentFil
       truncated: read.truncated,
       content: parsed.body,
       ...(parsed.description ? { description: parsed.description } : {}),
+      ...(parsed.tools !== undefined ? { tools: parsed.tools } : {}),
+      ...(parsed.toolPolicyError ? { toolPolicyError: parsed.toolPolicyError } : {}),
       ...(parsed.applyTo ? { applyTo: parsed.applyTo } : {}),
     });
     result.totalBytes += contentBytes;
@@ -726,7 +754,6 @@ export function formatAgentInstructions(result: AgentFilesResult): string {
       'No agent instruction files were found.',
       `Looked for ${describeSources()} in ${searched.join('; ')}.`,
       result.skipped.length ? `Skipped: ${result.skipped.length} path(s) (see the extension log).` : '',
-      'The extension has no built-in prompt; this system message contains context only.',
     ];
     return lines.filter(Boolean).join('\n');
   }

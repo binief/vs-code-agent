@@ -4,7 +4,7 @@
  * This module deliberately contains **no behavioural instructions**. It only
  * describes the environment, the workspace, the files the editor has open and
  * the tools that are available, then appends the agent instruction files
- * verbatim. Every instruction the model acts on comes from those files.
+ * verbatim. Operational recovery messages are sent separately by the harness.
  */
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';

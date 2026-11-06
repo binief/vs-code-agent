@@ -5,8 +5,7 @@ import { fail, ok, type Tool } from '../types';
 export const getDiagnosticsTool: Tool<{ path?: string; severity?: 'error' | 'warning' | 'all' }> = {
   name: 'get_diagnostics',
   description:
-    'Get the current errors and warnings the editor knows about (TypeScript, ESLint, Pylance, \u2026). ' +
-    'Use it after editing files to verify the change compiled, or to explore what is already broken. Report only what this tool returns — never invent diagnostics.',
+    'Get the current errors and warnings the editor knows about (TypeScript, ESLint, Pylance, \u2026).',
   parameters: {
     type: 'object',
     properties: {
@@ -55,8 +54,7 @@ export const getDiagnosticsTool: Tool<{ path?: string; severity?: 'error' | 'war
 export const openFileTool: Tool<{ path: string; line?: number; reason?: string }> = {
   name: 'open_file',
   description:
-    'Open a file in the editor, optionally jumping to a line. Use it when it helps the user look at the result, ' +
-    'or after finishing a change. It does not modify anything.',
+    'Open a file in the editor, optionally jumping to a line. It does not modify anything.',
   parameters: {
     type: 'object',
     properties: {

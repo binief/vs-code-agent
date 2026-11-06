@@ -5,6 +5,7 @@ import { isRetryableProviderError, retryDelayMs } from './providers/errors';
 import { ThinkingStreamGuard, RepeatedToolCallTracker, type ThinkingStopReason } from './loopTracking';
 import { buildSystemPrompt, summarizeDiagnostics } from './prompt';
 import { createDefaultTools, ToolRegistry } from './tools';
+import { resolveAgentToolPolicy } from './toolPolicy';
 import { repairToolMessages } from './transcript';
 import {
   DEFAULT_CONFIG,
@@ -243,8 +244,7 @@ export class HarnessSession {
           focusPaths: (workspace?.openFiles ?? []).map((file) => file.path),
         });
       } catch (err) {
-        // A broken instruction file must not take the whole task down; the
-        // prompt simply gets no instructions this time.
+        // Record discovery failure so the policy resolver can fail closed.
         host.log('warn', `agent instruction discovery failed: ${(err as Error).message}`);
         agentFiles = {
           enabled: this.deps.config.agentFiles.enabled,
@@ -262,8 +262,7 @@ export class HarnessSession {
       }
       // The user may have pinned a subset (the agents chip in the panel). The
       // selection is applied here, not in discovery, so the full result stays
-      // available for the picker and for an automatic fallback when a pinned
-      // file has been deleted.
+      // available for the picker; missing pinned files fail closed.
       const selected = selectAgentFiles(agentFiles, this.deps.agentSelection);
       if (selected.missing.length > 0) {
         host.log(
@@ -292,10 +291,15 @@ export class HarnessSession {
           (selected.selection ? ` (${selected.files.length} of ${selected.available} selected)` : '') +
           (selected.skipped.length ? ` (${selected.skipped.length} skipped)` : ''),
       );
+      const toolPolicy = resolveAgentToolPolicy(selected, this.registry.specs());
+      const allowedToolNames = new Set(toolPolicy.tools.map((tool) => tool.name));
+      if (toolPolicy.restricted) {
+        onEvent({ type: 'notice', level: 'info', message: `Selected agent tool policy: ${toolPolicy.tools.map((tool) => tool.name).join(', ') || 'no tools'}.` });
+      }
       const system = buildSystemPrompt({
         root: host.workspaceRoot,
         config: this.deps.config,
-        tools: this.registry.specs(),
+        tools: toolPolicy.tools,
         diagnostics,
         workspace,
         agentFiles: selected,
@@ -359,7 +363,7 @@ export class HarnessSession {
         let messages = buildMessages();
 
         // Reserve room for output and account for the tool definitions actually sent.
-        const toolsForStep = isFinalStep ? [] : this.registry.specs();
+        const toolsForStep = isFinalStep ? [] : toolPolicy.tools;
         const contextWindow = this.deps.config.compaction.contextWindowTokens;
         const outputReserve = Math.max(0, this.deps.config.maxOutputTokens);
         const measureContext = () => {
@@ -599,10 +603,10 @@ export class HarnessSession {
               outcome = 'error';
               break;
             }
-            const nudge = isBudget
-              ? 'Your previous response was interrupted after reaching the thinking length budget. Proceed concisely using available evidence or a tool, or explain what is blocking progress.'
-              : 'Your previous response was interrupted because your reasoning repeated. Change approach, use available evidence or a tool, or explain what is blocking progress.';
-            taskMessages.push({ role: 'user', content: nudge });
+            const interruptionNotice = isBudget
+              ? 'Your previous response was interrupted after reaching the thinking length budget.'
+              : 'Your previous response was interrupted because your reasoning repeated.';
+            taskMessages.push({ role: 'user', content: interruptionNotice });
             continue;
           }
           const providerMessage = (err as Error).message;
@@ -692,7 +696,7 @@ export class HarnessSession {
             });
             continue;
           }
-          const result = await this.executeToolCall(call, onEvent, signal);
+          const result = await this.executeToolCall(call, onEvent, signal, allowedToolNames);
           toolCallsRun++;
           const streak = toolLoop.record(call, result);
           if (streak === 1) toolLoopNotice = undefined;
@@ -714,7 +718,7 @@ export class HarnessSession {
           break;
         }
         if (toolLoopNotice) {
-          taskMessages.push({ role: 'user', content: `${toolLoopNotice} Do not repeat the same call without a reason; inspect the result and try a different approach or explain the blocker.` });
+          taskMessages.push({ role: 'user', content: toolLoopNotice });
         }
       }
     } catch (err) {
@@ -837,6 +841,7 @@ export class HarnessSession {
     call: ToolCall,
     onEvent: (event: HarnessEvent) => void,
     signal: AbortSignal,
+    allowedTools: ReadonlySet<string>,
   ): Promise<ToolResult> {
     const started = Date.now();
     const host = this.deps.host;
@@ -856,6 +861,9 @@ export class HarnessSession {
       return result;
     };
 
+    if (!allowedTools.has(call.name)) {
+      return finish({ ok: false, content: `Tool "${call.name}" is not allowed by the selected agent tool policy or is unavailable.`, summary: 'tool not allowed' });
+    }
     const tool = this.registry.get(call.name);
     if (!tool) {
       return finish({

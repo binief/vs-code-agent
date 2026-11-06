@@ -29,8 +29,7 @@ export const listFilesTool: Tool<{
 }> = {
   name: 'list_files',
   description:
-    'List files and directories in the workspace. Use it to discover the project layout before reading or editing. ' +
-    'Never invent file names — always list first to verify what exists. ' +
+    'List files and directories in the workspace. ' +
     'Skips dependency/build folders (node_modules, .git, dist, out, build, \u2026). Supports a glob filter such as "**/*.ts".',
   parameters: {
     type: 'object',
@@ -102,7 +101,7 @@ export const readFileTool: Tool<{
   name: 'read_file',
   description:
     'Read a text file (line-numbered) or list a directory. Line endings are shown as LF so snippets match on ' +
-    'Windows and Unix. Always read a file before editing it — never quote or summarize file contents you have not just read via this tool. Use start_line/end_line to read a slice of a large file.',
+    'Windows and Unix. Supports start_line/end_line for reading a slice of a large file.',
   parameters: {
     type: 'object',
     properties: {
@@ -186,8 +185,7 @@ export const writeFileTool: Tool<{
   name: 'write_file',
   description:
     'Create or overwrite a file with the full content you provide. Intermediate directories are created. ' +
-    'Prefer replace_in_file for small edits to existing files. Content must be the complete new file body. ' +
-    'Never write guessed content for existing files — read_file first and base edits on the returned text. ' +
+    'Content must be the complete new file body. ' +
     'Line endings are normalized for the model and written with the existing file style (or the OS style for new files).',
   parameters: {
     type: 'object',
@@ -265,7 +263,7 @@ export const createFileTool: Tool<{ path: string; content?: string }> = {
   name: 'create_file',
   description:
     'Create a new file (intermediate directories are created). Fails if the path already exists, so it is safe ' +
-    'against accidental overwrites. Only use for files verified to not exist (via list_files). Use write_file to overwrite a whole file, or replace_in_file to edit one.',
+    'against accidental overwrites.',
   parameters: {
     type: 'object',
     properties: {
@@ -292,7 +290,7 @@ export const replaceInFileTool: Tool<{
     'Replace an exact text snippet inside an existing file. Line endings are matched independently of the platform ' +
     'and the file style is preserved. By default old_text must match exactly once; if it matches multiple times, ' +
     'include more surrounding context to identify the intended location. Pass count to explicitly replace the first ' +
-    'N occurrences, or -1 for all. Read the file first and copy old_text verbatim, including indentation. ' +
+    'N occurrences, or -1 for all. old_text includes indentation. ' +
     'Use an empty new_text to delete the snippet.',
   parameters: {
     type: 'object',

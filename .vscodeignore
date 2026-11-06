@@ -8,7 +8,6 @@ tsconfig.json
 .vscodeignore
 **/*.ts
 **/*.map
-node_modules/**
 out/test/**
 out/demo/**
 test-*
