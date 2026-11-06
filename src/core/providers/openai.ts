@@ -138,7 +138,7 @@ export class OpenAiCompatibleProvider implements Provider {
     const thinking = reasoningOf(message);
 
     // An endpoint that ignored `stream` still has to feed the UI something.
-    if (thinking && req.onThinking) req.onThinking(thinking);
+    if (thinking && req.onThinking) req.onThinking(thinking, true);
     if (text && req.onDelta) req.onDelta(text);
 
     return {

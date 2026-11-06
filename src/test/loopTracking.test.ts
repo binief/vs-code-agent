@@ -4,7 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
 import { HarnessSession } from '../core/agent';
-import { ConsecutiveSentenceTracker, RepeatedToolCallTracker } from '../core/loopTracking';
+import { ConsecutiveSentenceTracker, RepeatedToolCallTracker, ThinkingStreamGuard } from '../core/loopTracking';
 import { isTranscriptWellFormed } from '../core/transcript';
 import { ToolRegistry } from '../core/tools';
 import { DEFAULT_CONFIG, type ChatMessage, type ChatRequest, type HarnessEvent, type HarnessHost, type Provider, type ProviderResponse, type Tool } from '../core/types';
@@ -100,7 +100,7 @@ test('repeated interrupted thinking attempts stop instead of retrying indefinite
     const result = await session.runTask('test', () => {});
     assert.equal(calls, 3);
     assert.equal(result.outcome, 'error');
-    assert.match(result.summary, /repeated thinking loops/);
+    assert.match(result.summary, /repeated thinking interruptions/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -181,7 +181,96 @@ test('completed non-streaming response reports repetition without discarding its
     const result = await session.runTask('test', (e) => events.push(e));
     assert.equal(result.outcome, 'complete');
     assert.equal(result.summary, 'Done.');
-    assert.ok(events.some((e) => e.type === 'notice' && e.message.includes('3 consecutive times')));
+    assert.ok(events.some((e) => e.type === 'notice' && e.message.includes('completed response')));
     assert.ok(!events.some((e) => e.type === 'thinking' || e.type === 'thinking-delta'));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('thinking guard catches sentence, alternating block and punctuation-free phrase independent of chunking', () => {
+  const a = 'First I will inspect files. ';
+  const b = 'Next I will check the project. ';
+  const examples: Array<[string, string]> = [
+    [a.repeat(3) + b, 'sentence'],
+    [(a + b).repeat(20), 'block'],
+    ['checking the same file and inspecting its contents repeatedly '.repeat(20), 'phrase'],
+  ];
+  for (const [text, expected] of examples) {
+    const whole = new ThinkingStreamGuard(0).add(text);
+    assert.equal(whole.reason, expected);
+    const split = new ThinkingStreamGuard(0);
+    let accepted = '';
+    let reason: string | undefined;
+    for (const char of text) {
+      const result = split.add(char);
+      accepted += result.accepted;
+      if (result.reason) { reason = result.reason; break; }
+    }
+    assert.equal(reason, expected);
+    assert.equal(accepted, whole.accepted);
+  }
+});
+
+test('sentence detection remembers a loop inside a chunk and resets after the pattern breaks', () => {
+  const tracker = new ConsecutiveSentenceTracker();
+  const a = 'First I will inspect files. ';
+  const b = 'Next I will check the project. ';
+  assert.equal(tracker.add(a.repeat(3) + b).looping, true);
+  assert.equal(tracker.add('One more different sentence. ').looping, false);
+  assert.equal(tracker.add((a + b).repeat(2)).looping, false);
+  assert.equal(tracker.add(a + b).reason, 'repeated 2-sentence block');
+});
+
+test('thinking guard enforces a separate configurable budget and permits long unique content when disabled', () => {
+  const unique = Array.from({ length: 1000 }, (_, i) => `Unique item ${i} has an independent observation. `).join('');
+  const bounded = new ThinkingStreamGuard(500).add(unique);
+  assert.equal(bounded.reason, 'budget');
+  assert.equal(bounded.accepted.length, 500);
+  const unbounded = new ThinkingStreamGuard(0).add(unique);
+  assert.equal(unbounded.reason, undefined);
+  assert.equal(unbounded.accepted, unique);
+});
+
+test('thinking budget interrupts despite hidden display and the next attempt receives a budget-specific nudge', async () => {
+  const dir = workspace();
+  try {
+    const events: HarnessEvent[] = [];
+    const seen: ChatMessage[][] = [];
+    let aborted = false;
+    const provider: Provider = { id: 'long', label: 'long', async chat(req) {
+      seen.push(req.messages);
+      if (seen.length === 1) {
+        req.onThinking?.('A long but nonrepeating explanation is still being generated.');
+        aborted = !!req.signal?.aborted;
+        return { text: '', toolCalls: [{ id: 'bad', name: 'list_files', arguments: '{}' }] };
+      }
+      return { text: 'Recovered.', toolCalls: [] };
+    } };
+    const session = new HarnessSession({ host: new FakeHost(dir), provider, config: { ...DEFAULT_CONFIG, showThinking: false, stream: true, thinkingMaxChars: 40, maxSteps: 5 } });
+    const result = await session.runTask('test', (e) => events.push(e));
+    assert.equal(result.outcome, 'complete');
+    assert.equal(result.toolCalls, 0);
+    assert.ok(aborted);
+    assert.ok(events.some((e) => e.type === 'notice' && /40-character safety budget/.test(e.message)));
+    assert.ok(seen[1].some((m) => m.role === 'user' && m.content.includes('thinking length budget')));
+    assert.ok(!events.some((e) => e.type === 'thinking' || e.type === 'thinking-delta'));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('display is bounded independently when the thinking budget is disabled', async () => {
+  const dir = workspace();
+  try {
+    const events: HarnessEvent[] = [];
+    const unique = Array.from({ length: 400 }, (_, i) => `Observation ${i} contains different evidence. `).join('');
+    const provider: Provider = { id: 'long', label: 'long', async chat(req) {
+      req.onThinking?.(unique);
+      assert.equal(req.signal?.aborted, false);
+      return { text: 'Done.', toolCalls: [] };
+    } };
+    const session = new HarnessSession({ host: new FakeHost(dir), provider, config: { ...DEFAULT_CONFIG, showThinking: true, stream: true, thinkingMaxChars: 0, maxSteps: 5 } });
+    const result = await session.runTask('test', (e) => events.push(e));
+    assert.equal(result.outcome, 'complete');
+    const displayed = events.filter((e): e is Extract<HarnessEvent, { type: 'thinking-delta' }> => e.type === 'thinking-delta').map((e) => e.text).join('');
+    assert.ok(displayed.length < 12050);
+    assert.match(displayed, /thinking display truncated/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

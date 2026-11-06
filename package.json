@@ -309,6 +309,12 @@
           "default": true,
           "markdownDescription": "Show the model's reasoning stream in its own lane when the backend provides one (DeepSeek `reasoning_content`, OpenRouter `reasoning`, OpenAI-compatible reasoning models, Anthropic extended thinking). The reasoning is displayed only — it is never sent back to the model as conversation content."
         },
+        "codingHarness.thinkingMaxChars": {
+          "type": "number",
+          "default": 12000,
+          "minimum": 0,
+          "markdownDescription": "Maximum streamed reasoning characters per model attempt before interrupting the request. Set to 0 to disable this budget. Long legitimate reasoning may also be interrupted. Repetition detection remains active."
+        },
         "codingHarness.chat.saveEnabled": {
           "type": "boolean",
           "scope": "window",

@@ -409,6 +409,7 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.lineEndings` | `auto` | Preserve existing style; `lf` \| `crlf` \| `cr` \| `native` override it |
 | `codingHarness.stream` | `true` | Render output token by token; off = one response per turn |
 | `codingHarness.showThinking` | `true` | Show the model's reasoning lane when the backend provides one |
+| `codingHarness.thinkingMaxChars` | `12000` | Interrupt a streamed reasoning attempt at this character budget; `0` disables the budget (loop detection remains active) |
 | `codingHarness.chat.saveEnabled` | `true` | Automatically save and restore the current workspace chat |
 | `codingHarness.chat.saveFolder` | `""` | Folder for automatic saves; empty uses VS Code workspace storage |
 | `codingHarness.agentFiles.enabled` | `true` | Load instructions from agent files (no built-in prompt) |

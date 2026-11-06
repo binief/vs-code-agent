@@ -121,7 +121,7 @@ export class AnthropicProvider implements Provider {
     }
     const text = textParts.join('\n').trim();
     const thinking = thinkingParts.join('\n').trim();
-    if (thinking && req.onThinking) req.onThinking(thinking);
+    if (thinking && req.onThinking) req.onThinking(thinking, true);
     if (text && req.onDelta) req.onDelta(text);
 
     return {
