@@ -4,7 +4,7 @@ import * as path from 'path';
 import { createHash, randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
 import { HarnessSession } from '../core/agent';
-import { compactHistory as compactMessages, estimateMessagesTokens } from '../core/compaction';
+import { estimateMessagesTokens } from '../core/compaction';
 import { agentFilesSummary, discoverAgentFiles, selectAgentFiles, type AgentFilesResult } from '../core/agentFiles';
 import { buildSystemPrompt, summarizeDiagnostics } from '../core/prompt';
 import { apiKeyFromEnv, createProvider } from '../core/providers';
@@ -796,6 +796,7 @@ export class HarnessController {
         threshold: typeof threshold === 'number' ? threshold : 0.75,
         contextWindowTokens: typeof contextWindow === 'number' ? contextWindow : 128000,
         keepLastMessages: typeof keepLast === 'number' ? keepLast : 10,
+        summaryModel: c.get<string>('compaction.summaryModel') || undefined,
       },
     });
   }
@@ -1095,6 +1096,8 @@ export class HarnessController {
         cumulativeUsage: this.cumulativeUsage,
         tokensPerSecond: this.lastTokensPerSecond,
         contextTokens: result.contextTokens,
+        contextPercent: this.state.contextWindow && result.contextTokens !== undefined
+          ? result.contextTokens / this.state.contextWindow * 100 : 0,
       };
       this.log.info(`task finished: ${result.outcome} in ${result.steps} step(s), ${result.toolCalls} tool call(s), ${result.usage.totalTokens || 0} tokens`);
     } catch (err) {
@@ -1159,26 +1162,34 @@ export class HarnessController {
       void vscode.window.showInformationMessage('No active session to compact.');
       return;
     }
-    let result: { compacted: boolean; originalTokens: number; newTokens: number; removed: number };
-    if (this.session) {
-      result = this.session.compact();
-    } else {
-      const compacted = compactMessages(this.restoredHistory, this.readConfig());
-      this.restoredHistory = compacted.newHistory;
-      result = { ...compacted.result, removed: compacted.result.removedMessages };
-    }
-    if (result.compacted) {
-      this.pushNotice('info', `Compacted conversation: removed ${result.removed} old messages, freed ${result.originalTokens - result.newTokens} tokens (${result.newTokens} tokens now).`);
-      this.log.info(`manual compaction: ${result.originalTokens} -> ${result.newTokens} tokens, removed ${result.removed}`);
-      const tokens = this.session?.getContextUsage().tokens ?? estimateMessagesTokens(this.restoredHistory);
-      const window = this.readConfig().compaction.contextWindowTokens;
-      const percent = window > 0 ? (tokens / window) * 100 : 0;
-      this.state = { ...this.state, contextTokens: tokens, contextWindow: window, contextPercent: percent };
+    this.cancelPendingStart = false;
+    this.setStatus('thinking', true);
+    try {
+      const session = await this.ensureSession();
+      if (this.cancelPendingStart) {
+        this.cancelPendingStart = false;
+        this.pushNotice('info', 'Compaction cancelled.');
+        return;
+      }
+      this.pushNotice('info', 'Checking context for LLM compaction; summarization may require an additional provider request.');
+      const result = await session.compact();
+      this.cumulativeUsage = session.usage;
+      if (result.compacted) {
+        this.pushNotice('info', `Compacted conversation: removed ${result.removed} old messages, saved approximately ${result.originalTokens - result.newTokens} tokens.`);
+        this.log.info(`manual compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens, removed ${result.removed}`);
+        const { tokens, window, percent } = session.getContextUsage();
+        this.state = { ...this.state, contextTokens: tokens, contextWindow: window, contextPercent: percent, cumulativeUsage: this.cumulativeUsage };
+        this.post({ type: 'context', contextTokens: tokens, contextWindow: window, contextPercent: percent });
+      } else {
+        this.state = { ...this.state, cumulativeUsage: this.cumulativeUsage };
+        void vscode.window.showWarningMessage(`Conversation not compacted: ${result.reason} Original context was retained.`);
+      }
       this.post({ type: 'state', state: this.state });
-      this.post({ type: 'context', contextTokens: tokens, contextWindow: window, contextPercent: percent });
       await this.persistChat();
-    } else {
-      void vscode.window.showInformationMessage('Nothing to compact — conversation is already short.');
+    } catch (err) {
+      void vscode.window.showWarningMessage(`Could not compact conversation: ${(err as Error).message}`);
+    } finally {
+      this.setStatus('idle', false);
     }
   }
 
@@ -2093,7 +2104,8 @@ export class HarnessController {
 function mergeUsage(a: Usage, b: Usage): Usage {
   const inputTokens = (a.inputTokens ?? 0) + (b.inputTokens ?? 0);
   const outputTokens = (a.outputTokens ?? 0) + (b.outputTokens ?? 0);
-  const totalTokens = (a.totalTokens ?? 0) + (b.totalTokens ?? 0) || inputTokens + outputTokens;
+  const totalTokens = (a.totalTokens ?? ((a.inputTokens ?? 0) + (a.outputTokens ?? 0))) +
+    (b.totalTokens ?? ((b.inputTokens ?? 0) + (b.outputTokens ?? 0)));
   return {
     inputTokens: inputTokens || undefined,
     outputTokens: outputTokens || undefined,

@@ -140,9 +140,9 @@ test('a cancelled tool batch leaves a transcript the provider still accepts', as
 
 /* ----------------------------------------------------------- compaction */
 
-test('compaction never starts the kept tail with an orphaned tool result', () => {
+test('compaction never starts the kept tail with an orphaned tool result', async () => {
   const history: ChatMessage[] = [
-    { role: 'user', content: 'u1' },
+    { role: 'user', content: 'u1'.repeat(200) },
     { role: 'assistant', content: 'a1', toolCalls: [{ id: 't1', name: 'read_file', arguments: '{}' }] },
     { role: 'tool', toolCallId: 't1', name: 'read_file', content: 'r1' },
     { role: 'user', content: 'u2' },
@@ -159,10 +159,10 @@ test('compaction never starts the kept tail with an orphaned tool result', () =>
     { role: 'tool', toolCallId: 't5', name: 'read_file', content: 'r5' },
   ];
 
-  const { newHistory, result } = compactHistory(history, config({ compaction: {
+  const { newHistory, result } = await compactHistory(history, config({ compaction: {
     ...DEFAULT_CONFIG.compaction,
     keepLastMessages: 6,
-  } }));
+  } }), { id: 'test', label: 'test', async chat() { return { text: 'Earlier task details.', toolCalls: [] }; } });
 
   assert.equal(result.compacted, true);
   assert.equal(isTranscriptWellFormed(newHistory), true);
@@ -182,6 +182,7 @@ test('a follow-up task after mid-task compaction sends a well-formed prompt', as
     id: 'openai',
     label: 'scripted',
     async chat(req: ChatRequest): Promise<ProviderResponse> {
+      if (req.messages[0]?.content.startsWith('Summarize the following conversation')) return { text: 'Previous tasks involved inspecting and writing files.', toolCalls: [] };
       seen.push(req.messages.filter((m) => m.role !== 'system'));
       turn++;
       if (turn <= 3) {

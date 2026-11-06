@@ -604,3 +604,18 @@ for (const kind of ['openai', 'anthropic'] as const) {
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 }
+
+test('Anthropic input usage includes cache reads and writes in both streaming and JSON responses', async () => {
+  const provider = new AnthropicProvider({ apiKey: 'k', baseUrl: 'https://example.test' });
+  stubFetch(sseResponse([
+    sseChunk({ type: 'message_start', message: { usage: { input_tokens: 10, cache_read_input_tokens: 100, cache_creation_input_tokens: 20 } } }),
+    sseChunk({ type: 'message_delta', usage: { output_tokens: 3 }, delta: { stop_reason: 'end_turn' } }),
+  ]));
+  const streamed = await provider.chat({ model: 'x', messages: [{ role: 'user', content: 'hi' }], tools: [], onDelta: () => {} });
+  assert.equal(streamed.usage?.inputTokens, 130);
+  assert.equal(streamed.usage?.cachedTokens, 100);
+  stubFetch(new Response(JSON.stringify({ content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 10, cache_read_input_tokens: 100, cache_creation_input_tokens: 20, output_tokens: 3 } }), { headers: { 'content-type': 'application/json' } }));
+  const plain = await provider.chat({ model: 'x', messages: [{ role: 'user', content: 'hi' }], tools: [] });
+  assert.equal(plain.usage?.inputTokens, 130);
+  assert.equal(plain.usage?.cachedTokens, 100);
+});
