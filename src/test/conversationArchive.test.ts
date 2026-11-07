@@ -188,3 +188,124 @@ test('conversation search bounds its scan, resumes by UTF-16 offset and finds bo
     assert.equal(result.outcome, 'complete', result.summary);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('manual tool-output reduction requires the built-in archive reader and preserves exact originals across restore', async () => {
+  const dir = tmp();
+  try {
+    const output = 'BEGIN\n' + 'middle important evidence\n'.repeat(300) + 'END error=42';
+    const history: ChatMessage[] = [
+      { role: 'user', content: 'Earlier request' },
+      { role: 'assistant', content: '', toolCalls: [{ id: 'old', name: 'inspect', arguments: '{}' }] },
+      { role: 'tool', toolCallId: 'old', name: 'inspect', content: output },
+      { role: 'assistant', content: 'Earlier answer' },
+      { role: 'user', content: 'Latest request' }, { role: 'assistant', content: 'Latest answer' },
+    ];
+    const c = { ...config, compaction: { ...config.compaction, keepLastMessages: 2, verbatimFallback: false } };
+    const run = async (policy: string, collision = false) => {
+      fs.writeFileSync(path.join(dir, 'agent.md'), `---\ntools: [${policy}]\n---\nAgent`);
+      let calls = 0;
+      const provider: Provider = { id: 'fake', label: 'fake', async chat(req) {
+        calls++;
+        if (req.messages[0].content.startsWith('Summarize the following')) throw new Error('do not summarize');
+        if (calls === 1) return { text: '', toolCalls: [{ id: 'r', name: 'read_conversation', arguments: JSON.stringify({ message_index: 3, offset: 6 }) }] };
+        assert.match(req.messages.at(-1)?.content ?? '', /middle important evidence/);
+        return { text: 'done', toolCalls: [] };
+      } };
+      const custom: Tool[] = collision ? [{ name: 'read_conversation', description: 'custom', parameters: { type: 'object' }, async run() { throw new Error('must not run'); } }] : [];
+      const session = new HarnessSession({ host: new Host(dir), provider, config: c, tools: new ToolRegistry(custom), agentSelection: ['agent.md'] });
+      session.restoreConversation(JSON.parse(JSON.stringify(history)), {}, JSON.parse(JSON.stringify(history)), true);
+      const result = await session.compact();
+      return { result, session, calls };
+    };
+    const searchOnly = await run('search');
+    assert.equal(searchOnly.result.compacted, false);
+    assert.equal(searchOnly.session.conversationSnapshot[2].content, output);
+    const collision = await run('read', true);
+    assert.equal(collision.result.compacted, false);
+    const permitted = await run('read');
+    assert.equal(permitted.result.strategy, 'tool-output');
+    assert.equal(permitted.calls, 0, 'pruning does not call the provider or rerun the tool');
+    assert.match(permitted.session.conversationSnapshot[2].content, /message_index=3/);
+    assert.equal(permitted.session.originalConversationSnapshot[2].content, output);
+    const persisted = JSON.parse(JSON.stringify({ history: permitted.session.conversationSnapshot, original: permitted.session.originalConversationSnapshot }));
+    let turn = 0;
+    const provider: Provider = { id: 'fake', label: 'fake', async chat(req) {
+      if (++turn === 1) {
+        assert.match(req.messages.find((m) => m.toolCallId === 'old')?.content ?? '', /message_index=3/);
+        return { text: '', toolCalls: [{ id: 'read', name: 'read_conversation', arguments: '{"message_index":3,"offset":6}' }] };
+      }
+      assert.match(req.messages.at(-1)?.content ?? '', /middle important evidence/);
+      return { text: 'done', toolCalls: [] };
+    } };
+    const reopened = new HarnessSession({ host: new Host(dir), provider, config: c, agentSelection: ['agent.md'] });
+    reopened.restoreConversation(persisted.history, {}, persisted.original, true);
+    const task = await reopened.runTask('Retrieve the recorded output.', () => {});
+    assert.equal(task.outcome, 'complete', task.summary);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('overflow recovery reduces old recorded tool outputs first and lets the model retrieve the middle', async () => {
+  const dir = tmp();
+  try {
+    const output = 'start\n' + 'bulk-data '.repeat(900) + 'hidden UNIQUE_EVIDENCE\n' + 'end-data '.repeat(900);
+    const history: ChatMessage[] = [
+      { role: 'user', content: 'Old task' },
+      { role: 'assistant', content: '', toolCalls: [{ id: 'old', name: 'inspect', arguments: '{}' }] },
+      { role: 'tool', name: 'inspect', toolCallId: 'old', content: output },
+      { role: 'assistant', content: 'Old answer' },
+      { role: 'user', content: 'Previous question' }, { role: 'assistant', content: 'Previous answer' },
+    ];
+    let turn = 0;
+    const provider: Provider = { id: 'fake', label: 'fake', async chat(req) {
+      if (++turn === 1) throw new Error('maximum context length exceeded');
+      if (turn === 2) {
+        const old = req.messages.find((m) => m.toolCallId === 'old');
+        assert.match(old?.content ?? '', /message_index=3/);
+        assert.ok(!old?.content.includes('UNIQUE_EVIDENCE'));
+        assert.ok(req.messages.some((m) => m.role === 'user' && m.content === 'Current request'));
+        return { text: '', toolCalls: [{ id: 'lookup', name: 'read_conversation', arguments: JSON.stringify({ message_index: 3, offset: output.indexOf('hidden UNIQUE_EVIDENCE') }) }] };
+      }
+      assert.match(req.messages.at(-1)?.content ?? '', /hidden UNIQUE_EVIDENCE/);
+      return { text: 'done', toolCalls: [] };
+    } };
+    const c = { ...config, compaction: { ...config.compaction, keepLastMessages: 2 } };
+    const session = new HarnessSession({ host: new Host(dir), provider, config: c });
+    session.restoreConversation(JSON.parse(JSON.stringify(history)), {}, JSON.parse(JSON.stringify(history)), true);
+    const notices: string[] = [];
+    const task = await session.runTask('Current request', (event) => { if (event.type === 'notice') notices.push(event.message); });
+    assert.equal(task.outcome, 'complete', task.summary);
+    assert.ok(notices.some((s) => s.includes('Shortened 1 older recorded tool')));
+    assert.equal(session.originalConversationSnapshot[2].content, output);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('ranked search is available through search policy, excludes active copies, and returns bounded untrusted results', async () => {
+  const dir = tmp();
+  try {
+    fs.writeFileSync(path.join(dir, 'agent.md'), '---\ntools: [search]\n---\nAgent');
+    const original: ChatMessage[] = [
+      { role: 'user', content: 'Earlier diagnosis: src/core/agent.ts failed with Error42' },
+      { role: 'assistant', content: 'Related core agent issue' },
+      { role: 'user', content: 'Already active src/core/agent.ts' },
+    ];
+    const active = [original[2]];
+    let turn = 0;
+    const provider: Provider = { id: 'fake', label: 'fake', async chat(req) {
+      if (++turn === 1) {
+        assert.ok(req.tools.some((t) => t.name === 'search_conversation'));
+        assert.ok(!req.tools.some((t) => t.name === 'read_conversation'));
+        return { text: '', toolCalls: [{ id: 's', name: 'search_conversation', arguments: JSON.stringify({ query: 'src/core/agent.ts', mode: 'ranked' }) }] };
+      }
+      const content = req.messages.at(-1)?.content ?? '';
+      assert.match(content, /Ranked scan-window/);
+      assert.match(content, /message_index=1/);
+      assert.doesNotMatch(content, /message_index=3/);
+      assert.match(content, /untrusted history/);
+      return { text: 'done', toolCalls: [] };
+    } };
+    const session = new HarnessSession({ host: new Host(dir), provider, config, agentSelection: ['agent.md'] });
+    session.restoreConversation(JSON.parse(JSON.stringify(active)), {}, JSON.parse(JSON.stringify(original)), true);
+    const task = await session.runTask('Find the old path', () => {});
+    assert.equal(task.outcome, 'complete', task.summary);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

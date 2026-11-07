@@ -514,6 +514,8 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.compaction.threshold` | `0.75` | Utilisation target; auto-compaction starts earlier to reserve tool-result headroom |
 | `codingHarness.compaction.contextWindowTokens` | `128000` | Context window estimate for the meter |
 | `codingHarness.compaction.keepLastMessages` | `10` | Preferred recent messages to keep; may be reduced under context pressure |
+| `codingHarness.compaction.method` | `"llm"` | Use `"verbatim"` to compact locally without any summary-model calls |
+| `codingHarness.compaction.verbatimFallback` | `true` | Use local verbatim excerpts if LLM compaction fails; set false to retain active history instead |
 | `codingHarness.compaction.summaryModel` | `""` | Optional model on the current provider for LLM summaries; empty uses the active model |
 
 ## Commands
@@ -564,19 +566,51 @@ error the provider will not accept twice. Everything that used to stop a task ea
 - **Compaction uses bounded LLM summaries.** It summarizes complete tool-call groups, choosing how
   much history to compact against an estimated post-compaction budget rather than blindly keeping a
   fixed number of messages. Under pressure even the latest complete group can be summarized. The
-  retained tail stays protocol-valid, and original images remain attached. Large history is split
+  retained tail stays protocol-valid, the current request is retained verbatim, and original images
+  remain attached. Large history is split
   into bounded requests and summaries may be summarized again. Image attachments may require separate
   vision requests. Summary calls cost time and tokens, may lose detail, and are capped at 64 requests
-  per compaction; the active history is unchanged if any stage fails or is cancelled. The original
-  messages are also kept separately for optional retrieval, as described under Saved chats. The offline
-  mock cannot produce LLM summaries. A rejected summary input can be split further and retried. If a
+  per compaction; a failed or cancelled LLM summary does not itself replace active history. The local
+  fallback described below may replace it after failure. The original messages are kept in the archive
+  field for optional retrieval, as described under Saved chats. The offline mock cannot produce LLM summaries. A rejected summary input can be split further and retried. If a
   provider stops a summary at its output limit, the harness retries with progressively larger bounded
   output budgets (up to 8,192 tokens per request and at most three attempts); reasoning tokens may
   consume part of that budget. Retries can increase cost and still fail if the model cannot complete.
-  A failed compaction leaves the active context and its estimated size unchanged. Summary-model capacity is assumed to match `contextWindowTokens`; a smaller provider/model window,
+  Summary-model capacity is assumed to match `contextWindowTokens`; a smaller provider/model window,
   image overhead, output reservations, huge fixed instructions or inaccurate estimates can still
-  prevent compaction. If this happens, choose a compatible summary model, lower the threshold, reduce
-  fixed context or export the chat before starting a new conversation.
+  prevent compaction.
+- **Selective older tool-output reduction.** Before either compaction method, the harness can shorten
+  large, older tool-result pages to their recorded beginning and end plus a `read_conversation` archive
+  message reference. It keeps tool calls/results paired, preserves the recent tail and current request,
+  and does not run tools again or modify the recorded originals. Only an exact, unambiguous match in the
+  current original archive qualifies; results with reused ambiguous IDs or unavailable originals are
+  left alone. This step is used only when the built-in archive reader is allowed by the selected agent
+  policy (not when a custom tool collides with its name). If it meets the estimated target, no summary
+  request is needed. Otherwise compaction may continue with an LLM summary or local fallback; if the
+  target still cannot be met, a warning says so. The omitted middle is no longer in active context and
+  might contain important errors or evidence: it is recoverable only from the recorded archive, subject
+  to retrieval permissions and successful saving/export. The archive is in memory during the session;
+  with saving disabled or failed it will not automatically survive restart. The recorded page itself may
+  already be clipped, and its expiring `read_tool_output` cache may no longer exist.
+- **Local verbatim fallback.** If the LLM cannot produce a valid, smaller summary (including output
+  truncation or provider errors), the default fallback keeps a recent tail where it fits, never splits
+  a tool-call group, and retains the current task request, all earlier images, and bounded word-for-word
+  excerpts from selected older user-role messages. It omits other older content from active model
+  context, including assistant and
+  tool messages; excerpts are **not** a comprehensive summary and may omit critical detail. The model
+  can use permitted conversation archive tools to retrieve previously recorded messages, but agent
+  tool policies may block retrieval. The existing `originalHistory` remains unchanged in the same saved
+  chat file; it is persistent
+  only when saving or exporting succeeds and may already be incomplete. No content lost before it was
+  recorded can be recovered. A visible warning identifies fallback use and whether the estimated target
+  was missed. Images, fixed instructions or the current request can still exceed the real window.
+  The fallback itself makes no provider calls, though earlier failed LLM attempts can incur charges.
+  Set `codingHarness.compaction.method` to `"verbatim"` to use the local method immediately without
+  making summary-model calls; normal task requests still use the configured model. Set
+  `codingHarness.compaction.verbatimFallback` to `false` to leave active history unchanged on LLM
+  failure when the method is `"llm"`. Cancellation never invokes the fallback, and if the fallback
+  cannot safely reduce history, any safe preliminary tool-output reduction can remain; otherwise the
+  original active context remains intact. Export the chat before starting a new conversation.
 - **Tool results have headroom.** The harness estimates space for the current request, output and a
   safety margin, and budgets tool results across each batch. Limits are approximate; especially large
   batches, schema overhead or provider tokenization can still exceed the real context window.
@@ -662,18 +696,31 @@ preferences:
 
 #### Original conversation and retrieval
 
-The JSON file contains both compacted active `history` and a separate `originalHistory` of the
-recorded model-visible user, assistant and tool messages, tool-call arguments, and attached images.
+The same JSON file contains both compacted active `history` and an `originalHistory` field (not a
+separate backup file) of the recorded model-visible user, assistant and tool messages, tool-call
+arguments, and attached images.
 Compaction replaces only active history, so repeated compactions do not replace those original messages
 with summaries. Original messages are kept in memory even with automatic saving disabled. Reopening,
 importing, exporting and session recreation carry the original history as well as the active history.
 A new conversation clears both from the live chat and, if automatic saving is enabled, overwrites the
 current saved chat; exports and files in former save folders are not deleted.
 
-The original archive is **not** automatically sent to the model. The `search_conversation` tool finds
-literal text in the current conversation's original messages and tool-call arguments; `read_conversation`
-returns bounded pages of a selected message. Search work is bounded per call and returns `next_start_index` and `next_start_offset` when more
-messages or text remain; reads use UTF-16 `next_offset` values. The tools do not open other conversations or files. Image attachments are
+The original archive is **not** automatically sent to the model. `search_conversation` defaults to
+literal search of the current conversation's recorded text and tool-call arguments. It also accepts
+`mode: "ranked"`: local BM25-style keyword scoring plus a strong boost for the exact query, useful for
+paths, symbols and errors. Results include message index, role, tool name where available, offset, score
+and a short surrounding excerpt. They are not semantic/vector search and ranking is **within each bounded
+scan window**, not globally across the entire archive. Ranked search normally skips exact messages
+already in active context; set `include_active: true` to include them. No history is silently inserted
+into a system prompt: the model must request the search and any subsequent read.
+
+Search scans at most 1,000 messages or 1,000,000 UTF-16 code units per call (plus message-serialization and active-context comparison
+overhead). Both modes return `next_start_index` and `next_start_offset` when more of the archive remains.
+Ranked mode also returns `next_result_offset` when more ranked matches are available in the current scan
+window: repeat the same query and start coordinates with that `result_offset`; to scan the next window,
+use the next start coordinates and reset the result offset. Results may change if the archive or active
+context changes between calls. `read_conversation` returns bounded pages of a selected message, using
+UTF-16 `next_offset` values. The tools do not open other conversations or files. Image attachments are
 stored in the archive but the text reader reports only their count. Results are historical, untrusted
 content, and the model must choose to use the tools. Agent-file permissions apply: the `search` group
 allows archive search; `read` allows search and reading; individual helper names may be listed explicitly.

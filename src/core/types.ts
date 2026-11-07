@@ -275,6 +275,10 @@ export interface CompactionConfig {
   threshold: number; // 0-1, e.g. 0.75 means compact when 75% of context window used
   contextWindowTokens: number;
   keepLastMessages: number;
+  /** Prefer LLM summaries or use local verbatim excerpts directly. */
+  method?: 'llm' | 'verbatim';
+  /** Use a lossy local verbatim fallback when LLM compaction fails. */
+  verbatimFallback?: boolean;
   summaryModel?: string; // optional model to use for summarization, defaults to main model
 }
 
@@ -364,6 +368,8 @@ export const DEFAULT_CONFIG: HarnessConfig = {
     threshold: 0.75,
     contextWindowTokens: 128_000,
     keepLastMessages: 10,
+    method: 'llm',
+    verbatimFallback: true,
   },
 };
 
@@ -422,6 +428,8 @@ export function resolveConfig(partial: Partial<HarnessConfig> | undefined): Harn
       threshold: partial.compaction.threshold ?? DEFAULT_CONFIG.compaction.threshold,
       contextWindowTokens: partial.compaction.contextWindowTokens ?? DEFAULT_CONFIG.compaction.contextWindowTokens,
       keepLastMessages: partial.compaction.keepLastMessages ?? DEFAULT_CONFIG.compaction.keepLastMessages,
+      method: partial.compaction.method ?? DEFAULT_CONFIG.compaction.method,
+      verbatimFallback: partial.compaction.verbatimFallback ?? DEFAULT_CONFIG.compaction.verbatimFallback,
       summaryModel: partial.compaction.summaryModel ?? DEFAULT_CONFIG.compaction.summaryModel,
     };
   }

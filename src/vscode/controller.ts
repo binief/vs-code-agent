@@ -832,6 +832,8 @@ export class HarnessController {
         threshold: typeof threshold === 'number' ? threshold : 0.75,
         contextWindowTokens: typeof contextWindow === 'number' ? contextWindow : 128000,
         keepLastMessages: typeof keepLast === 'number' ? keepLast : 10,
+        method: c.get<unknown>('compaction.method') === 'verbatim' ? 'verbatim' : 'llm',
+        verbatimFallback: c.get<unknown>('compaction.verbatimFallback') === undefined || c.get<unknown>('compaction.verbatimFallback') === true,
         summaryModel: c.get<string>('compaction.summaryModel') || undefined,
       },
     });
@@ -1215,12 +1217,25 @@ export class HarnessController {
         this.pushNotice('info', 'Compaction cancelled.');
         return;
       }
-      this.pushNotice('info', 'Checking context for LLM compaction; summarization may require an additional provider request.');
+      this.pushNotice('info', this.readConfig().compaction.method === 'verbatim' ? 'Checking context for local verbatim compaction.' : 'Checking context for LLM compaction; summarization may require an additional provider request.');
       const result = await session.compact();
       this.cumulativeUsage = session.usage;
       if (result.compacted) {
-        this.pushNotice('info', `Compacted conversation: removed ${result.removed} old messages, saved approximately ${result.originalTokens - result.newTokens} tokens.`);
-        this.log.info(`manual compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens, removed ${result.removed}`);
+        if (result.strategy === 'tool-output') {
+          const targetNote = result.targetMet === false ? ` Estimated target not met.${result.fallbackReason ? ` ${result.fallbackReason}` : ''}` : '';
+          const coverage = session.isOriginalConversationComplete ? '' : ' Earlier recorded history may already be incomplete.';
+          this.pushNotice('warn', `Shortened ${result.toolOutputsReduced} older recorded tool result(s), saving approximately ${result.originalTokens - result.newTokens} estimated tokens. Their middles are omitted from active context; recorded pages remain in the in-memory archive. They will not automatically survive restart if saving is disabled or fails; later retrieval also depends on tool permissions.${coverage}${targetNote}`);
+        } else if (result.strategy === 'verbatim') {
+          const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
+          const coverage = session.isOriginalConversationComplete ? '' : ' Earlier recorded history may already be incomplete.';
+          const method = result.fallbackReason ? `LLM compaction failed: ${result.fallbackReason} Used local verbatim fallback` : 'Used local verbatim compaction';
+          this.pushNotice('warn', `${method}; saved approximately ${result.originalTokens - result.newTokens} tokens. Only selected user-role excerpts and images remain from older messages; other details are omitted from active context. Recorded originals remain in the conversation archive, subject to saving and tool permissions.${coverage}${targetNote}`);
+        } else {
+          const reductionNote = result.toolOutputsReduced ? ` ${result.toolOutputsReduced} older recorded tool result(s) were shortened before summarization; omitted details remain only in the archive, subject to saving and permissions.` : '';
+          const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
+          this.pushNotice(result.toolOutputsReduced || result.targetMet === false ? 'warn' : 'info', `Compacted conversation: removed ${result.removed} old messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${reductionNote}${targetNote}`);
+        }
+        this.log.info(`manual ${result.strategy ?? 'LLM'} compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens, removed ${result.removed}`);
         const { tokens, window, percent } = session.getContextUsage();
         this.state = { ...this.state, contextTokens: tokens, contextWindow: window, contextPercent: percent, cumulativeUsage: this.cumulativeUsage };
         this.post({ type: 'context', contextTokens: tokens, contextWindow: window, contextPercent: percent });

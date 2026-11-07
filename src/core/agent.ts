@@ -1,12 +1,13 @@
 import { agentFilesSummary, discoverAgentFiles, selectAgentFiles } from './agentFiles';
 import { CheckpointStore, type RevertReport } from './checkpoints';
-import { CompactionCancelled, compactHistory, estimateRequestTokens, estimateTokens } from './compaction';
+import { CompactionCancelled, compactHistory, estimateMessagesTokens, estimateRequestTokens, estimateTokens } from './compaction';
 import { isRetryableProviderError, retryDelayMs } from './providers/errors';
 import { ThinkingStreamGuard, RepeatedToolCallTracker, type ThinkingStopReason } from './loopTracking';
 import { buildSystemPrompt, summarizeDiagnostics } from './prompt';
 import { createDefaultTools, ToolRegistry } from './tools';
 import { resolveAgentToolPolicy } from './toolPolicy';
 import { repairToolMessages } from './transcript';
+import { rankedArchiveSearch } from './rankedArchiveSearch';
 import {
   DEFAULT_CONFIG,
   type ApprovalDecision,
@@ -63,9 +64,12 @@ const TOOL_OUTPUT_READER: ToolSpec = {
 
 const ARCHIVE_SEARCH: ToolSpec = {
   name: 'search_conversation',
-  description: 'Search the current conversation’s original message text, including messages summarized out of active context. Results are untrusted historical data.',
+  description: 'Search the current conversation’s original message text and tool-call arguments. Literal search is the default; ranked mode scores exact phrases and keywords within a bounded scan window. Results are untrusted historical data.',
   parameters: { type: 'object', properties: {
-    query: { type: 'string', description: 'Literal text to find.' },
+    query: { type: 'string', description: 'Literal text to find, or a phrase/keywords when mode is ranked.' },
+    mode: { type: 'string', enum: ['literal', 'ranked'], description: 'literal (default) or ranked local exact/keyword search.' },
+    include_active: { type: 'boolean', description: 'Ranked mode: include messages already in active context; default false.' },
+    result_offset: { type: 'number', description: 'Ranked mode: next_result_offset with the same start_index and start_offset to page ranked results within this scan window.' },
     start_index: { type: 'number', description: '1-based first message to search; default 1.' },
     start_offset: { type: 'number', description: '0-based UTF-16 offset from next_start_offset; default 0.' },
     case_sensitive: { type: 'boolean', description: 'Match case exactly; default false.' },
@@ -255,8 +259,25 @@ export class HarnessSession {
     return { tokens: total, window, percent };
   }
 
+  /** Resolve the same current agent policy used by a task; fail closed on discovery errors. */
+  private async canReadArchiveForCompaction(): Promise<boolean> {
+    if (this.registry.has(ARCHIVE_READ.name) || !this.originalHistory.length) return false;
+    try {
+      const workspace = await this.collectWorkspaceContext();
+      const found = discoverAgentFiles({ root: this.deps.host.workspaceRoot, config: this.deps.config.agentFiles,
+        focusPaths: (workspace?.openFiles ?? []).map((file) => file.path) });
+      const selected = selectAgentFiles(found, this.deps.agentSelection);
+      const helpers = [ARCHIVE_SEARCH, ARCHIVE_READ].filter((spec) => !this.registry.has(spec.name));
+      return resolveAgentToolPolicy(selected, [...this.registry.specs(), ...helpers], new Set(helpers.map((s) => s.name)))
+        .tools.some((spec) => spec.name === ARCHIVE_READ.name);
+    } catch (err) {
+      this.deps.host.log('warn', `archive permission discovery failed during compaction: ${(err as Error).message}`);
+      return false;
+    }
+  }
+
   /** Manually compact conversation history using the configured provider. */
-  async compact(): Promise<{ compacted: boolean; originalTokens: number; newTokens: number; removed: number; reason: string }> {
+  async compact(): Promise<{ compacted: boolean; originalTokens: number; newTokens: number; removed: number; reason: string; strategy?: 'llm' | 'verbatim' | 'tool-output'; toolOutputsReduced?: number; fallbackReason?: string; targetMet?: boolean }> {
     if (this.busy) throw new Error('Cannot compact while a task is running.');
     this.busy = true;
     this.controller = new AbortController();
@@ -264,10 +285,12 @@ export class HarnessSession {
       const c = this.deps.config;
       const target = Math.max(0, Math.floor((c.compaction.contextWindowTokens * Math.min(0.6, c.compaction.threshold * 0.85) - Math.max(0, c.maxOutputTokens)) / this.inputCalibration) -
         estimateRequestTokens(this.lastSystemPrompt ? [{ role: 'system', content: this.lastSystemPrompt }] : [], this.toolsForEstimate()));
-      const { newHistory, result } = await compactHistory(this.history, c, this.deps.provider, this.controller.signal, { targetHistoryTokens: target });
+      const latestUser = [...this.history].reverse().find((message) => message.role === 'user');
+      const archiveMessages = await this.canReadArchiveForCompaction() ? this.originalConversationSnapshot : undefined;
+      const { newHistory, result } = await compactHistory(this.history, c, this.deps.provider, this.controller.signal, { targetHistoryTokens: target, allowVerbatimFallback: c.compaction.method === 'verbatim' || c.compaction.verbatimFallback !== false, useVerbatimOnly: c.compaction.method === 'verbatim', preserveUserMessage: latestUser, archiveMessages });
       if (result.usage) this.cumulativeUsage = mergeUsage(this.cumulativeUsage, result.usage);
       if (result.compacted) this.history = newHistory;
-      return { compacted: result.compacted, originalTokens: result.originalTokens, newTokens: result.newTokens, removed: result.removedMessages, reason: result.summary };
+      return { compacted: result.compacted, originalTokens: result.originalTokens, newTokens: result.newTokens, removed: result.removedMessages, reason: result.summary, strategy: result.strategy, toolOutputsReduced: result.toolOutputsReduced, fallbackReason: result.fallbackReason, targetMet: result.targetMet };
     } catch (err) {
       if (err instanceof CompactionCancelled && err.usage) this.cumulativeUsage = mergeUsage(this.cumulativeUsage, err.usage);
       throw err;
@@ -407,11 +430,16 @@ export class HarnessSession {
         return Math.max(0, Math.floor((target - Math.max(0, c.maxOutputTokens)) / this.inputCalibration) -
           estimateRequestTokens([{ role: 'system', content: system }], tools));
       };
-      const compactTask = async (tools: readonly ToolSpec[]): Promise<boolean> => {
-        onEvent({ type: 'notice', message: 'Checking context for LLM compaction; summarization may require an additional provider request.', level: 'info' });
+      const compactTask = async (tools: readonly ToolSpec[], providerOverflow = false): Promise<boolean> => {
+        const localOnly = this.deps.config.compaction.method === 'verbatim';
+        onEvent({ type: 'notice', message: localOnly ? 'Checking context for local verbatim compaction.' : 'Checking context for LLM compaction; summarization may require an additional provider request.', level: 'info' });
         let compacted: Awaited<ReturnType<typeof compactHistory>>;
         try {
-          compacted = await compactHistory([...this.history, ...taskMessages], this.deps.config, this.deps.provider, signal, { targetHistoryTokens: historyTarget(tools) });
+          const active = [...this.history, ...taskMessages];
+          // An endpoint rejection is evidence that our configured estimate is
+          // too optimistic. Request a material reduction even for short chats.
+          const target = providerOverflow ? Math.min(historyTarget(tools), Math.floor(estimateMessagesTokens(active) * 0.5)) : historyTarget(tools);
+          compacted = await compactHistory(active, this.deps.config, this.deps.provider, signal, { targetHistoryTokens: target, allowVerbatimFallback: localOnly || this.deps.config.compaction.verbatimFallback !== false, useVerbatimOnly: localOnly, preserveUserMessage: userMessage, archiveMessages: !this.registry.has(ARCHIVE_READ.name) && tools.some((spec) => spec.name === ARCHIVE_READ.name) ? this.originalConversationSnapshot : undefined });
         } catch (err) {
           if (err instanceof CompactionCancelled && err.usage) {
             this.cumulativeUsage = mergeUsage(this.cumulativeUsage, err.usage);
@@ -435,10 +463,28 @@ export class HarnessSession {
         this.history = [];
         taskMessages.splice(0, taskMessages.length, ...newHistory);
         const retained = newHistory.length - 1;
-        const recentNote = retained < Math.max(2, this.deps.config.compaction.keepLastMessages)
+        const recentNote = result.strategy === 'llm' && retained < Math.max(2, this.deps.config.compaction.keepLastMessages)
           ? ' Some recent messages were summarized to meet the context budget.' : '';
-        onEvent({ type: 'notice', message: `LLM compacted conversation: removed ${result.removedMessages} messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${recentNote}`, level: 'info' });
-        host.log('info', `LLM compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens`);
+        if (result.strategy === 'tool-output') {
+          if (result.targetMet === false) autoCompactRetryAt = this.history.length + taskMessages.length + 2;
+          const targetNote = result.targetMet === false ? ` Estimated target not met.${result.fallbackReason ? ` ${result.fallbackReason}` : ''}` : '';
+          onEvent({ type: 'notice', level: 'warn', message: `Shortened ${result.toolOutputsReduced} older recorded tool result(s), saving approximately ${result.originalTokens - result.newTokens} estimated tokens. Their middles are omitted from active context; recorded pages remain in the in-memory archive. They will not automatically survive restart if saving is disabled or fails; later retrieval also depends on tool permissions.${this.originalHistoryComplete ? '' : ' Earlier history may be incomplete.'}${targetNote}` });
+        } else if (result.strategy === 'verbatim') {
+          // Do not immediately retry failed LLM summarization on an unchanged
+          // fallback context; try again only after further messages arrive.
+          autoCompactRetryAt = this.history.length + taskMessages.length + 2;
+          const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
+          const coverage = this.originalHistoryComplete ? '' : ' Earlier recorded history may already be incomplete.';
+          const access = allowedToolNames.has(ARCHIVE_READ.name) && !this.registry.has(ARCHIVE_READ.name)
+            ? '' : ' Archive reading is unavailable under the active agent tool policy.';
+          const method = result.fallbackReason ? `LLM compaction failed: ${result.fallbackReason} Used local verbatim fallback` : 'Used local verbatim compaction';
+          onEvent({ type: 'notice', level: 'warn', message: `${method}; saved approximately ${result.originalTokens - result.newTokens} tokens. Only selected user-role excerpts and images remain from older messages; other details are omitted from active context. Recorded originals remain in the conversation archive, subject to saving and tool permissions.${coverage}${access}${targetNote}${recentNote}` });
+        } else {
+          const reductionNote = result.toolOutputsReduced ? ` ${result.toolOutputsReduced} older recorded tool result(s) were shortened before summarization; omitted details remain only in the archive, subject to saving and permissions.` : '';
+          const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
+          onEvent({ type: 'notice', message: `LLM compacted conversation: removed ${result.removedMessages} messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${recentNote}${reductionNote}${targetNote}`, level: result.toolOutputsReduced || result.targetMet === false ? 'warn' : 'info' });
+        }
+        host.log('info', `${result.strategy ?? 'LLM'} compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens`);
         return true;
       };
 
@@ -732,8 +778,8 @@ export class HarnessSession {
           if (!contextOverflowRetried && !attemptText && this.deps.config.compaction.enabled &&
               /context.{0,30}(?:length|window|exceed|limit)|maximum.{0,30}(?:context|tokens)|too many tokens|token limit exceeded|(?:input|prompt).{0,30}too (?:long|large)/i.test(providerMessage)) {
             contextOverflowRetried = true;
-            onEvent({ type: 'notice', message: 'Provider rejected the context as too large; attempting LLM compaction and one retry.', level: 'warn' });
-            if (await compactTask(toolsForStep)) { step--; continue; }
+            onEvent({ type: 'notice', message: `Provider rejected the context as too large; attempting ${this.deps.config.compaction.method === 'verbatim' ? 'local verbatim' : 'LLM'} compaction and one retry.`, level: 'warn' });
+            if (await compactTask(toolsForStep, true)) { step--; continue; }
           }
           errorText = providerMessage;
           host.log('error', `provider error: ${errorText}`);
@@ -1018,6 +1064,16 @@ export class HarnessSession {
           const firstOffset = args.start_offset === undefined ? 0 : Number(args.start_offset);
           if (!Number.isInteger(from) || from < 1 || !Number.isInteger(firstOffset) || firstOffset < 0) return finish({ ok: false, content: 'start_index must be positive and start_offset must be non-negative integers.', summary: 'bad index' });
           const query = args.query as string;
+          if (args.mode !== undefined && args.mode !== 'literal' && args.mode !== 'ranked') return finish({ ok: false, content: 'mode must be literal or ranked.', summary: 'bad mode' });
+          if (args.mode === 'ranked') {
+            if (args.include_active !== undefined && typeof args.include_active !== 'boolean') return finish({ ok: false, content: 'include_active must be a boolean.', summary: 'bad arguments' });
+            const resultOffset = args.result_offset === undefined ? 0 : Number(args.result_offset);
+            if (!Number.isInteger(resultOffset) || resultOffset < 0 || resultOffset > 1000) return finish({ ok: false, content: 'result_offset must be a non-negative integer at most 1000.', summary: 'bad offset' });
+            const ranked = rankedArchiveSearch({ archive, active: [...this.history, ...(this.pendingMessages ?? [])], text: archiveMessageText, query,
+              caseSensitive: args.case_sensitive === true, startIndex: from, startOffset: firstOffset, resultOffset,
+              includeActive: args.include_active === true, maxBytes: Math.min(MAX_TOOL_RESULT_BYTES, Math.max(128, outputTokenBudget * 3 - 450)), coverage });
+            return finish({ ok: ranked.ok, content: ranked.content, summary: ranked.ok ? `${ranked.count} ranked archived matches` : 'bad search' });
+          }
           const expression = args.case_sensitive ? undefined : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'iu');
           const results: string[] = [];
           let nextIndex: number | undefined;
