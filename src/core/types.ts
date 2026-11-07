@@ -297,6 +297,8 @@ export interface HarnessConfig {
   stream: boolean;
   /** Show the model's reasoning stream, when the backend provides one. */
   showThinking: boolean;
+  /** Allow explicitly permitted, read-only delegated investigations. */
+  subagentsEnabled: boolean;
   /** Instructions loaded from agent.md/AGENTS.md files. */
   agentFiles: AgentFilesConfig;
   /** Which factual context is included in the system message. */
@@ -322,6 +324,7 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   lineEndings: 'auto',
   stream: true,
   showThinking: true,
+  subagentsEnabled: false,
   agentFiles: {
     enabled: true,
     names: ['AGENTS.md', 'agent.md', 'agents.md', 'copilot-instructions.md'],

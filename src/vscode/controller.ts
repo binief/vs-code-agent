@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { createHash, randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
-import { HarnessSession } from '../core/agent';
+import { HarnessSession, withDelegationSpec } from '../core/agent';
 import { estimateMessagesTokens } from '../core/compaction';
 import { agentFilesSummary, discoverAgentFiles, selectAgentFiles, type AgentFilesResult } from '../core/agentFiles';
 import { buildSystemPrompt, summarizeDiagnostics } from '../core/prompt';
@@ -800,6 +800,7 @@ export class HarnessController {
       lineEndings: c.get('lineEndings'),
       stream: c.get('stream'),
       showThinking: c.get('showThinking'),
+      subagentsEnabled: c.get<boolean>('subagents.enabled') === true,
       agentFiles: {
         enabled: Boolean(agentEnabled),
         names: agentNames,
@@ -1663,7 +1664,7 @@ export class HarnessController {
       '---',
       '# Agent instructions',
       '',
-      '<!-- No tools are enabled by default. Add read, search, edit, execute, mcp, or exact tool names above. -->',
+      '<!-- No tools are enabled by default. Add read, search, edit, execute, mcp, subagent, or exact tool names above. -->',
       '',
       '<!-- Everything below is sent with every task when this file is selected. -->',
       '<!-- Add project conventions, commands to run, style rules and things to avoid. -->',
@@ -1723,7 +1724,8 @@ export class HarnessController {
     }
     let tools;
     try {
-      tools = resolveAgentToolPolicy(agentFiles, this.session?.toolSpecs ?? new ToolRegistry(createDefaultTools()).specs()).tools;
+      const specs = this.session?.toolSpecs ?? withDelegationSpec(new ToolRegistry(createDefaultTools()).specs());
+      tools = resolveAgentToolPolicy(agentFiles, specs).tools.filter((tool) => config.subagentsEnabled || tool.name !== 'delegate_task');
     } catch (err) {
       void vscode.window.showWarningMessage(`Cannot preview agent tool policy: ${(err as Error).message}`);
       return;

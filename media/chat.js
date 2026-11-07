@@ -773,6 +773,8 @@
         return 'terminal';
       case 'get_diagnostics':
         return 'warn';
+      case 'delegate_task':
+        return 'spark';
       default:
         return name && name.indexOf('mcp_') === 0 ? 'plug' : 'terminal';
     }
@@ -787,6 +789,7 @@
       return oneLine(item.args, 60);
     }
     if (item.name === 'run_command' && args.command) return args.command;
+    if (item.name === 'delegate_task' && args.task) return args.task;
     return (
       args.path ||
       args.file ||

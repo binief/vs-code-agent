@@ -229,7 +229,7 @@ Review the code and report findings without modifying files.
 The list is enforced both when presenting tools to the model and when executing its calls. Available
 groups are `read` (`list_files`, `read_file`, `get_diagnostics`, `open_file`), `search` (`list_files`,
 `search_text`), `edit` (`create_file`, `write_file`, `replace_in_file`, `delete_file`), `execute`
-(`run_command`), and `mcp` (all registered `mcp_` tools). You may instead name exact registered tools.
+(`run_command`), `mcp` (all registered `mcp_` tools), and `subagent` (`delegate_task`, when enabled). You may instead name exact registered tools.
 `tools: []`, no selected files, or no selected file with a `tools` declaration permits no tools.
 In the panel, choosing “Use every discovered file” selects all discovered files.
 
@@ -244,6 +244,34 @@ modify files, and MCP servers may have arbitrary side effects, even when `edit` 
 command, edit and approval settings still apply to their respective built-in tools. Natural-language
 instructions alone do not enforce read-only access. In particular, a list that includes `edit`,
 `execute`, and `mcp` explicitly permits those capabilities; remove them for a read-only reviewer.
+
+### Optional read-only subagents
+
+Subagents are **off by default**. To enable them, set `codingHarness.subagents.enabled` to `true`
+in VS Code Settings and explicitly allow `subagent` (or `delegate_task`) alongside the read/search
+tools in the selected agent file's YAML:
+
+```yaml
+---
+tools: [read, search, edit, execute, subagent]
+---
+```
+
+Every selected file that declares tools must permit delegation: their permissions still intersect.
+The main agent decides whether to call `delegate_task`, supplying a focused task and any relevant
+context. Each call runs a separate, sequential subagent conversation with the same model, workspace
+and selected instruction snapshot. Parent chat history and images are not automatically included.
+Only permitted built-in `list_files`, `read_file`, `search_text` and `get_diagnostics` are available
+to the subagent. It cannot edit, run commands, use MCP, open files in the editor, or delegate again.
+Its file access follows the existing workspace and outside-workspace settings. If no read-only tool is
+permitted, delegation fails instead of guessing.
+
+Only the child’s final findings and any warnings are sent back to the main conversation; the child’s
+intermediate transcript is not saved in the chat. The tool card and notices show progress and failures.
+Child model usage is included in the session total. Cancellation of the main task also cancels the
+child, subject to the provider honoring cancellation. These findings are unverified and may omit or
+misstate details; the main agent should inspect evidence when necessary. Additional model calls can
+increase time and cost. The offline mock planner does not autonomously decide to delegate.
 
 ### Commands
 
@@ -505,6 +533,7 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.mcp.timeoutMs` | `10000` | Default timeout for MCP tool calls |
 | `codingHarness.mcp.loadFromFiles` | `true` | Read servers from workspace config files |
 | `codingHarness.mcp.configFiles` | `[".vscode/mcp.json",".mcp.json","mcp.json"]` | Files scanned for servers |
+| `codingHarness.subagents.enabled` | `false` | Enable explicitly permitted, read-only subagent delegation |
 | `codingHarness.compaction.enabled` | `true` | Enable conversation compaction |
 | `codingHarness.compaction.autoCompact` | `true` | Compact automatically near the context limit |
 | `codingHarness.compaction.threshold` | `0.75` | Utilisation target; auto-compaction starts earlier to reserve tool-result headroom |

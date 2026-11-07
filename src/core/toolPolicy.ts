@@ -7,6 +7,7 @@ const GROUPS: Record<string, readonly string[]> = {
   search: ['list_files', 'search_text'],
   edit: ['create_file', 'write_file', 'replace_in_file', 'delete_file'],
   execute: ['run_command'],
+  subagent: ['delegate_task'],
 };
 
 /**

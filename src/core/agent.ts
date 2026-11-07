@@ -1,4 +1,4 @@
-import { agentFilesSummary, discoverAgentFiles, selectAgentFiles } from './agentFiles';
+import { agentFilesSummary, discoverAgentFiles, selectAgentFiles, type SelectedAgentFiles } from './agentFiles';
 import { CheckpointStore, type RevertReport } from './checkpoints';
 import { CompactionCancelled, compactHistory, contextBreakdown, contextBreakdownTotal, estimateMessagesTokens, estimateRequestTokens, estimateTokens } from './compaction';
 import { isRetryableProviderError, retryDelayMs } from './providers/errors';
@@ -47,6 +47,23 @@ export interface AgentDeps {
    * the files the user chose. `undefined`/`null` sends everything discovered.
    */
   agentSelection?: readonly string[] | null;
+  /** Internal delegation state: preserve the parent's policy and selected instructions. */
+  delegated?: { selected: SelectedAgentFiles; policySpecs: readonly ToolSpec[]; allowed: ReadonlySet<string> };
+}
+
+const DELEGATE_TOOL: ToolSpec = {
+  name: 'delegate_task',
+  description: 'Delegate a focused read-only investigation to a separate agent. Supply only relevant context; the result is an unverified handoff, not the child transcript. The child cannot edit, run commands, use MCP, or delegate further.',
+  parameters: { type: 'object', properties: {
+    task: { type: 'string', description: 'A focused investigation or review question.' },
+    context: { type: 'string', description: 'Relevant background or constraints to pass to the subagent; parent chat history is not included.' },
+  }, required: ['task'] },
+};
+const SUBAGENT_READ_TOOLS = new Set(['list_files', 'read_file', 'search_text', 'get_diagnostics']);
+
+/** Include the reserved delegation name for policy parsing, even when disabled. */
+export function withDelegationSpec(specs: readonly ToolSpec[]): ToolSpec[] {
+  return [...specs.filter((spec) => spec.name !== DELEGATE_TOOL.name), DELEGATE_TOOL];
 }
 
 const MAX_THINKING_DISPLAY_CHARS = 12_000;
@@ -97,9 +114,9 @@ export class HarnessSession {
     return this.registry.names();
   }
 
-  /** Tool schemas handed to the provider (used by the context preview). */
+  /** Known schemas for resolving policy in the context preview. */
   get toolSpecs(): ToolSpec[] {
-    return this.registry.specs();
+    return withDelegationSpec(this.registry.specs());
   }
 
   get isRunning(): boolean {
@@ -277,34 +294,37 @@ export class HarnessSession {
       const diagnostics = this.deps.config.context.diagnostics ? await this.collectDiagnostics() : undefined;
       // Instructions are re-read for every task, so editing an agent file is
       // picked up by the next prompt without restarting the extension.
-      let agentFiles: ReturnType<typeof discoverAgentFiles>;
-      try {
-        agentFiles = discoverAgentFiles({
-          root: host.workspaceRoot,
-          config: this.deps.config.agentFiles,
-          focusPaths: (workspace?.openFiles ?? []).map((file) => file.path),
-        });
-      } catch (err) {
-        // Record discovery failure so the policy resolver can fail closed.
-        host.log('warn', `agent instruction discovery failed: ${(err as Error).message}`);
-        agentFiles = {
-          enabled: this.deps.config.agentFiles.enabled,
-          root: host.workspaceRoot,
-          names: this.deps.config.agentFiles.names,
-          patterns: this.deps.config.agentFiles.patterns,
-          scanNested: this.deps.config.agentFiles.scanNested,
-          maxDepth: this.deps.config.agentFiles.maxDepth,
-          includeUser: this.deps.config.agentFiles.includeUser,
-          userPath: this.deps.config.agentFiles.userPath,
-          files: [],
-          skipped: [{ path: '(discovery)', reason: (err as Error).message }],
-          totalBytes: 0,
-        };
+      let selected: SelectedAgentFiles;
+      if (this.deps.delegated) {
+        // Use the exact instruction snapshot and permission ceiling of the parent.
+        selected = this.deps.delegated.selected;
+      } else {
+        let agentFiles: ReturnType<typeof discoverAgentFiles>;
+        try {
+          agentFiles = discoverAgentFiles({
+            root: host.workspaceRoot,
+            config: this.deps.config.agentFiles,
+            focusPaths: (workspace?.openFiles ?? []).map((file) => file.path),
+          });
+        } catch (err) {
+          // Record discovery failure so the policy resolver can fail closed.
+          host.log('warn', `agent instruction discovery failed: ${(err as Error).message}`);
+          agentFiles = {
+            enabled: this.deps.config.agentFiles.enabled,
+            root: host.workspaceRoot,
+            names: this.deps.config.agentFiles.names,
+            patterns: this.deps.config.agentFiles.patterns,
+            scanNested: this.deps.config.agentFiles.scanNested,
+            maxDepth: this.deps.config.agentFiles.maxDepth,
+            includeUser: this.deps.config.agentFiles.includeUser,
+            userPath: this.deps.config.agentFiles.userPath,
+            files: [],
+            skipped: [{ path: '(discovery)', reason: (err as Error).message }],
+            totalBytes: 0,
+          };
+        }
+        selected = selectAgentFiles(agentFiles, this.deps.agentSelection);
       }
-      // The user may have pinned a subset (the agents chip in the panel). The
-      // selection is applied here, not in discovery, so the full result stays
-      // available for the picker; missing pinned files fail closed.
-      const selected = selectAgentFiles(agentFiles, this.deps.agentSelection);
       if (selected.missing.length > 0) {
         host.log(
           'warn',
@@ -332,7 +352,15 @@ export class HarnessSession {
           (selected.selection ? ` (${selected.files.length} of ${selected.available} selected)` : '') +
           (selected.skipped.length ? ` (${selected.skipped.length} skipped)` : ''),
       );
-      const toolPolicy = resolveAgentToolPolicy(selected, this.registry.specs());
+      // Keep the reserved tool known to the policy parser even when disabled, so
+      // an agent file can retain its permission while the setting is switched off.
+      const policySpecs = this.deps.delegated?.policySpecs ?? withDelegationSpec(this.registry.specs());
+      const resolved = resolveAgentToolPolicy(selected, policySpecs);
+      const toolPolicy = { ...resolved, tools: resolved.tools.filter((spec) => {
+        if (this.deps.delegated && !this.deps.delegated.allowed.has(spec.name)) return false;
+        if (spec.name === DELEGATE_TOOL.name) return !this.deps.delegated && this.deps.config.subagentsEnabled === true;
+        return this.registry.has(spec.name);
+      }) };
       const allowedToolNames = new Set(toolPolicy.tools.map((tool) => tool.name));
       this.lastAllowedTools = toolPolicy.tools;
       if (toolPolicy.restricted) {
@@ -699,7 +727,7 @@ export class HarnessSession {
             });
             continue;
           }
-          const result = await this.executeToolCall(call, onEvent, signal, allowedToolNames, 2048);
+          const result = await this.executeToolCall(call, onEvent, signal, allowedToolNames, 2048, selected, policySpecs, step);
           toolCallsRun++;
           addMessage({ role: 'tool', toolCallId: call.id, name: call.name,
             content: result.content });
@@ -837,6 +865,9 @@ export class HarnessSession {
     signal: AbortSignal,
     allowedTools: ReadonlySet<string>,
     outputTokenBudget: number,
+    selected: SelectedAgentFiles,
+    policySpecs: readonly ToolSpec[],
+    step: number,
   ): Promise<ToolResult> {
     const started = Date.now();
     const host = this.deps.host;
@@ -859,6 +890,58 @@ export class HarnessSession {
     if (signal.aborted) return finish({ ok: false, content: CANCELLED_TOOL_RESULT, summary: 'cancelled' });
     if (!allowedTools.has(call.name)) {
       return finish({ ok: false, content: `Tool "${call.name}" is not allowed by the selected agent tool policy or is unavailable.`, summary: 'tool not allowed' });
+    }
+    if (call.name === DELEGATE_TOOL.name) {
+      if (this.deps.config.subagentsEnabled !== true || this.deps.delegated) {
+        return finish({ ok: false, content: 'Subagents are disabled.', summary: 'subagent disabled' });
+      }
+      let args: Record<string, unknown>;
+      try { args = parseToolArguments(call.arguments); } catch (err) {
+        return finish({ ok: false, content: `Invalid delegation arguments: ${(err as Error).message}`, summary: 'bad arguments' });
+      }
+      if (typeof args.task !== 'string' || !args.task.trim() || (args.context !== undefined && typeof args.context !== 'string')) {
+        return finish({ ok: false, content: 'Delegation requires a non-empty task string and an optional context string.', summary: 'bad arguments' });
+      }
+      const safeTools = createDefaultTools().filter((tool) => SUBAGENT_READ_TOOLS.has(tool.name) &&
+        allowedTools.has(tool.name) && this.registry.get(tool.name) === tool);
+      if (!safeTools.length) return finish({ ok: false, content: 'No read-only built-in tools are allowed for this subagent. Add read or search permissions in the selected agent files.', summary: 'no read tools' });
+      const child = new HarnessSession({
+        host, provider: this.deps.provider, config: { ...this.deps.config, subagentsEnabled: false },
+        registry: new ToolRegistry(safeTools),
+        delegated: { selected, policySpecs, allowed: allowedTools },
+      });
+      const abortChild = () => child.cancel();
+      signal.addEventListener('abort', abortChild, { once: true });
+      const issues: string[] = [];
+      onEvent({ type: 'notice', level: 'info', message: 'Subagent started a read-only investigation with separate context.' });
+      try {
+        if (signal.aborted) return finish({ ok: false, content: CANCELLED_TOOL_RESULT, summary: 'cancelled' });
+        const prompt = `Delegated task: ${args.task.trim()}${typeof args.context === 'string' && args.context.trim() ? `\n\nRelevant context supplied by the parent:\n${args.context.trim()}` : ''}\n\nReturn findings with relevant file paths and evidence, and explicitly identify uncertainties or unverified details.`;
+        const result = await child.runTask(prompt, (event) => {
+          if (event.type === 'tool-start') onEvent({ type: 'notice', level: 'info', message: `Subagent requested ${event.name}.` });
+          if (event.type === 'tool-end' && !event.ok) issues.push(`${event.name}: ${event.summary}`);
+          if (event.type === 'notice' && (event.level === 'warn' || event.level === 'error')) {
+            issues.push(event.message);
+            onEvent({ type: 'notice', level: event.level, message: `Subagent: ${event.message}` });
+          }
+        });
+        this.cumulativeUsage = mergeUsage(this.cumulativeUsage, result.usage);
+        onEvent({ type: 'usage', step, usage: result.usage, cumulative: { ...this.cumulativeUsage } });
+        const history = child.transcript;
+        let afterTool = history.length - 1;
+        while (afterTool >= 0 && history[afterTool].role !== 'tool') afterTool--;
+        const answer = history.slice(afterTool + 1).filter((message) => message.role === 'assistant' && !message.toolCalls?.length)
+          .map((message) => message.content.trim()).filter(Boolean).join('\n\n');
+        const issueText = issues.length ? `\nSubagent warnings or failed tools:\n${issues.map((issue) => `- ${issue}`).join('\n')}` : '';
+        if (signal.aborted) return finish({ ok: false, content: 'Subagent cancelled.', summary: 'subagent cancelled' });
+        if (result.outcome !== 'complete') {
+          return finish({ ok: false, content: `Subagent ${result.outcome}: ${result.summary}${answer ? `\nPartial response (not a completed handoff):\n${answer}` : ''}${issueText}`, summary: `subagent ${result.outcome}` });
+        }
+        if (!answer) return finish({ ok: false, content: `Subagent returned no final findings.${issueText}`, summary: 'empty subagent response' });
+        return finish({ ok: true, content: `Subagent findings (unverified handoff):\n${answer}${issueText}`, summary: issues.length ? 'subagent finished with warnings' : 'subagent finished' });
+      } finally {
+        signal.removeEventListener('abort', abortChild);
+      }
     }
     const tool = this.registry.get(call.name);
     if (!tool) {

@@ -534,3 +534,13 @@ test('context breakdown is shown on demand and calls out a large output reserve'
   assert.ok(h.posted.some((m) => m.type === 'preview-context'));
   h.close();
 });
+
+test('the delegated task is visible in its tool card', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [{ id: 'delegation', kind: 'tool', toolCallId: 'd', name: 'delegate_task',
+    args: JSON.stringify({ task: 'Inspect authentication flow' }), status: 'running' }], state, activity: idle });
+  assert.equal(h.doc.querySelector('.tool-name').textContent, 'delegate_task');
+  assert.equal(h.doc.querySelector('.tool-arg').textContent, 'Inspect authentication flow');
+  assert.equal(h.doc.querySelector('.tool-icon use').getAttribute('href'), '#i-spark');
+  h.close();
+});
