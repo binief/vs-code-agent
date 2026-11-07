@@ -186,7 +186,7 @@ test('failed compaction after a context rejection retains original conversation 
       if (isSummary(req)) throw new Error('summarizer unavailable');
       throw new Error('context exceeded');
     } };
-    const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, autoCompact: false, keepLastMessages: 2 } });
+    const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, autoCompact: false, keepLastMessages: 2, verbatimFallback: false } });
     const session = new HarnessSession({ host: new Host(dir), provider, config: c });
     const original = longHistory();
     session.restoreConversation(original);
@@ -597,7 +597,7 @@ test('automatic compaction failure reports one retention notice and leaves origi
       if (isSummary(req)) { summaries++; return { text: 'Partial', toolCalls: [], finishReason: 'length', usage: { inputTokens: 10, outputTokens: 20 } }; }
       return { text: 'Continued.', toolCalls: [] };
     } };
-    const c = config({ maxSteps: 3, compaction: { ...DEFAULT_CONFIG.compaction, autoCompact: true, keepLastMessages: 2, contextWindowTokens: 2000, threshold: 0.5 } });
+    const c = config({ maxSteps: 3, compaction: { ...DEFAULT_CONFIG.compaction, autoCompact: true, verbatimFallback: false, keepLastMessages: 2, contextWindowTokens: 2000, threshold: 0.5 } });
     const session = new HarnessSession({ host: new Host(dir), provider, config: c });
     const history = longHistory();
     session.restoreConversation(history, {}, history, true);
@@ -610,5 +610,259 @@ test('automatic compaction failure reports one retention notice and leaves origi
     assert.ok(notice);
     assert.match(notice.message, /output limit on three attempts/);
     assert.equal((notice.message.match(/Original context/gi) ?? []).length, 1);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('verbatim fallback keeps a valid recent tool group and bounded exact excerpts when LLM summaries truncate', async () => {
+  const data = `BEGIN-${'😀'.repeat(2000)}-MIDDLE-SECRET-${'🐈'.repeat(2000)}-END`;
+  const history: ChatMessage[] = [
+    { role: 'user', content: data },
+    { role: 'assistant', content: 'Old analysis', toolCalls: [{ id: 'old', name: 'read_file', arguments: '{"path":"a"}' }] },
+    { role: 'tool', toolCallId: 'old', name: 'read_file', content: 'UNTRUSTED-TOOL-DATA'.repeat(500) },
+    { role: 'user', content: 'Recent request exact' },
+    { role: 'assistant', content: '', toolCalls: [{ id: 'recent', name: 'search_text', arguments: '{}' }] },
+    { role: 'tool', toolCallId: 'recent', name: 'search_text', content: 'Recent result' },
+  ];
+  const before = JSON.stringify(history);
+  let calls = 0;
+  const provider: Provider = { id: 'test', label: 'test', async chat() { calls++; return { text: 'TRUNCATED MODEL OUTPUT', toolCalls: [], finishReason: 'length', usage: { inputTokens: 10, outputTokens: 20 } }; } };
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 3 } });
+  const { newHistory, result } = await compactHistory(history, c, provider, undefined, { allowVerbatimFallback: true });
+  assert.equal(result.strategy, 'verbatim');
+  assert.equal(result.compacted, true);
+  assert.ok(result.newTokens < result.originalTokens);
+  assert.equal(result.usage?.totalTokens, 90);
+  assert.equal(calls, 3);
+  assert.equal(JSON.stringify(history), before, 'the source is never mutated');
+  assert.ok(isTranscriptWellFormed(newHistory));
+  assert.deepEqual(newHistory.slice(-3), history.slice(-3));
+  assert.match(newHistory[0].content, /BEGIN-/);
+  assert.match(newHistory[0].content, /-END/);
+  assert.doesNotMatch(newHistory[0].content, /TRUNCATED MODEL OUTPUT|UNTRUSTED-TOOL-DATA|MIDDLE-SECRET/);
+  assert.doesNotMatch(newHistory[0].content, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u, 'excerpts do not split surrogate pairs');
+});
+
+test('verbatim fallback preserves every image and never creates a user message with more than eight images', async () => {
+  const images = Array.from({ length: 12 }, (_, i) => ({ mediaType: 'image/png', data: 'YWJj', name: `image-${i}` }));
+  const history: ChatMessage[] = [
+    { role: 'user', content: 'Image instructions. '.repeat(300), images: images.slice(0, 8) },
+    { role: 'assistant', content: 'Prior response. '.repeat(300) },
+    { role: 'user', content: 'More images. '.repeat(300), images: images.slice(8) },
+    { role: 'assistant', content: 'Recent answer' },
+    { role: 'user', content: 'Latest request' },
+  ];
+  const provider: Provider = { id: 'test', label: 'test', async chat() { throw new Error('summarizer offline'); } };
+  const { newHistory, result } = await compactHistory(history, config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } }), provider, undefined, { allowVerbatimFallback: true });
+  assert.equal(result.strategy, 'verbatim');
+  assert.deepEqual(newHistory.flatMap((m) => m.images ?? []), images);
+  assert.ok(newHistory.every((m) => (m.images?.length ?? 0) <= 8));
+  assert.ok(isTranscriptWellFormed(newHistory));
+});
+
+test('automatic verbatim fallback preserves the current task request and original conversation', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-verbatim-auto-'));
+  try {
+    const original = longHistory();
+    const prompt = `CURRENT-REQUEST-${'critical '.repeat(500)}-END`;
+    let summaries = 0;
+    let taskRequest: ChatRequest | undefined;
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      if (isSummary(req)) { summaries++; return { text: 'partial', toolCalls: [], finishReason: 'length' }; }
+      taskRequest = req;
+      return { text: 'Done', toolCalls: [] };
+    } };
+    const c = config({ maxSteps: 3, compaction: { ...DEFAULT_CONFIG.compaction, autoCompact: true, contextWindowTokens: 2000, threshold: 0.5, keepLastMessages: 2 } });
+    const session = new HarnessSession({ host: new Host(dir), provider, config: c });
+    session.restoreConversation(original, {}, original, true);
+    const events: HarnessEvent[] = [];
+    await session.runTask(prompt, (event) => events.push(event));
+    assert.equal(summaries, 3);
+    assert.ok(taskRequest?.messages.some((m) => m.role === 'user' && m.content === prompt), 'the current request stays exact');
+    assert.ok(taskRequest?.messages.some((m) => m.content.includes('Conversation compacted without an LLM')));
+    assert.ok(isTranscriptWellFormed(taskRequest!.messages));
+    assert.deepEqual(session.originalConversationSnapshot.slice(0, original.length), original);
+    assert.ok(session.originalConversationSnapshot.some((m) => m.content === prompt));
+    assert.ok(events.some((e) => e.type === 'notice' && e.level === 'warn' && /local verbatim fallback/.test(e.message) && /omitted from active context/.test(e.message)));
+    assert.ok(events.some((e) => e.type === 'notice' && /target was not met|still near the limit/.test(e.message)), 'unachievable budgets are reported');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('provider overflow can recover using local fallback after the summary model repeatedly truncates', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-verbatim-overflow-'));
+  try {
+    let calls = 0, summaries = 0;
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      if (isSummary(req)) { summaries++; return { text: 'partial', toolCalls: [], finishReason: 'max_tokens' }; }
+      if (++calls === 1) throw new Error('maximum context length exceeded');
+      assert.ok(req.messages.some((m) => m.content.includes('Conversation compacted without an LLM')));
+      assert.ok(req.messages.some((m) => m.content === 'Keep this current request exactly'));
+      assert.ok(isTranscriptWellFormed(req.messages));
+      return { text: 'Recovered', toolCalls: [] };
+    } };
+    const original = longHistory();
+    const session = new HarnessSession({ host: new Host(dir), provider, config: config({ compaction: { ...DEFAULT_CONFIG.compaction, autoCompact: false, keepLastMessages: 2 } }) });
+    session.restoreConversation(original, {}, original, true);
+    const result = await session.runTask('Keep this current request exactly', () => {});
+    assert.equal(result.outcome, 'complete');
+    assert.equal(calls, 2);
+    assert.equal(summaries, 3);
+    assert.deepEqual(session.originalConversationSnapshot.slice(0, original.length), original);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('verbatim fallback is optional, does not run after cancellation, and rejects malformed tool groups', async () => {
+  const history = longHistory();
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } });
+  const offline: Provider = { id: 'test', label: 'test', async chat() { throw new Error('unavailable'); } };
+  const noFallback = await compactHistory(history, c, offline);
+  assert.strictEqual(noFallback.newHistory, history);
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(compactHistory(history, c, offline, controller.signal, { allowVerbatimFallback: true }), /cancelled/);
+  const malformed: ChatMessage[] = [{ role: 'user', content: 'A'.repeat(4000) }, { role: 'assistant', content: '', toolCalls: [{ id: 'missing', name: 'tool', arguments: '{}' }] }, { role: 'user', content: 'next' }];
+  const rejected = await compactHistory(malformed, c, offline, undefined, { targetHistoryTokens: 500, allowVerbatimFallback: true });
+  assert.strictEqual(rejected.newHistory, malformed);
+  assert.equal(rejected.result.compacted, false);
+});
+
+test('local fallback reintroduces an exact current request removed by an earlier LLM compaction', async () => {
+  const current: ChatMessage = { role: 'user', content: `Current full request ${'🐈'.repeat(900)}`, images: [{ mediaType: 'image/png', data: 'YWJj', name: 'current.png' }] };
+  const history: ChatMessage[] = [
+    { role: 'user', content: '[Conversation compacted: previous summary] ' + 'previous context '.repeat(500) },
+    { role: 'assistant', content: 'Old work '.repeat(300) },
+    { role: 'user', content: 'Continue' },
+    { role: 'assistant', content: 'Recent result' },
+  ];
+  const provider: Provider = { id: 'test', label: 'test', async chat() { throw new Error('offline'); } };
+  const { newHistory, result } = await compactHistory(history, config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } }), provider, undefined, { allowVerbatimFallback: true, preserveUserMessage: current });
+  assert.equal(result.strategy, 'verbatim');
+  assert.ok(newHistory.includes(current));
+  assert.equal(newHistory.filter((m) => m.images?.some((i) => i.name === 'current.png')).length, 1);
+  assert.ok(isTranscriptWellFormed(newHistory));
+});
+
+test('verbatim fallback reports when the agent policy prevents archive reading and does not bypass it', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-verbatim-policy-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'agent.md'), '---\ntools: []\n---\n');
+    let step = 0;
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      if (isSummary(req)) return { text: 'partial', toolCalls: [], finishReason: 'length' };
+      assert.ok(!req.tools.some((tool) => tool.name === 'read_conversation'));
+      if (++step === 1) return { text: '', toolCalls: [{ id: 'denied', name: 'read_conversation', arguments: '{"message_index":1}' }] };
+      assert.match(req.messages.find((m) => m.toolCallId === 'denied')?.content ?? '', /not allowed/);
+      return { text: 'done', toolCalls: [] };
+    } };
+    const c = config({ maxSteps: 4, compaction: { ...DEFAULT_CONFIG.compaction, autoCompact: true, contextWindowTokens: 3000, threshold: 0.5, keepLastMessages: 2 } });
+    const session = new HarnessSession({ host: new Host(dir), provider, config: c, agentSelection: ['agent.md'] });
+    const original = longHistory();
+    session.restoreConversation(original, {}, original, true);
+    const events: HarnessEvent[] = [];
+    await session.runTask('Current request', (event) => events.push(event));
+    assert.equal(step, 2);
+    assert.ok(events.some((event) => event.type === 'notice' && /Archive reading is unavailable/.test(event.message)));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('provider overflow forces useful fallback even with fewer messages than the preferred retained tail', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-verbatim-small-overflow-'));
+  try {
+    const prior = 'Prior requirements. '.repeat(500);
+    const history: ChatMessage[] = [{ role: 'user', content: prior }, { role: 'assistant', content: 'Prior response' }];
+    let taskCalls = 0, summaries = 0;
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      if (isSummary(req)) { summaries++; return { text: 'partial', toolCalls: [], finishReason: 'length' }; }
+      if (++taskCalls === 1) throw new Error('maximum context length exceeded');
+      assert.ok(req.messages.some((m) => m.content.includes('Conversation compacted without an LLM')));
+      assert.ok(req.messages.some((m) => m.content === 'Latest exact request'));
+      return { text: 'Recovered', toolCalls: [] };
+    } };
+    const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, autoCompact: false, keepLastMessages: 10, contextWindowTokens: 128000 } });
+    const session = new HarnessSession({ host: new Host(dir), provider, config: c });
+    session.restoreConversation(history, {}, history, true);
+    const result = await session.runTask('Latest exact request', () => {});
+    assert.equal(result.outcome, 'complete');
+    assert.equal(taskCalls, 2);
+    assert.equal(summaries, 3);
+    assert.deepEqual(session.originalConversationSnapshot.slice(0, history.length), history);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('reintroducing a current request does not duplicate images already retained by an earlier summary', async () => {
+  const image = { mediaType: 'image/png', data: 'YWJj', name: 'current.png' };
+  const current: ChatMessage = { role: 'user', content: 'Current task request', images: [image] };
+  const history: ChatMessage[] = [
+    { role: 'user', content: '[Conversation compacted: previous summary] ' + 'old '.repeat(3000), images: [image] },
+    { role: 'assistant', content: 'Prior answer '.repeat(100) },
+    { role: 'user', content: 'Continue' }, { role: 'assistant', content: 'Done' },
+  ];
+  const provider: Provider = { id: 'test', label: 'test', async chat() { throw new Error('offline'); } };
+  const { newHistory, result } = await compactHistory(history, config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } }), provider, undefined, { allowVerbatimFallback: true, preserveUserMessage: current });
+  assert.equal(result.strategy, 'verbatim');
+  assert.ok(newHistory.some((m) => m.content === current.content));
+  assert.deepEqual(newHistory.flatMap((m) => m.images ?? []), [image]);
+});
+
+test('offline provider can use the local fallback without making model calls', async () => {
+  let calls = 0;
+  const provider: Provider = { id: 'mock', label: 'offline', async chat() { calls++; throw new Error('should not call'); } };
+  const history = longHistory();
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } });
+  const { result, newHistory } = await compactHistory(history, c, provider, undefined, { allowVerbatimFallback: true });
+  assert.equal(result.strategy, 'verbatim');
+  assert.equal(calls, 0);
+  assert.ok(result.newTokens < result.originalTokens);
+  assert.ok(isTranscriptWellFormed(newHistory));
+});
+
+test('fallback leaves active history untouched when verbatim extraction cannot reduce it', async () => {
+  const history: ChatMessage[] = [
+    { role: 'user', content: 'a'.repeat(330) },
+    { role: 'assistant', content: 'ok' },
+    { role: 'user', content: 'next' },
+  ];
+  const provider: Provider = { id: 'test', label: 'test', async chat() { return { text: 'partial', toolCalls: [], finishReason: 'length' }; } };
+  const { result, newHistory } = await compactHistory(history, config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } }), provider, undefined, { allowVerbatimFallback: true });
+  assert.equal(result.compacted, false);
+  assert.strictEqual(newHistory, history);
+  assert.match(result.summary, /Verbatim compaction could not safely reduce/);
+});
+
+test('small fallback excerpt budgets prioritize the most recent older user message', async () => {
+  const history: ChatMessage[] = [
+    { role: 'user', content: 'FIRST-' + 'a'.repeat(5000) },
+    { role: 'assistant', content: 'Older response '.repeat(100) },
+    { role: 'user', content: 'LATEST-USER-INSTRUCTION' },
+    { role: 'assistant', content: 'Result' },
+  ];
+  const provider: Provider = { id: 'test', label: 'test', async chat() { throw new Error('offline'); } };
+  const { result, newHistory } = await compactHistory(history, config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } }), provider, undefined, { targetHistoryTokens: 100, allowVerbatimFallback: true });
+  assert.equal(result.strategy, 'verbatim');
+  assert.ok(newHistory[0].content.includes('LATEST-USER-INSTRUCTION'));
+  assert.ok(!newHistory[0].content.includes('FIRST-'));
+  assert.equal(result.targetMet, false);
+});
+
+test('verbatim-only mode skips summary calls and preserves the live task request', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-verbatim-mode-'));
+  try {
+    let calls = 0;
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      assert.ok(!isSummary(req), 'verbatim-only mode must not request a summary');
+      calls++;
+      assert.ok(req.messages.some((m) => m.content === 'Latest unchanged request'));
+      assert.ok(req.messages.some((m) => m.content.includes('Conversation compacted without an LLM')));
+      return { text: 'Done', toolCalls: [] };
+    } };
+    const c = config({ maxSteps: 3, compaction: { ...DEFAULT_CONFIG.compaction, method: 'verbatim', verbatimFallback: false, autoCompact: true, contextWindowTokens: 3000, threshold: 0.5, keepLastMessages: 2 } });
+    const session = new HarnessSession({ host: new Host(dir), provider, config: c });
+    const original = longHistory();
+    session.restoreConversation(original, {}, original, true);
+    const events: HarnessEvent[] = [];
+    const result = await session.runTask('Latest unchanged request', (e) => events.push(e));
+    assert.equal(result.outcome, 'complete');
+    assert.equal(calls, 1);
+    assert.deepEqual(session.originalConversationSnapshot.slice(0, original.length), original);
+    assert.ok(events.some((e) => e.type === 'notice' && e.message.includes('Used local verbatim compaction')));
+    assert.ok(!events.some((e) => e.type === 'notice' && e.message.includes('LLM compaction failed')));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

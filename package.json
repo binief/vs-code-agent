@@ -485,6 +485,17 @@
           "maximum": 50,
           "markdownDescription": "Preferred number of recent messages to keep intact; may be reduced to meet the context budget."
         },
+        "codingHarness.compaction.method": {
+          "type": "string",
+          "enum": ["llm", "verbatim"],
+          "default": "llm",
+          "markdownDescription": "Use LLM summaries or select verbatim to compact locally without model calls. Verbatim compaction preserves selected exact excerpts and images but omits other older content from active context."
+        },
+        "codingHarness.compaction.verbatimFallback": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "When LLM compaction fails, locally retain bounded verbatim excerpts of older user-role messages and all images, while omitting other older content from active context. Recorded original messages remain in the conversation archive subject to saving and tool permissions. Disable to leave active history unchanged on failure."
+        },
         "codingHarness.compaction.summaryModel": {
           "type": "string",
           "default": "",
