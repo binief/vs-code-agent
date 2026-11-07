@@ -226,7 +226,7 @@ export class HarnessSession {
   }
 
   /** Manually compact conversation history using the configured provider. */
-  async compact(): Promise<{ compacted: boolean; originalTokens: number; newTokens: number; removed: number; reason: string; strategy?: 'llm'; targetMet?: boolean }> {
+  async compact(): Promise<{ compacted: boolean; originalTokens: number; newTokens: number; removed: number; reason: string; strategy?: 'llm'; usedLongerSummary?: boolean; targetMet?: boolean }> {
     if (this.busy) throw new Error('Cannot compact while a task is running.');
     this.busy = true;
     this.controller = new AbortController();
@@ -238,7 +238,7 @@ export class HarnessSession {
       const { newHistory, result } = await compactHistory(this.history, c, this.deps.provider, this.controller.signal, { targetHistoryTokens: target, preserveUserMessage: latestUser });
       if (result.usage) this.cumulativeUsage = mergeUsage(this.cumulativeUsage, result.usage);
       if (result.compacted) this.history = newHistory;
-      return { compacted: result.compacted, originalTokens: result.originalTokens, newTokens: result.newTokens, removed: result.removedMessages, reason: result.summary, strategy: result.strategy, targetMet: result.targetMet };
+      return { compacted: result.compacted, originalTokens: result.originalTokens, newTokens: result.newTokens, removed: result.removedMessages, reason: result.summary, strategy: result.strategy, usedLongerSummary: result.usedLongerSummary, targetMet: result.targetMet };
     } catch (err) {
       if (err instanceof CompactionCancelled && err.usage) this.cumulativeUsage = mergeUsage(this.cumulativeUsage, err.usage);
       throw err;
@@ -417,7 +417,9 @@ export class HarnessSession {
         this.history = [];
         taskMessages.splice(0, taskMessages.length, ...newHistory);
         const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
-        onEvent({ type: 'notice', message: `LLM compacted conversation: removed ${result.removedMessages} messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${targetNote}`, level: result.targetMet === false ? 'warn' : 'info' });
+        const lengthNote = result.usedLongerSummary ? ' A completed reducing summary exceeded the requested length; the best available summary was used.' : '';
+        if (result.targetMet === false) autoCompactRetryAt = this.history.length + taskMessages.length + 2;
+        onEvent({ type: 'notice', message: `LLM compacted conversation: removed ${result.removedMessages} messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${lengthNote}${targetNote}`, level: result.targetMet === false || result.usedLongerSummary ? 'warn' : 'info' });
         host.log('info', `LLM compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens`);
         return true;
       };

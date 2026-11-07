@@ -569,3 +569,108 @@ test('a new task with an oversized output reserve warns about fixed context with
     assert.ok(!events.some((e) => e.type === 'notice' && /Could not compact conversation/.test(e.message)));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('completed summaries that reduce context but miss the requested length use the best retry with a warning flag', async () => {
+  const history: ChatMessage[] = [
+    { role: 'user', content: 'Original objective. '.repeat(600) },
+    { role: 'assistant', content: 'Verified evidence. '.repeat(300) },
+    { role: 'user', content: 'Current task must be preserved.' },
+    { role: 'assistant', content: 'Recent response.' },
+  ];
+  let calls = 0;
+  let firstTarget = 0;
+  let best = '';
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+    calls++;
+    const target = Number(req.messages[0].content.match(/under approximately (\d+) tokens/)?.[1]);
+    if (calls === 1) firstTarget = target;
+    const length = (Math.ceil(firstTarget * 1.5) + (calls === 1 ? 50 : 100)) * 3;
+    const text = (calls === 1 ? 'a' : 'b').repeat(length);
+    if (calls === 1) best = text;
+    return { text, toolCalls: [], finishReason: 'stop', usage: { inputTokens: 10, outputTokens: 5 } };
+  } };
+  const options = { targetHistoryTokens: 1200, preserveUserMessage: history[2] };
+  const { newHistory, result } = await compactHistory(history,
+    config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } }), provider, undefined, options);
+  assert.equal(calls, 2);
+  assert.equal(result.compacted, true);
+  assert.equal(result.usedLongerSummary, true);
+  assert.equal(result.targetMet, false);
+  assert.ok(result.newTokens < result.originalTokens);
+  assert.ok(newHistory[0].content.includes(best), 'the shorter completed candidate is used');
+  assert.ok(newHistory.includes(history[2]), 'the live request is kept intact');
+  assert.ok(isTranscriptWellFormed(newHistory));
+  assert.equal(result.usage?.inputTokens, 20);
+  assert.equal(result.usage?.outputTokens, 10);
+});
+
+test('a reducing first summary is not applied if the shorter retry is cancelled', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-compact-cancel-retry-'));
+  try {
+    const history: ChatMessage[] = [
+      { role: 'user', content: 'Original request. '.repeat(800) },
+      { role: 'assistant', content: 'Evidence. '.repeat(500) },
+      { role: 'user', content: 'Recent request.' },
+      { role: 'assistant', content: 'Recent answer.' },
+    ];
+    let calls = 0;
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      calls++;
+      if (calls === 1) return { text: 'A'.repeat(4800), toolCalls: [], usage: { inputTokens: 20, outputTokens: 10 } };
+      entered();
+      return await new Promise((_, reject) => req.signal?.addEventListener('abort', () => reject(new Error('cancelled')), { once: true }));
+    } };
+    const session = new HarnessSession({ host: new Host(dir), provider,
+      config: config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } }) });
+    session.restoreConversation(history, {}, history, true);
+    const pending = session.compact();
+    await started;
+    session.cancel();
+    await assert.rejects(pending, /cancelled/);
+    assert.deepEqual(session.transcript, history);
+    assert.deepEqual(session.originalConversationSnapshot, history);
+    assert.equal(session.usage.inputTokens, 20);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a reducing first summary is not applied if the shorter retry is incomplete', async () => {
+  const history: ChatMessage[] = [
+    { role: 'user', content: 'Original request. '.repeat(800) },
+    { role: 'assistant', content: 'Evidence. '.repeat(500) },
+    { role: 'user', content: 'Recent request.' },
+    { role: 'assistant', content: 'Recent answer.' },
+  ];
+  let calls = 0;
+  const provider: Provider = { id: 'test', label: 'test', async chat() {
+    calls++;
+    return calls === 1 ? { text: 'A'.repeat(4800), toolCalls: [] }
+      : { text: 'incomplete', toolCalls: [], finishReason: 'length' };
+  } };
+  const { newHistory, result } = await compactHistory(history,
+    config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } }), provider);
+  assert.equal(calls, 3);
+  assert.equal(result.compacted, false);
+  assert.strictEqual(newHistory, history);
+  assert.match(result.summary, /output limit/);
+});
+
+test('a reducing serialized summary is rejected if the assembled history is not smaller', async () => {
+  const history: ChatMessage[] = [];
+  for (let i = 0; i < 10; i++) history.push({ role: i % 2 ? 'assistant' : 'user', content: 'A'.repeat(90) });
+  history.push({ role: 'user', content: 'Keep this request.' }, { role: 'assistant', content: 'Recent.' });
+  let calls = 0;
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+    calls++;
+    const payload = req.messages[0].content.split('Conversation JSON or consecutive fragment:\n')[1];
+    const tokens = estimateTokens(payload) - 1;
+    return { text: 'z'.repeat(tokens * 3), toolCalls: [] };
+  } };
+  const { newHistory, result } = await compactHistory(history,
+    config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } }), provider);
+  assert.equal(calls, 2);
+  assert.equal(result.compacted, false);
+  assert.strictEqual(newHistory, history);
+  assert.match(result.summary, /did not reduce the estimated context size/);
+});

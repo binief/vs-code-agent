@@ -592,8 +592,10 @@ fixed step limit or automatic loop/thinking interruption; long runs can consume 
   remain attached. Large history is split
   into bounded requests and summaries may be summarized again. Image attachments may require separate
   vision requests. Summary calls cost time and tokens, may lose detail, and are capped at 64 requests
-  per compaction; a failed or cancelled LLM summary leaves active history unchanged. The original
-  messages remain in the saved chat as described under Saved chats. The offline mock cannot produce LLM summaries. A rejected summary input can be split further and retried. If a
+  per compaction; a failed or cancelled LLM summary leaves active history unchanged. If the model
+  produces a complete, smaller summary that exceeds the requested length even after a shorter retry,
+  the best reducing summary may be used with a warning. The complete resulting history must still be
+  smaller; if the estimated target is missed, a warning says so. The original messages remain in the saved chat as described under Saved chats. The offline mock cannot produce LLM summaries. A rejected summary input can be split further and retried. If a
   provider stops a summary at its output limit, the harness retries with progressively larger bounded
   output budgets (up to 8,192 tokens per request and at most three attempts); reasoning tokens may
   consume part of that budget. Retries can increase cost and still fail if the model cannot complete.

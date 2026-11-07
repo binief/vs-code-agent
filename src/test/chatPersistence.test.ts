@@ -1062,3 +1062,29 @@ test('summary failure leaves active history and saved originals unchanged', asyn
   assert.deepEqual(saved.originalHistory, before.originalHistory);
   assert.match(dialogs.warnings.at(-1) ?? '', /Original context was retained/);
 });
+
+test('manual compaction warns about longer reducing summaries and preserves saved originals', async () => {
+  settings['compaction.keepLastMessages'] = 2;
+  try {
+    respond = toolProvider([]);
+    const subject = makeController('longer-summary-warning');
+    await subject.controller.run('Investigate these details. '.repeat(400));
+    await subject.controller.run('Follow up.');
+    const file = path.join(subject.storage, 'current-chat.json');
+    const before = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
+    let calls = 0;
+    let firstTarget = 0;
+    respond = async (req) => {
+      calls++;
+      const target = Number(req.messages[0].content.match(/under approximately (\d+) tokens/)?.[1]);
+      if (calls === 1) firstTarget = target;
+      return { text: 's'.repeat((Math.ceil(firstTarget * 1.5) + 50) * 3), toolCalls: [] };
+    };
+    await subject.controller.compactHistory();
+    assert.equal(calls, 2);
+    const after = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
+    assert.match(after.history[0].content, /Conversation compacted/);
+    assert.deepEqual(after.originalHistory, before.originalHistory);
+    assert.ok(subject.controller.getTranscript().some((item: any) => item.kind === 'notice' && item.level === 'warn' && item.message.includes('exceeded the requested length')));
+  } finally { delete settings['compaction.keepLastMessages']; }
+});
