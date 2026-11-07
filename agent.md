@@ -1,3 +1,6 @@
+---
+tools: [read, search, edit, execute]
+---
 # Coding Harness — project instructions
 
 Instructions for working on this repository. The extension is a tool harness only: it has no

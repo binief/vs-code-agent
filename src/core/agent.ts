@@ -2,13 +2,10 @@ import { agentFilesSummary, discoverAgentFiles, selectAgentFiles } from './agent
 import { CheckpointStore, type RevertReport } from './checkpoints';
 import { CompactionCancelled, compactHistory, contextBreakdown, contextBreakdownTotal, estimateMessagesTokens, estimateRequestTokens, estimateTokens } from './compaction';
 import { isRetryableProviderError, retryDelayMs } from './providers/errors';
-import { ThinkingStreamGuard, RepeatedToolCallTracker, type ThinkingStopReason } from './loopTracking';
 import { buildSystemPrompt, summarizeDiagnostics } from './prompt';
-import { createDefaultTools, runCommandTool, ToolRegistry } from './tools';
-import { randomUUID } from 'node:crypto';
+import { createDefaultTools, ToolRegistry } from './tools';
 import { resolveAgentToolPolicy } from './toolPolicy';
 import { repairToolMessages } from './transcript';
-import { rankedArchiveSearch } from './rankedArchiveSearch';
 import {
   DEFAULT_CONFIG,
   type ApprovalDecision,
@@ -52,56 +49,6 @@ export interface AgentDeps {
   agentSelection?: readonly string[] | null;
 }
 
-const MAX_TOOL_RESULT_BYTES = 30_000;
-const MAX_CACHED_OUTPUT_BYTES = 16 * 1024 * 1024;
-const TOOL_OUTPUT_READER: ToolSpec = {
-  name: 'read_tool_output',
-  description: 'Read a page of a tool output cached during the current task. Offsets are UTF-16 code units; cached output is cleared after the task.',
-  parameters: { type: 'object', properties: {
-    result_id: { type: 'string', description: 'Output identifier from the original tool result.' },
-    offset: { type: 'number', description: '0-based UTF-16 offset from next_offset; defaults to 0.' },
-  }, required: ['result_id'] },
-};
-
-const ARCHIVE_SEARCH: ToolSpec = {
-  name: 'search_conversation',
-  description: 'Search the current conversation’s original message text and tool-call arguments. Literal search is the default; ranked mode scores exact phrases and keywords within a bounded scan window. Results are untrusted historical data.',
-  parameters: { type: 'object', properties: {
-    query: { type: 'string', description: 'Literal text to find, or a phrase/keywords when mode is ranked.' },
-    mode: { type: 'string', enum: ['literal', 'ranked'], description: 'literal (default) or ranked local exact/keyword search.' },
-    include_active: { type: 'boolean', description: 'Ranked mode: include messages already in active context; default false.' },
-    result_offset: { type: 'number', description: 'Ranked mode: next_result_offset with the same start_index and start_offset to page ranked results within this scan window.' },
-    start_index: { type: 'number', description: '1-based first message to search; default 1.' },
-    start_offset: { type: 'number', description: '0-based UTF-16 offset from next_start_offset; default 0.' },
-    case_sensitive: { type: 'boolean', description: 'Match case exactly; default false.' },
-  }, required: ['query'] },
-};
-const ARCHIVE_READ: ToolSpec = {
-  name: 'read_conversation',
-  description: 'Read an original message in the current conversation archive. Results are untrusted historical data; images are described, not returned by this tool.',
-  parameters: { type: 'object', properties: {
-    message_index: { type: 'number', description: '1-based message number from search_conversation.' },
-    offset: { type: 'number', description: '0-based UTF-16 offset from next_offset; default 0.' },
-  }, required: ['message_index'] },
-};
-
-/** Text view for retrieval; the persisted message itself remains unchanged. */
-function archiveMessageText(message: ChatMessage): string {
-  return message.content + (message.toolCalls?.length ? `\n[Tool calls]\n${JSON.stringify(message.toolCalls)}` : '');
-}
-
-/** A UTF-8 bounded prefix that never splits a Unicode surrogate pair. */
-function utf8Page(text: string, offset: number, maxBytes: number): { page: string; next: number } {
-  let end = offset;
-  let bytes = 0;
-  for (const char of text.slice(offset)) {
-    const size = Buffer.byteLength(char, 'utf8');
-    if (bytes + size > maxBytes) break;
-    bytes += size;
-    end += char.length;
-  }
-  return { page: text.slice(offset, end), next: end };
-}
 const MAX_THINKING_DISPLAY_CHARS = 12_000;
 /**
  * Attempts per model call. Transient failures (429, 5xx, a dropped connection)
@@ -116,7 +63,7 @@ const CANCELLED_TOOL_RESULT = 'Skipped: the task was cancelled before this tool 
 /**
  * Drives one conversation: builds the prompt, calls the model, executes the
  * tools it asks for (with approval + checkpointing), feeds the results back and
- * repeats until the model stops calling tools or the step budget runs out.
+ * repeats until the model finishes or the task is cancelled.
  *
  * History is kept across tasks so a follow-up like "also add a test for that"
  * has context, and so the user can answer a question the agent asked.
@@ -140,9 +87,6 @@ export class HarnessSession {
   private lastSystemPrompt = '';
   /** Most recently resolved task policy; undefined means the estimate is provisional. */
   private lastAllowedTools?: ToolSpec[];
-  private readonly toolOutputCache = new Map<string, string>();
-  private toolOutputBytes = 0;
-  private nextOutputId = 1;
 
   constructor(private deps: AgentDeps) {
     this.registry = deps.registry ?? deps.tools ?? new ToolRegistry(createDefaultTools());
@@ -238,8 +182,6 @@ export class HarnessSession {
     this.inputCalibration = 1;
     this.lastSystemPrompt = '';
     this.lastAllowedTools = undefined;
-    this.toolOutputCache.clear();
-    this.toolOutputBytes = 0;
   }
 
   cancel(): void {
@@ -252,8 +194,7 @@ export class HarnessSession {
   }
 
   private toolsForEstimate(): ToolSpec[] {
-    const helpers = this.originalHistory.length || this.pendingOriginal?.length ? [ARCHIVE_SEARCH, ARCHIVE_READ] : [];
-    return this.lastAllowedTools ?? [...this.registry.specs(), ...helpers.filter((spec) => !this.registry.has(spec.name))];
+    return this.lastAllowedTools ?? [];
   }
 
   /** Estimate current context usage */
@@ -267,25 +208,8 @@ export class HarnessSession {
     return { tokens: total, window, percent, breakdown };
   }
 
-  /** Resolve the same current agent policy used by a task; fail closed on discovery errors. */
-  private async canReadArchiveForCompaction(): Promise<boolean> {
-    if (this.registry.has(ARCHIVE_READ.name) || !this.originalHistory.length) return false;
-    try {
-      const workspace = await this.collectWorkspaceContext();
-      const found = discoverAgentFiles({ root: this.deps.host.workspaceRoot, config: this.deps.config.agentFiles,
-        focusPaths: (workspace?.openFiles ?? []).map((file) => file.path) });
-      const selected = selectAgentFiles(found, this.deps.agentSelection);
-      const helpers = [ARCHIVE_SEARCH, ARCHIVE_READ].filter((spec) => !this.registry.has(spec.name));
-      return resolveAgentToolPolicy(selected, [...this.registry.specs(), ...helpers], new Set(helpers.map((s) => s.name)))
-        .tools.some((spec) => spec.name === ARCHIVE_READ.name);
-    } catch (err) {
-      this.deps.host.log('warn', `archive permission discovery failed during compaction: ${(err as Error).message}`);
-      return false;
-    }
-  }
-
   /** Manually compact conversation history using the configured provider. */
-  async compact(): Promise<{ compacted: boolean; originalTokens: number; newTokens: number; removed: number; reason: string; strategy?: 'llm' | 'verbatim' | 'tool-output'; toolOutputsReduced?: number; fallbackReason?: string; targetMet?: boolean }> {
+  async compact(): Promise<{ compacted: boolean; originalTokens: number; newTokens: number; removed: number; reason: string; strategy?: 'llm'; targetMet?: boolean }> {
     if (this.busy) throw new Error('Cannot compact while a task is running.');
     this.busy = true;
     this.controller = new AbortController();
@@ -294,11 +218,10 @@ export class HarnessSession {
       const target = Math.max(0, Math.floor((c.compaction.contextWindowTokens * Math.min(0.6, c.compaction.threshold * 0.85) - Math.max(0, c.maxOutputTokens)) / this.inputCalibration) -
         estimateRequestTokens(this.lastSystemPrompt ? [{ role: 'system', content: this.lastSystemPrompt }] : [], this.toolsForEstimate()));
       const latestUser = [...this.history].reverse().find((message) => message.role === 'user');
-      const archiveMessages = await this.canReadArchiveForCompaction() ? this.originalConversationSnapshot : undefined;
-      const { newHistory, result } = await compactHistory(this.history, c, this.deps.provider, this.controller.signal, { targetHistoryTokens: target, allowVerbatimFallback: c.compaction.method === 'verbatim' || c.compaction.verbatimFallback !== false, useVerbatimOnly: c.compaction.method === 'verbatim', preserveUserMessage: latestUser, archiveMessages });
+      const { newHistory, result } = await compactHistory(this.history, c, this.deps.provider, this.controller.signal, { targetHistoryTokens: target, preserveUserMessage: latestUser });
       if (result.usage) this.cumulativeUsage = mergeUsage(this.cumulativeUsage, result.usage);
       if (result.compacted) this.history = newHistory;
-      return { compacted: result.compacted, originalTokens: result.originalTokens, newTokens: result.newTokens, removed: result.removedMessages, reason: result.summary, strategy: result.strategy, toolOutputsReduced: result.toolOutputsReduced, fallbackReason: result.fallbackReason, targetMet: result.targetMet };
+      return { compacted: result.compacted, originalTokens: result.originalTokens, newTokens: result.newTokens, removed: result.removedMessages, reason: result.summary, strategy: result.strategy, targetMet: result.targetMet };
     } catch (err) {
       if (err instanceof CompactionCancelled && err.usage) this.cumulativeUsage = mergeUsage(this.cumulativeUsage, err.usage);
       throw err;
@@ -315,15 +238,11 @@ export class HarnessSession {
   ): Promise<TaskResult> {
     if (this.busy) throw new Error('A task is already running.');
     this.busy = true;
-    this.toolOutputCache.clear();
-    this.toolOutputBytes = 0;
-    this.nextOutputId = 1;
     this.controller = new AbortController();
     const signal = this.controller.signal;
     this.lastSystemPrompt = '';
     this.lastAllowedTools = undefined;
     const host = this.deps.host;
-    const maxSteps = Math.max(1, this.deps.config.maxSteps);
 
     const images = options.images?.length ? options.images : undefined;
     // An image-only turn still needs words: a bare image block gives the model
@@ -350,8 +269,6 @@ export class HarnessSession {
     let lastText = '';
     let errorText = '';
     let lastTokensPerSecond = 0;
-    const toolLoop = new RepeatedToolCallTracker();
-    let thinkingInterruptions = 0;
     let autoCompactRetryAt = 0;
     let contextOverflowRetried = false;
 
@@ -415,8 +332,7 @@ export class HarnessSession {
           (selected.selection ? ` (${selected.files.length} of ${selected.available} selected)` : '') +
           (selected.skipped.length ? ` (${selected.skipped.length} skipped)` : ''),
       );
-      const archiveTools = [ARCHIVE_SEARCH, ARCHIVE_READ].filter((spec) => !this.registry.has(spec.name));
-      const toolPolicy = resolveAgentToolPolicy(selected, [...this.registry.specs(), ...archiveTools], new Set(archiveTools.map((spec) => spec.name)));
+      const toolPolicy = resolveAgentToolPolicy(selected, this.registry.specs());
       const allowedToolNames = new Set(toolPolicy.tools.map((tool) => tool.name));
       this.lastAllowedTools = toolPolicy.tools;
       if (toolPolicy.restricted) {
@@ -442,15 +358,14 @@ export class HarnessSession {
           estimateRequestTokens([{ role: 'system', content: system }], tools));
       };
       const compactTask = async (tools: readonly ToolSpec[], providerOverflow = false): Promise<boolean> => {
-        const localOnly = this.deps.config.compaction.method === 'verbatim';
-        onEvent({ type: 'notice', message: localOnly ? 'Checking context for local verbatim compaction.' : 'Checking context for LLM compaction; summarization may require an additional provider request.', level: 'info' });
+        onEvent({ type: 'notice', message: 'Checking context for LLM compaction.', level: 'info' });
         let compacted: Awaited<ReturnType<typeof compactHistory>>;
         try {
           const active = [...this.history, ...taskMessages];
           // An endpoint rejection is evidence that our configured estimate is
           // too optimistic. Request a material reduction even for short chats.
           const target = providerOverflow ? Math.min(historyTarget(tools), Math.floor(estimateMessagesTokens(active) * 0.5)) : historyTarget(tools);
-          compacted = await compactHistory(active, this.deps.config, this.deps.provider, signal, { targetHistoryTokens: target, allowVerbatimFallback: localOnly || this.deps.config.compaction.verbatimFallback !== false, useVerbatimOnly: localOnly, preserveUserMessage: userMessage, archiveMessages: !this.registry.has(ARCHIVE_READ.name) && tools.some((spec) => spec.name === ARCHIVE_READ.name) ? this.originalConversationSnapshot : undefined });
+          compacted = await compactHistory(active, this.deps.config, this.deps.provider, signal, { targetHistoryTokens: target, preserveUserMessage: userMessage });
         } catch (err) {
           if (err instanceof CompactionCancelled && err.usage) {
             this.cumulativeUsage = mergeUsage(this.cumulativeUsage, err.usage);
@@ -473,40 +388,19 @@ export class HarnessSession {
         }
         this.history = [];
         taskMessages.splice(0, taskMessages.length, ...newHistory);
-        const retained = newHistory.length - 1;
-        const recentNote = result.strategy === 'llm' && retained < Math.max(2, this.deps.config.compaction.keepLastMessages)
-          ? ' Some recent messages were summarized to meet the context budget.' : '';
-        if (result.strategy === 'tool-output') {
-          if (result.targetMet === false) autoCompactRetryAt = this.history.length + taskMessages.length + 2;
-          const targetNote = result.targetMet === false ? ` Estimated target not met.${result.fallbackReason ? ` ${result.fallbackReason}` : ''}` : '';
-          onEvent({ type: 'notice', level: 'warn', message: `Shortened ${result.toolOutputsReduced} older recorded tool result(s), saving approximately ${result.originalTokens - result.newTokens} estimated tokens. Their middles are omitted from active context; recorded pages remain in the in-memory archive. They will not automatically survive restart if saving is disabled or fails; later retrieval also depends on tool permissions.${this.originalHistoryComplete ? '' : ' Earlier history may be incomplete.'}${targetNote}` });
-        } else if (result.strategy === 'verbatim') {
-          // Do not immediately retry failed LLM summarization on an unchanged
-          // fallback context; try again only after further messages arrive.
-          autoCompactRetryAt = this.history.length + taskMessages.length + 2;
-          const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
-          const coverage = this.originalHistoryComplete ? '' : ' Earlier recorded history may already be incomplete.';
-          const access = allowedToolNames.has(ARCHIVE_READ.name) && !this.registry.has(ARCHIVE_READ.name)
-            ? '' : ' Archive reading is unavailable under the active agent tool policy.';
-          const method = result.fallbackReason ? `LLM compaction failed: ${result.fallbackReason} Used local verbatim fallback` : 'Used local verbatim compaction';
-          onEvent({ type: 'notice', level: 'warn', message: `${method}; saved approximately ${result.originalTokens - result.newTokens} tokens. Only selected user-role excerpts and images remain from older messages; other details are omitted from active context. Recorded originals remain in the conversation archive, subject to saving and tool permissions.${coverage}${access}${targetNote}${recentNote}` });
-        } else {
-          const reductionNote = result.toolOutputsReduced ? ` ${result.toolOutputsReduced} older recorded tool result(s) were shortened before summarization; omitted details remain only in the archive, subject to saving and permissions.` : '';
-          const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
-          onEvent({ type: 'notice', message: `LLM compacted conversation: removed ${result.removedMessages} messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${recentNote}${reductionNote}${targetNote}`, level: result.toolOutputsReduced || result.targetMet === false ? 'warn' : 'info' });
-        }
-        host.log('info', `${result.strategy ?? 'LLM'} compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens`);
+        const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
+        onEvent({ type: 'notice', message: `LLM compacted conversation: removed ${result.removedMessages} messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${targetNote}`, level: result.targetMet === false ? 'warn' : 'info' });
+        host.log('info', `LLM compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens`);
         return true;
       };
 
-      for (let step = 1; step <= maxSteps; step++) {
+      for (let step = 1; ; step++) {
         if (signal.aborted) {
           outcome = 'cancelled';
           break;
         }
         steps = step;
-        const isFinalStep = step === maxSteps;
-        onEvent({ type: 'step', index: step, maxSteps });
+        onEvent({ type: 'step', index: step, maxSteps: 0 });
         onEvent({ type: 'status', status: 'thinking' });
 
         /**
@@ -520,24 +414,13 @@ export class HarnessSession {
             ...this.history,
             ...taskMessages,
           ];
-          if (isFinalStep) {
-            list.push({
-              role: 'user',
-              content: `Step budget reached: ${maxSteps} step(s) used. No further tool calls are available in this task.`,
-            });
-          }
           return repairToolMessages(list);
         };
 
         let messages = buildMessages();
 
         // Reserve room for output and account for the tool definitions actually sent.
-        const toolsForStep = isFinalStep ? [] : toolPolicy.tools.filter((spec) =>
-          this.registry.has(spec.name) || this.originalConversationSnapshot.length > 0);
-        if (!isFinalStep && this.toolOutputCache.size && toolPolicy.tools.length && !this.registry.has(TOOL_OUTPUT_READER.name)) {
-          toolsForStep.push(TOOL_OUTPUT_READER);
-          allowedToolNames.add(TOOL_OUTPUT_READER.name);
-        }
+        const toolsForStep = toolPolicy.tools;
         const contextWindow = this.deps.config.compaction.contextWindowTokens;
         const outputReserve = Math.max(0, this.deps.config.maxOutputTokens);
         const measureContext = () => {
@@ -575,10 +458,6 @@ export class HarnessSession {
         let streamId = streamIdFor(1);
         let thinkingId = thinkingIdFor(1);
         const showThinking = this.deps.config.showThinking;
-        const configuredThinkingLimit = this.deps.config.thinkingMaxChars;
-        const thinkingLimit = Number.isFinite(configuredThinkingLimit) && configuredThinkingLimit >= 0
-          ? Math.floor(configuredThinkingLimit) : DEFAULT_CONFIG.thinkingMaxChars;
-        let thinkingGuard = new ThinkingStreamGuard(thinkingLimit);
         let receivedThinkingDelta = false;
         let completedThinkingDisplayed = false;
         let displayTruncated = false;
@@ -604,7 +483,6 @@ export class HarnessSession {
         const abortAttempt = () => attemptController.abort();
         signal.addEventListener('abort', abortAttempt, { once: true });
         if (signal.aborted) abortAttempt();
-        let thinkingInterrupted: ThinkingStopReason | undefined;
         try {
           callStartedAt = Date.now();
           const response = await this.callProvider(
@@ -618,7 +496,6 @@ export class HarnessSession {
               this.pendingAssistantText = '';
               thinking = '';
               thinkingStartedAt = 0;
-              thinkingGuard = new ThinkingStreamGuard(thinkingLimit);
               receivedThinkingDelta = false;
               completedThinkingDisplayed = false;
               displayTruncated = false;
@@ -632,7 +509,7 @@ export class HarnessSession {
                 // Streaming keeps the panel alive while the model is still writing.
                 onDelta: this.deps.config.stream
                   ? (delta: string) => {
-                      if (thinkingInterrupted || signal.aborted) return;
+                      if (signal.aborted) return;
                       streamed = true;
                       attemptText += delta;
                       this.pendingAssistantText = attemptText;
@@ -642,7 +519,7 @@ export class HarnessSession {
                 // A completed JSON response cannot be aborted retroactively.
                 onThinking: this.deps.config.stream
                   ? (delta: string, completed?: boolean) => {
-                      if (thinkingInterrupted || signal.aborted) return;
+                      if (signal.aborted) return;
                       if (!thinkingStartedAt) thinkingStartedAt = Date.now();
                       if (completed) {
                         appendThinkingDisplay(delta);
@@ -650,12 +527,7 @@ export class HarnessSession {
                         return;
                       }
                       receivedThinkingDelta = true;
-                      const result = thinkingGuard.add(delta);
-                      appendThinkingDisplay(result.accepted);
-                      if (result.reason) {
-                        thinkingInterrupted = result.reason;
-                        abortAttempt();
-                      }
+                      appendThinkingDisplay(delta);
                     }
                   : undefined,
               };
@@ -678,21 +550,12 @@ export class HarnessSession {
               this.pendingAssistantText = '';
             },
           );
-          if (thinkingInterrupted) throw new Error('Thinking loop interrupted');
-          thinkingInterruptions = 0;
           callDurationMs = Date.now() - callStartedAt;
           text = response.text ?? '';
-          calls = isFinalStep ? [] : response.toolCalls ?? [];
+          calls = response.toolCalls ?? [];
           finishReason = response.finishReason;
           if (!receivedThinkingDelta && response.thinking) {
             // The provider returned a complete JSON response; do not discard its answer or tools.
-            const completedGuard = new ThinkingStreamGuard(0);
-            const result = completedGuard.add(response.thinking);
-            if (result.reason) {
-              const msg = `Possible thinking loop detected in a completed response (${result.reason}); the response was retained.`;
-              host.log('warn', msg);
-              onEvent({ type: 'notice', message: msg, level: 'warn' });
-            }
             if (!completedThinkingDisplayed) appendThinkingDisplay(response.thinking);
           }
           if (response.usage) {
@@ -759,40 +622,11 @@ export class HarnessSession {
             outcome = 'cancelled';
             break;
           }
-          if (thinkingInterrupted) {
-            thinkingInterruptions++;
-            if (showThinking && thinking.trim()) {
-              onEvent({ type: 'thinking', id: thinkingId, text: thinking, durationMs: thinkingStartedAt ? Date.now() - thinkingStartedAt : 0 });
-            }
-            if (attemptText || streamed) {
-              onEvent({ type: 'assistant', id: streamId, text: attemptText.trim(), final: false, streamed: true });
-              if (attemptText.trim()) addMessage({ role: 'assistant', content: attemptText });
-            }
-            this.pendingAssistantText = '';
-            const isBudget = thinkingInterrupted === 'budget';
-            const detail = isBudget
-              ? `Thinking reached the ${thinkingLimit}-character safety budget (codingHarness.thinkingMaxChars).`
-              : `Thinking loop detected (${thinkingInterrupted} repetition).`;
-            const message = `${detail} The model stream was interrupted.`;
-            host.log('warn', message);
-            onEvent({ type: 'notice', message, level: 'warn' });
-            if (thinkingInterruptions >= 3 || isFinalStep) {
-              errorText = 'Stopped after repeated thinking interruptions. Try a different model or adjust the thinking budget.';
-              onEvent({ type: 'notice', message: errorText, level: 'error' });
-              outcome = 'error';
-              break;
-            }
-            const interruptionNotice = isBudget
-              ? 'Your previous response was interrupted after reaching the thinking length budget.'
-              : 'Your previous response was interrupted because your reasoning repeated.';
-            addMessage({ role: 'user', content: interruptionNotice });
-            continue;
-          }
           const providerMessage = (err as Error).message;
           if (!contextOverflowRetried && !attemptText && this.deps.config.compaction.enabled &&
               /context.{0,30}(?:length|window|exceed|limit)|maximum.{0,30}(?:context|tokens)|too many tokens|token limit exceeded|(?:input|prompt).{0,30}too (?:long|large)/i.test(providerMessage)) {
             contextOverflowRetried = true;
-            onEvent({ type: 'notice', message: `Provider rejected the context as too large; attempting ${this.deps.config.compaction.method === 'verbatim' ? 'local verbatim' : 'LLM'} compaction and one retry.`, level: 'warn' });
+            onEvent({ type: 'notice', message: 'Provider rejected the context as too large; attempting LLM compaction and one retry.', level: 'warn' });
             if (await compactTask(toolsForStep, true)) { step--; continue; }
           }
           errorText = providerMessage;
@@ -828,7 +662,7 @@ export class HarnessSession {
           // An answer that hit the output ceiling is not a finished answer:
           // ending the task there is exactly the "it stopped halfway through"
           // report. Keep the partial text and ask the model to carry on.
-          if (isTruncated(finishReason) && !isFinalStep && !signal.aborted) {
+          if (isTruncated(finishReason) && !signal.aborted) {
             if (trimmed || streamed) {
               onEvent({ type: 'assistant', id: streamId, text: trimmed, final: false, streamed });
             }
@@ -841,47 +675,10 @@ export class HarnessSession {
             continue;
           }
 
-          const verificationCommand = this.deps.config.verificationCommand?.trim();
-          if (verificationCommand && !isFinalStep) {
-            if (!allowedToolNames.has('run_command') || this.registry.get('run_command') !== runCommandTool) {
-              errorText = 'Configured verification could not run: the built-in run_command tool is unavailable or disallowed by the active tool policy.';
-              outcome = 'error';
-              if (trimmed || streamed) onEvent({ type: 'assistant', id: streamId, text: trimmed, final: true, streamed });
-              onEvent({ type: 'notice', level: 'error', message: `${errorText} Task completion is unverified.` });
-              break;
-            }
-            onEvent({ type: 'notice', level: 'info', message: 'Running the configured verification command once; normal command policy and approvals apply.' });
-            const check: ToolCall = { id: `harness-verification-${randomUUID()}`, name: 'run_command',
-              arguments: JSON.stringify({ command: verificationCommand, purpose: 'Configured task verification' }) };
-            addMessage({ role: 'assistant', content: '[Harness: configured verification]', toolCalls: [check] });
-            const checked = await this.executeToolCall(check, onEvent, signal, allowedToolNames, 2048);
-            toolCallsRun++;
-            addMessage({ role: 'tool', toolCallId: check.id, name: check.name, content: this.pageToolResult(checked.content, 2048, onEvent) });
-            if (signal.aborted) { outcome = 'cancelled'; break; }
-            if (!checked.ok) {
-              errorText = `Configured verification failed or was not run: ${checked.summary ?? 'unknown result'}. Task completion is unverified.`;
-              outcome = 'error';
-              if (trimmed || streamed) onEvent({ type: 'assistant', id: streamId, text: trimmed, final: true, streamed });
-              onEvent({ type: 'notice', level: 'error', message: errorText });
-              break;
-            }
-            onEvent({ type: 'notice', level: 'info', message: 'Configured verification command passed. A passing command does not prove the whole task is correct.' });
-          } else if (verificationCommand && isFinalStep) {
-            onEvent({ type: 'notice', level: 'warn', message: 'The step limit was reached; configured verification was not run and task completion is unverified.' });
-          }
           if (trimmed || streamed) {
             onEvent({ type: 'assistant', id: streamId, text: trimmed, final: true, streamed });
           }
-          // On the final step the model is forced to answer in prose, so a
-          // prose answer there means the budget ran out rather than "done".
-          outcome = isFinalStep ? 'max-steps' : 'complete';
-          if (isFinalStep) {
-            onEvent({
-              type: 'notice',
-              message: `Step budget (${maxSteps}) reached — the run ended with a summary. Raise codingHarness.maxSteps for longer tasks.`,
-              level: 'warn',
-            });
-          }
+          outcome = 'complete';
           break;
         }
         if (trimmed || streamed) {
@@ -889,8 +686,7 @@ export class HarnessSession {
         }
 
         onEvent({ type: 'status', status: 'executing' });
-        let toolLoopNotice: string | undefined;
-        for (const [callIndex, call] of calls.entries()) {
+        for (const call of calls) {
           if (signal.aborted) {
             // Still answer every requested call: a tool call with no result
             // makes the provider reject the *next* request, which would stop
@@ -903,30 +699,15 @@ export class HarnessSession {
             });
             continue;
           }
-          // Include every pending tool call even while the group is incomplete.
-          const current = estimateRequestTokens([{ role: 'system', content: system }, ...this.history, ...taskMessages], toolsForStep) * this.inputCalibration;
-          const safeInput = Math.max(0, contextWindow * 0.8 - outputReserve);
-          const remaining = Math.max(0, safeInput - current);
-          const budget = Math.max(256, Math.min(2048, Math.floor(remaining / this.inputCalibration / Math.max(1, calls.length - callIndex))));
-          const result = await this.executeToolCall(call, onEvent, signal, allowedToolNames, budget);
+          const result = await this.executeToolCall(call, onEvent, signal, allowedToolNames, 2048);
           toolCallsRun++;
-          const streak = toolLoop.record(call, result);
-          if (streak === 1) toolLoopNotice = undefined;
-          if (streak >= 3 && streak % 3 === 0) {
-            toolLoopNotice = `Tool loop detected: ${call.name} was called ${streak} times consecutively with the same arguments and returned the same result. Identical output does not prove there were no side effects.`;
-            host.log('warn', toolLoopNotice);
-            onEvent({ type: 'notice', message: toolLoopNotice, level: 'warn' });
-          }
           addMessage({ role: 'tool', toolCallId: call.id, name: call.name,
-            content: this.pageToolResult(result.content, budget, onEvent) });
+            content: result.content });
         }
 
         if (signal.aborted) {
           outcome = 'cancelled';
           break;
-        }
-        if (toolLoopNotice) {
-          addMessage({ role: 'user', content: toolLoopNotice });
         }
       }
     } catch (err) {
@@ -954,8 +735,6 @@ export class HarnessSession {
       this.pendingMessages = undefined;
       this.pendingOriginal = undefined;
       this.pendingAssistantText = '';
-      this.toolOutputCache.clear();
-      this.toolOutputBytes = 0;
     }
 
     onEvent({ type: 'status', status: 'idle' });
@@ -965,7 +744,7 @@ export class HarnessSession {
         ? `Failed: ${errorText}`
         : outcome === 'cancelled'
           ? 'Cancelled by the user.'
-          : lastText || (outcome === 'max-steps' ? 'Stopped at the step budget.' : 'Done.');
+          : lastText || 'Done.';
 
     onEvent({
       type: 'done',
@@ -1052,22 +831,6 @@ export class HarnessSession {
     }
   }
 
-  private pageToolResult(content: string, budget: number, onEvent: (event: HarnessEvent) => void): string {
-    const maxBytes = Math.min(MAX_TOOL_RESULT_BYTES, Math.max(128, budget * 3 - 450));
-    if (Buffer.byteLength(content, 'utf8') <= maxBytes) return content;
-    const { page, next } = utf8Page(content, 0, maxBytes);
-    const bytes = Buffer.byteLength(content, 'utf8');
-    if (!this.registry.has(TOOL_OUTPUT_READER.name) && this.toolOutputBytes + bytes <= MAX_CACHED_OUTPUT_BYTES) {
-      const id = `output-${this.nextOutputId++}`;
-      this.toolOutputCache.set(id, content);
-      this.toolOutputBytes += bytes;
-      onEvent({ type: 'notice', level: 'info', message: `Large tool output paged; ${bytes} bytes cached until this task ends.` });
-      return `${page}\n[Partial output; read_tool_output result_id=${id}, next_offset=${next}. Cache expires when this task ends.]`;
-    }
-    onEvent({ type: 'notice', level: 'warn', message: 'Large tool output exceeded the current budget and could not be cached; the remainder is unavailable.' });
-    return `${page}\n[Output truncated; remaining content was not cached and is unavailable.]`;
-  }
-
   private async executeToolCall(
     call: ToolCall,
     onEvent: (event: HarnessEvent) => void,
@@ -1098,98 +861,6 @@ export class HarnessSession {
       return finish({ ok: false, content: `Tool "${call.name}" is not allowed by the selected agent tool policy or is unavailable.`, summary: 'tool not allowed' });
     }
     const tool = this.registry.get(call.name);
-    if (!tool && (call.name === ARCHIVE_SEARCH.name || call.name === ARCHIVE_READ.name)) {
-      try {
-        const args = parseToolArguments(call.arguments);
-        const archive = this.originalConversationSnapshot;
-        const coverage = this.originalHistoryComplete ? '' : ' [Earlier history may be incomplete.]';
-        if (call.name === ARCHIVE_SEARCH.name) {
-          if (typeof args.query !== 'string' || !args.query || args.query.length > 1000) return finish({ ok: false, content: 'query must be a non-empty string of at most 1000 characters.', summary: 'bad query' });
-          if (args.case_sensitive !== undefined && typeof args.case_sensitive !== 'boolean') return finish({ ok: false, content: 'case_sensitive must be a boolean.', summary: 'bad arguments' });
-          const from = args.start_index === undefined ? 1 : Number(args.start_index);
-          const firstOffset = args.start_offset === undefined ? 0 : Number(args.start_offset);
-          if (!Number.isInteger(from) || from < 1 || !Number.isInteger(firstOffset) || firstOffset < 0) return finish({ ok: false, content: 'start_index must be positive and start_offset must be non-negative integers.', summary: 'bad index' });
-          const query = args.query as string;
-          if (args.mode !== undefined && args.mode !== 'literal' && args.mode !== 'ranked') return finish({ ok: false, content: 'mode must be literal or ranked.', summary: 'bad mode' });
-          if (args.mode === 'ranked') {
-            if (args.include_active !== undefined && typeof args.include_active !== 'boolean') return finish({ ok: false, content: 'include_active must be a boolean.', summary: 'bad arguments' });
-            const resultOffset = args.result_offset === undefined ? 0 : Number(args.result_offset);
-            if (!Number.isInteger(resultOffset) || resultOffset < 0 || resultOffset > 1000) return finish({ ok: false, content: 'result_offset must be a non-negative integer at most 1000.', summary: 'bad offset' });
-            const ranked = rankedArchiveSearch({ archive, active: [...this.history, ...(this.pendingMessages ?? [])], text: archiveMessageText, query,
-              caseSensitive: args.case_sensitive === true, startIndex: from, startOffset: firstOffset, resultOffset,
-              includeActive: args.include_active === true, maxBytes: Math.min(MAX_TOOL_RESULT_BYTES, Math.max(128, outputTokenBudget * 3 - 450)), coverage });
-            return finish({ ok: ranked.ok, content: ranked.content, summary: ranked.ok ? `${ranked.count} ranked archived matches` : 'bad search' });
-          }
-          const expression = args.case_sensitive ? undefined : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'iu');
-          const results: string[] = [];
-          let nextIndex: number | undefined;
-          let nextOffset = 0;
-          let scanned = 0;
-          let examined = 0;
-          // Bound work as well as output. Overlap the boundary by the query
-          // length so a literal spanning pages is not missed.
-          const scanLimit = 1_000_000;
-          for (let i = from - 1; i < archive.length; i++) {
-            if (examined++ >= 1000 || scanned >= scanLimit) { nextIndex = i + 1; break; }
-            const text = archiveMessageText(archive[i]);
-            const offset = i === from - 1 ? firstOffset : 0;
-            if (offset > text.length || (offset > 0 && offset < text.length && /[\uD800-\uDBFF]/.test(text[offset - 1]) && /[\uDC00-\uDFFF]/.test(text[offset]))) {
-              return finish({ ok: false, content: 'Invalid archive search offset.', summary: 'bad offset' });
-            }
-            let end = Math.min(text.length, offset + scanLimit - scanned);
-            if (end > offset && end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1]) && /[\uDC00-\uDFFF]/.test(text[end])) end--;
-            const segment = text.slice(offset, Math.min(text.length, end + query.length - 1));
-            const local = expression ? (expression.exec(segment)?.index ?? -1) : segment.indexOf(query);
-            const position = local < 0 ? -1 : local + offset;
-            scanned += end - offset;
-            if (position >= offset && position < end) {
-              const snippet = text.slice(Math.max(0, position - 60), position + query.length + 100).replace(/[\r\n]+/g, ' ');
-              results.push(`message_index=${i + 1} role=${archive[i].role}${archive[i].name ? ` name=${archive[i].name}` : ''} offset=${position}: ${snippet}`);
-              if (results.length === 10) { if (i + 1 < archive.length) nextIndex = i + 2; break; }
-              // At most one match per message; continue with the next message.
-            } else if (end < text.length) {
-              nextIndex = i + 1;
-              nextOffset = end;
-              break;
-            }
-          }
-          const content = `${results.length} matching message(s).${coverage}${nextIndex ? ` next_start_index=${nextIndex} next_start_offset=${nextOffset}` : ''}\n${results.join('\n')}`;
-          return finish({ ok: true, content, summary: `${results.length} archived matches` });
-        }
-        const index = Number(args.message_index);
-        if (!Number.isInteger(index) || index < 1 || index > archive.length) return finish({ ok: false, content: 'Invalid archived message_index.', summary: 'bad index' });
-        const item = archive[index - 1];
-        const text = archiveMessageText(item);
-        const offset = args.offset === undefined ? 0 : Number(args.offset);
-        if (!Number.isInteger(offset) || offset < 0 || offset > text.length ||
-            (offset > 0 && offset < text.length && /[\uD800-\uDBFF]/.test(text[offset - 1]) && /[\uDC00-\uDFFF]/.test(text[offset]))) {
-          return finish({ ok: false, content: 'Invalid archive offset.', summary: 'bad offset' });
-        }
-        const { page, next } = utf8Page(text, offset, Math.max(64, outputTokenBudget * 3 - 800));
-        const header = `Archived message ${index} role=${item.role}${item.name ? ` name=${item.name}` : ''}${item.images?.length ? ` images=${item.images.length}` : ''}.${coverage}\n`;
-        const suffix = next < text.length ? `\n[next_offset=${next}]` : '\n[End of archived message.]';
-        return finish({ ok: true, content: header + page + suffix, summary: 'read archived message' });
-      } catch (err) {
-        return finish({ ok: false, content: `Invalid archive request: ${(err as Error).message}`, summary: 'bad arguments' });
-      }
-    }
-    if (!tool && call.name === TOOL_OUTPUT_READER.name && this.toolOutputCache.size) {
-      try {
-        const args = parseToolArguments(call.arguments);
-        const text = this.toolOutputCache.get(String(args.result_id ?? ''));
-        if (text === undefined) return finish({ ok: false, content: 'Unknown or expired tool output identifier.', summary: 'output unavailable' });
-        const offset = args.offset === undefined ? 0 : Number(args.offset);
-        if (!Number.isInteger(offset) || offset < 0 || offset > text.length ||
-            (offset > 0 && offset < text.length && /[\uD800-\uDBFF]/.test(text[offset - 1]) && /[\uDC00-\uDFFF]/.test(text[offset]))) {
-          return finish({ ok: false, content: 'Invalid output offset.', summary: 'bad offset' });
-        }
-        const { page, next } = utf8Page(text, offset, Math.max(64, outputTokenBudget * 3 - 800));
-        const suffix = next < text.length ? `\n[More output: result_id=${args.result_id}, next_offset=${next}; cache expires when this task ends.]` : '\n[End of cached output.]';
-        return finish({ ok: true, content: page + suffix, summary: 'read cached tool output' });
-      } catch (err) {
-        return finish({ ok: false, content: `Invalid cached output request: ${(err as Error).message}`, summary: 'bad arguments' });
-      }
-    }
     if (!tool) {
       return finish({
         ok: false,

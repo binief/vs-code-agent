@@ -3,18 +3,18 @@ import type { ToolSpec } from './types';
 
 /** Built-in group names used in agent-file `tools` metadata. */
 const GROUPS: Record<string, readonly string[]> = {
-  read: ['list_files', 'read_file', 'get_diagnostics', 'open_file', 'search_conversation', 'read_conversation'],
-  search: ['list_files', 'search_text', 'search_conversation'],
+  read: ['list_files', 'read_file', 'get_diagnostics', 'open_file'],
+  search: ['list_files', 'search_text'],
   edit: ['create_file', 'write_file', 'replace_in_file', 'delete_file'],
   execute: ['run_command'],
 };
 
 /**
  * Selected files with `tools` narrow the registry by intersection. Missing
- * metadata is neutral for backward compatibility. Never interpret prose as a
+ * metadata does not grant any capabilities. Never interpret prose as a
  * security policy; malformed, unknown or incomplete metadata fails closed.
  */
-export function resolveAgentToolPolicy(selected: SelectedAgentFiles, available: readonly ToolSpec[], archiveTools: ReadonlySet<string> = new Set()): {
+export function resolveAgentToolPolicy(selected: SelectedAgentFiles, available: readonly ToolSpec[]): {
   tools: ToolSpec[];
   restricted: boolean;
 } {
@@ -24,20 +24,18 @@ export function resolveAgentToolPolicy(selected: SelectedAgentFiles, available: 
   }
   const names = new Set(available.map((tool) => tool.name));
   let allowed = new Set(names);
-  let restricted = false;
+  let declared = false;
   for (const file of selected.files) {
     if (file.truncated) throw new Error(`Agent file "${file.displayPath}" is truncated; tool permissions cannot be determined safely.`);
     if (file.toolPolicyError) throw new Error(`Invalid tool policy in "${file.displayPath}": ${file.toolPolicyError}`);
     if (file.tools === undefined) continue;
-    restricted = true;
+    declared = true;
     const current = new Set<string>();
     for (const entry of file.tools) {
       if (entry === 'mcp') {
         for (const name of names) if (name.startsWith('mcp_')) current.add(name);
       } else if (Object.prototype.hasOwnProperty.call(GROUPS, entry)) {
         for (const name of GROUPS[entry]) {
-          // A custom tool with a reserved helper name is not implicitly granted.
-          if ((name === 'search_conversation' || name === 'read_conversation') && !archiveTools.has(name)) continue;
           if (names.has(name)) current.add(name);
         }
       } else if (names.has(entry)) {
@@ -48,5 +46,5 @@ export function resolveAgentToolPolicy(selected: SelectedAgentFiles, available: 
     }
     allowed = new Set([...allowed].filter((name) => current.has(name)));
   }
-  return { tools: available.filter((tool) => allowed.has(tool.name)), restricted };
+  return { tools: declared ? available.filter((tool) => allowed.has(tool.name)) : [], restricted: true };
 }

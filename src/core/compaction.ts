@@ -1,6 +1,4 @@
 import { estimateImageTokens } from './images';
-import { verbatimCompaction } from './verbatimCompaction';
-import { reduceArchivedToolOutputs } from './toolOutputReduction';
 import type { ChatMessage, ContextBreakdown, HarnessConfig, Provider, ToolSpec, Usage } from './types';
 
 /** Conservative approximation only; providers use different tokenizers. */
@@ -54,9 +52,7 @@ export interface CompactionResult {
   newTokens: number;
   removedMessages: number;
   summary: string;
-  strategy?: 'llm' | 'verbatim' | 'tool-output';
-  toolOutputsReduced?: number;
-  fallbackReason?: string;
+  strategy?: 'llm';
   targetMet?: boolean;
   usage?: Usage;
 }
@@ -64,14 +60,8 @@ export interface CompactionResult {
 /** Optional target is the budget for the resulting history, excluding system/tools/output. */
 export interface CompactionOptions {
   targetHistoryTokens?: number;
-  /** Caller must retain the original recorded conversation separately. */
-  allowVerbatimFallback?: boolean;
-  /** Skip the model and use local excerpts directly (requires archived originals). */
-  useVerbatimOnly?: boolean;
-  /** Current user request, retained intact by the local fallback. */
+  /** Current user request, retained intact during summarization. */
   preserveUserMessage?: ChatMessage;
-  /** Present only when the built-in archive reader is permitted. */
-  archiveMessages?: readonly ChatMessage[];
 }
 
 /** Carries costs of completed summary requests when a later chunk is cancelled. */
@@ -80,9 +70,8 @@ export class CompactionCancelled extends Error {
 }
 
 /**
- * Summarize complete history groups with bounded LLM requests. On failure the
- * caller may opt into a local verbatim fallback if it separately retains the
- * original conversation; otherwise the input history is returned untouched.
+ * Summarize complete history groups with bounded LLM requests. On failure or
+ * cancellation the input history is left untouched.
  */
 export async function compactHistory(
   history: ChatMessage[],
@@ -93,19 +82,11 @@ export async function compactHistory(
 ): Promise<{ newHistory: ChatMessage[]; result: CompactionResult }> {
   if (signal?.aborted) throw new CompactionCancelled();
   const originalTokens = estimateMessagesTokens(history);
-  const originalHistory = history;
-  let toolOutputsReduced = 0;
   let usage: Usage | undefined;
-  const unchanged = (reason: string) => toolOutputsReduced ? {
+  const unchanged = (reason: string) => ({
     newHistory: history,
-    result: { compacted: true, originalTokens, newTokens: estimateMessagesTokens(history), removedMessages: 0,
-      summary: reason, strategy: 'tool-output' as const, toolOutputsReduced,
-      targetMet: options.targetHistoryTokens === undefined || estimateMessagesTokens(history) <= options.targetHistoryTokens,
-      fallbackReason: reason, usage },
-  } : {
-    newHistory: originalHistory,
     result: { compacted: false, originalTokens, newTokens: originalTokens, removedMessages: 0, summary: reason, usage },
-  };
+  });
   const addUsage = (next?: Usage): void => {
     if (!next) return;
     const prev = usage ?? {};
@@ -125,16 +106,6 @@ export async function compactHistory(
   const outputCap = Math.max(128, Math.min(8192, Math.floor(window * 0.3)));
   const summaryTargetCap = Math.max(32, Math.floor(outputCap * 0.55));
   const keepLast = Math.max(2, config.compaction.keepLastMessages);
-  if (options.archiveMessages) {
-    const reduced = reduceArchivedToolOutputs(history, options.archiveMessages, keepLast, options.preserveUserMessage);
-    history = reduced.history;
-    toolOutputsReduced = reduced.count;
-    if (toolOutputsReduced && (options.targetHistoryTokens === undefined || estimateMessagesTokens(history) <= options.targetHistoryTokens)) {
-      return { newHistory: history, result: { compacted: true, originalTokens, newTokens: estimateMessagesTokens(history),
-        removedMessages: 0, summary: 'Older recorded tool results shortened to archive references.',
-        strategy: 'tool-output', toolOutputsReduced, targetMet: true, usage } };
-    }
-  }
   let cut = Math.max(0, history.length - keepLast);
   while (cut > 0 && history[cut]?.role === 'tool') cut--;
   const budget = options.targetHistoryTokens;
@@ -153,25 +124,7 @@ export async function compactHistory(
     }
   }
   if (cut <= 0) return unchanged('Conversation is too short to compact while preserving recent messages.');
-  const fallback = (reason?: string) => {
-    if (signal?.aborted) throw new CompactionCancelled(usage);
-    if (!options.allowVerbatimFallback) {
-      // Disabling fallback promises that an unsuccessful summary leaves the
-      // original active history untouched, including any tentative pruning.
-      history = originalHistory;
-      toolOutputsReduced = 0;
-      return unchanged(reason ?? 'Local compaction requires separately retained original history.');
-    }
-    const result = verbatimCompaction(history, cut, budget, estimateMessagesTokens, options.preserveUserMessage);
-    if (!result) return unchanged(`${reason ? `${reason} ` : ''}Verbatim compaction could not safely reduce the active history.`);
-    return { newHistory: result.history, result: {
-      compacted: true, originalTokens, newTokens: estimateMessagesTokens(result.history),
-      removedMessages: result.removed, summary: 'Verbatim excerpts of earlier user-role messages; other older content omitted.',
-      strategy: 'verbatim' as const, toolOutputsReduced, fallbackReason: reason, targetMet: result.targetMet, usage,
-    } };
-  };
-  if (options.useVerbatimOnly) return fallback();
-  if (provider.id === 'mock') return fallback('LLM compaction is unavailable with the offline mock provider.');
+  if (provider.id === 'mock') return unchanged('LLM compaction is unavailable with the offline mock provider.');
   const older = history.slice(0, cut);
   const compactableTokens = estimateMessagesTokens(older.map(({ images: _images, ...message }) => message));
   if (compactableTokens < 100) return unchanged('Not enough older text to summarize usefully. Reduce compaction.keepLastMessages or continue the task.');
@@ -312,11 +265,11 @@ export async function compactHistory(
     };
     const newHistory = [summaryMessage, ...(preservedRequest ? [preservedRequest] : []), ...history.slice(cut)];
     const newTokens = estimateMessagesTokens(newHistory);
-    if (newTokens >= originalTokens) return fallback('LLM summary did not reduce the estimated context size.');
-    return { newHistory, result: { compacted: true, originalTokens, newTokens, removedMessages: cut - 1 - (preservedRequest ? 1 : 0), summary, strategy: 'llm', toolOutputsReduced, targetMet: budget === undefined || newTokens <= budget, usage } };
+    if (newTokens >= originalTokens) return unchanged('LLM summary did not reduce the estimated context size.');
+    return { newHistory, result: { compacted: true, originalTokens, newTokens, removedMessages: cut - 1 - (preservedRequest ? 1 : 0), summary, strategy: 'llm', targetMet: budget === undefined || newTokens <= budget, usage } };
   } catch (err) {
     if (signal?.aborted) throw new CompactionCancelled(usage);
-    return fallback(err instanceof SummaryFailure ? err.message : `LLM compaction failed: ${(err as Error).message}`);
+    return unchanged(err instanceof SummaryFailure ? err.message : `LLM compaction failed: ${(err as Error).message}`);
   }
 }
 

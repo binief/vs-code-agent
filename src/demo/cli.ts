@@ -36,7 +36,6 @@ interface Args {
   model?: string;
   baseUrl?: string;
   auto: boolean;
-  maxSteps?: number;
   verbose: boolean;
   noStream: boolean;
   mcp?: string;
@@ -56,7 +55,6 @@ function parseArgs(argv: string[]): Args {
       case '--provider': args.provider = value() as ProviderId; break;
       case '--model': args.model = value(); break;
       case '--base-url': args.baseUrl = value(); break;
-      case '--max-steps': args.maxSteps = Number(value()); break;
       case '--auto': args.auto = true; break;
       case '--no-stream': args.noStream = true; break;
       case '--verbose': args.verbose = true; break;
@@ -85,7 +83,6 @@ Options:
   --provider <id>       openai | anthropic | mock   (default: mock)
   --model <id>          Model id, e.g. gpt-4o-mini, claude-sonnet-4-5
   --base-url <url>      OpenAI-compatible base URL (Ollama, OpenRouter, …)
-  --max-steps <n>       Step budget (default: 40)
   --auto                Approve every edit/command without asking
   --no-stream           Wait for each model turn instead of streaming it
   --verbose             Print full tool output
@@ -156,7 +153,6 @@ async function main(): Promise<void> {
     provider: args.provider ?? 'mock',
     model: args.model ?? (args.provider === 'anthropic' ? 'claude-sonnet-4-5' : DEFAULT_CONFIG.model),
     baseUrl: args.baseUrl ?? DEFAULT_CONFIG.baseUrl,
-    maxSteps: args.maxSteps ?? DEFAULT_CONFIG.maxSteps,
     editPolicy: 'ask',
     commandPolicy: 'ask',
     stream: !args.noStream,
@@ -230,7 +226,7 @@ async function main(): Promise<void> {
           process.stdout.write('\n');
           streaming = false;
         }
-        console.log(c.dim(`── step ${event.index}/${event.maxSteps}`));
+        console.log(c.dim(`── step ${event.index}`));
         break;
       case 'assistant-delta':
         // Live token stream: no newline until the turn ends.
