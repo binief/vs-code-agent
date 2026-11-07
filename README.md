@@ -247,8 +247,9 @@ instructions alone do not enforce read-only access. In particular, a list that i
 
 ### Optional read-only subagents
 
-Subagents are **off by default**. To enable them, set `codingHarness.subagents.enabled` to `true`
-in VS Code Settings and explicitly allow `subagent` (or `delegate_task`) alongside the read/search
+Subagents are **off by default**. In the chat panel, click **Settings** (sliders icon), enable
+**Read-only subagents**, and save. The same switch is available as `codingHarness.subagents.enabled`
+in VS Code Settings. Also explicitly allow `subagent` (or `delegate_task`) alongside the read/search
 tools in the selected agent file's YAML:
 
 ```yaml
@@ -267,8 +268,9 @@ Its file access follows the existing workspace and outside-workspace settings. I
 permitted, delegation fails instead of guessing.
 
 Only the child’s final findings and any warnings are sent back to the main conversation; the child’s
-intermediate transcript is not saved in the chat. The tool card and notices show progress and failures.
-Child model usage is included in the session total. Cancellation of the main task also cancels the
+intermediate transcript is not saved in the chat. When the model actually delegates, the activity strip
+shows **Subagent working**, and the `delegate_task` tool card and notices show its task and outcome.
+Enabling the switch alone does not force delegation. Child model usage is included in the session total. Cancellation of the main task also cancels the
 child, subject to the provider honoring cancellation. These findings are unverified and may omit or
 misstate details; the main agent should inspect evidence when necessary. Additional model calls can
 increase time and cost. The offline mock planner does not autonomously decide to delegate.
@@ -539,6 +541,7 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.compaction.threshold` | `0.75` | Utilisation target; auto-compaction starts earlier to reserve tool-result headroom |
 | `codingHarness.compaction.contextWindowTokens` | `128000` | Context window estimate for the meter |
 | `codingHarness.compaction.keepLastMessages` | `10` | Preferred recent messages to keep; may be reduced under context pressure |
+| `codingHarness.compaction.localFallback` | `false` | Allow lossy local excerpts when LLM compaction fails or when explicitly requested |
 | `codingHarness.compaction.summaryModel` | `""` | Optional model on the current provider for LLM summaries; empty uses the active model |
 
 ## Commands
@@ -592,13 +595,28 @@ fixed step limit or automatic loop/thinking interruption; long runs can consume 
   remain attached. Large history is split
   into bounded requests and summaries may be summarized again. Image attachments may require separate
   vision requests. Summary calls cost time and tokens, may lose detail, and are capped at 64 requests
-  per compaction; a failed or cancelled LLM summary leaves active history unchanged. If the model
+  per compaction. By default a failed or cancelled LLM summary leaves active history unchanged. With
+  **Local fallback compaction** enabled in the panel Settings (or `codingHarness.compaction.localFallback`),
+  a failed LLM summary instead attempts a bounded local extract of earlier messages. The extract is
+  explicitly labelled incomplete and may omit important details; a warning identifies the fallback.
+  It preserves the current request, retained recent messages, and image attachments, and is used only
+  if the complete resulting context is smaller. Original messages remain in the session and saved
+  chat when saving is enabled. Cancellation never triggers fallback. If the model
   produces a complete, smaller summary that exceeds the requested length even after a shorter retry,
   the best reducing summary may be used with a warning. The complete resulting history must still be
   smaller; if the estimated target is missed, a warning says so. The original messages remain in the saved chat as described under Saved chats. The offline mock cannot produce LLM summaries. A rejected summary input can be split further and retried. If a
   provider stops a summary at its output limit, the harness retries with progressively larger bounded
   output budgets (up to 8,192 tokens per request and at most three attempts); reasoning tokens may
   consume part of that budget. Retries can increase cost and still fail if the model cannot complete.
+  During manual and automatic compaction, the activity strip shows the current request, attempt,
+  elapsed time and whether it is waiting for the provider or receiving streamed output. When streaming
+  is enabled, summaries use it for activity updates without displaying the summary or reasoning; a
+  backend that buffers responses may still show only "waiting for provider". Some providers omit token
+  usage from streamed responses, so reported compaction usage may be incomplete. A long wait can be model
+  loading, prompt processing, generation, a queued request, or a stalled backend; check the provider's
+  logs. **Stop** cancels compaction and retains the original active history. No timeout is imposed on
+  slow models. To bypass an LLM request that is still waiting, press **Stop**, then use **Settings →
+  Compact locally now** after enabling local fallback; the lossy operation requires confirmation.
   Summary-model capacity is assumed to match `contextWindowTokens`; a smaller provider/model window,
   image overhead, output reservations, huge fixed instructions or inaccurate estimates can still
   prevent compaction.

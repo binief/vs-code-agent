@@ -620,3 +620,55 @@ test('Anthropic input usage includes cache reads and writes in both streaming an
   assert.equal(plain.usage?.inputTokens, 130);
   assert.equal(plain.usage?.cachedTokens, 100);
 });
+
+test('OpenAI-compatible compaction streams progress and accepts a buffered fallback', async () => {
+  const { compactHistory } = await import('../core/compaction');
+  const history = [
+    { role: 'user' as const, content: 'Preserve these verified details. '.repeat(200) },
+    { role: 'assistant' as const, content: 'Recent response.' },
+    { role: 'user' as const, content: 'Continue.' },
+  ];
+  const c = { ...DEFAULT_CONFIG, stream: true, compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } };
+  for (const streaming of [true, false]) {
+    const response = streaming ? sseResponse([
+      sseChunk({ choices: [{ delta: { reasoning_content: 'thinking' } }] }),
+      sseChunk({ choices: [{ delta: { content: 'Verified summary.' } }] }),
+      sseChunk({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+      'data: [DONE]\n\n',
+    ]) : new Response(JSON.stringify({ choices: [{ message: { content: 'Verified summary.' }, finish_reason: 'stop' }] }), {
+      headers: { 'content-type': 'application/json' },
+    });
+    const stub = stubFetch(response);
+    const events: import('../core/types').CompactionProgress[] = [];
+    const provider = new OpenAiCompatibleProvider({ baseUrl: 'https://example.test/v1' });
+    const { result, newHistory } = await compactHistory(history, c, provider, undefined, { onProgress: (event) => events.push(event) });
+    assert.equal((stub.calls[0] as any).body.stream, true);
+    assert.equal(result.compacted, true);
+    assert.match(newHistory[0].content, /Verified summary/);
+    assert.ok(events.some((event) => event.phase === 'waiting'));
+    assert.ok(events.some((event) => event.phase === 'receiving' && (event.characters ?? 0) > 0));
+    if (streaming) assert.ok(events.some((event) => event.phase === 'reasoning'));
+  }
+});
+
+test('compaction rejects incomplete summary streams and keeps the original history', async () => {
+  const { compactHistory } = await import('../core/compaction');
+  const history = [
+    { role: 'user' as const, content: 'Important original context. '.repeat(200) },
+    { role: 'assistant' as const, content: 'Recent response.' },
+    { role: 'user' as const, content: 'Continue.' },
+  ];
+  const c = { ...DEFAULT_CONFIG, stream: true, compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } };
+  for (const anthropic of [false, true]) {
+    stubFetch(sseResponse(anthropic
+      ? [sseChunk({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Partial summary.' } })]
+      : [sseChunk({ choices: [{ delta: { content: 'Partial summary.' } }] })]));
+    const provider = anthropic
+      ? new AnthropicProvider({ apiKey: 'test', baseUrl: 'https://example.test/v1' })
+      : new OpenAiCompatibleProvider({ baseUrl: 'https://example.test/v1' });
+    const { result, newHistory } = await compactHistory(history, c, provider, undefined, { onProgress: () => {} });
+    assert.equal(result.compacted, false);
+    assert.match(result.summary, /without a completion marker/);
+    assert.strictEqual(newHistory, history);
+  }
+});

@@ -116,6 +116,8 @@ test('automatic LLM compaction can summarize the current task and keep a valid t
     assert.equal(original.at(-1)?.content, 'Finished.');
     assert.ok(!original.some((m) => /Conversation compacted/.test(m.content)), 'summaries never replace originals');
     assert.ok(events.some((e) => e.type === 'notice' && e.message.includes('LLM compacted')));
+    assert.ok(events.some((e) => e.type === 'compaction-progress' && e.progress?.phase === 'waiting'));
+    assert.ok(events.some((e) => e.type === 'compaction-progress' && e.progress === null));
     assert.ok((session.usage.inputTokens ?? 0) >= 200, 'summary usage is counted');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
@@ -673,4 +675,136 @@ test('a reducing serialized summary is rejected if the assembled history is not 
   assert.equal(result.compacted, false);
   assert.strictEqual(newHistory, history);
   assert.match(result.summary, /did not reduce the estimated context size/);
+});
+
+test('compaction reports request, retry and streamed activity without exposing content', async () => {
+  const events: import('../core/types').CompactionProgress[] = [];
+  let calls = 0;
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+    calls++;
+    assert.ok(req.onDelta, 'summary requests stream when enabled and progress is observed');
+    req.onThinking?.('private reasoning');
+    req.onDelta?.('private summary fragment');
+    if (calls === 1) return { text: 'partial', toolCalls: [], finishReason: 'length' };
+    return { text: 'Complete summary.', toolCalls: [], finishReason: 'stop' };
+  } };
+  const c = config({ stream: true, compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } });
+  const result = await compactHistory(longHistory(), c, provider, undefined, { onProgress: (event) => events.push(event) });
+  assert.equal(result.result.compacted, true);
+  assert.deepEqual(events.map(({ request, attempt, phase }) => ({ request, attempt, phase })), [
+    { request: 1, attempt: 1, phase: 'waiting' },
+    { request: 1, attempt: 1, phase: 'reasoning' },
+    { request: 1, attempt: 1, phase: 'receiving' },
+    { request: 2, attempt: 2, phase: 'waiting' },
+    { request: 2, attempt: 2, phase: 'reasoning' },
+    { request: 2, attempt: 2, phase: 'receiving' },
+  ]);
+  assert.ok(events.every((event) => event.startedAt > 0));
+  assert.doesNotMatch(JSON.stringify(events), /private/);
+});
+
+test('non-streaming compaction still reports waiting and respects the stream setting', async () => {
+  const events: import('../core/types').CompactionProgress[] = [];
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+    assert.equal(req.onDelta, undefined);
+    assert.equal(req.onThinking, undefined);
+    return { text: 'Complete summary.', toolCalls: [] };
+  } };
+  const c = config({ stream: false, compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } });
+  const result = await compactHistory(longHistory(), c, provider, undefined, { onProgress: (event) => events.push(event) });
+  assert.equal(result.result.compacted, true);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].phase, 'waiting');
+});
+
+test('cancelling from progress does not start a provider request or alter history', async () => {
+  const original = longHistory();
+  const snapshot = JSON.stringify(original);
+  const controller = new AbortController();
+  let calls = 0;
+  const provider: Provider = { id: 'test', label: 'test', async chat() { calls++; return { text: 'Summary', toolCalls: [] }; } };
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } });
+  await assert.rejects(compactHistory(original, c, provider, controller.signal, { onProgress: () => controller.abort() }), /cancelled/i);
+  assert.equal(calls, 0);
+  assert.equal(JSON.stringify(original), snapshot);
+});
+
+test('optional local fallback is lossy, preserves images and the current request, and is disabled by default', async () => {
+  const original = longHistory();
+  const image = { mediaType: 'image/png', data: 'YWJj', name: 'evidence.png' };
+  original[0].images = [image];
+  const current = original[4];
+  const snapshot = JSON.stringify(original);
+  let calls = 0;
+  const provider: Provider = { id: 'test', label: 'test', async chat() { calls++; throw new Error('summary service offline'); } };
+  const off = config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2, localFallback: false } });
+  const failed = await compactHistory(original, off, provider, undefined, { targetHistoryTokens: 500, preserveUserMessage: current });
+  assert.equal(failed.result.compacted, false);
+  assert.strictEqual(failed.newHistory, original);
+  const on = config({ compaction: { ...off.compaction, localFallback: true } });
+  const { newHistory, result } = await compactHistory(original, on, provider, undefined, { targetHistoryTokens: 500, preserveUserMessage: current });
+  assert.equal(result.compacted, true);
+  assert.equal(result.strategy, 'local');
+  assert.match(result.fallbackReason ?? '', /summary service offline/);
+  assert.match(newHistory[0].content, /incomplete excerpts.*not an LLM summary/);
+  assert.ok(newHistory.some((message) => message === current), 'current request is kept verbatim');
+  assert.ok(newHistory.some((message) => message.images?.includes(image)), 'images are retained');
+  assert.equal(isTranscriptWellFormed(newHistory), true);
+  assert.ok(result.newTokens < result.originalTokens);
+  assert.equal(JSON.stringify(original), snapshot);
+  assert.equal(calls, 2);
+});
+
+test('local compaction can be explicitly requested without calling the model; disabled and cancelled requests do not fall back', async () => {
+  const original = longHistory();
+  let calls = 0;
+  const provider: Provider = { id: 'test', label: 'test', async chat() { calls++; throw new Error('must not run'); } };
+  const base = config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2, localFallback: true } });
+  const local = await compactHistory(original, base, provider, undefined, { preferLocal: true });
+  assert.equal(local.result.strategy, 'local');
+  assert.equal(calls, 0);
+  const disabled = await compactHistory(original, { ...base, compaction: { ...base.compaction, localFallback: false } }, provider, undefined, { preferLocal: true });
+  assert.equal(disabled.result.compacted, false);
+  assert.match(disabled.result.summary, /disabled/);
+  assert.strictEqual(disabled.newHistory, original);
+  const controller = new AbortController();
+  const aborting: Provider = { id: 'test', label: 'test', async chat() { controller.abort(); throw new Error('cancelled'); } };
+  await assert.rejects(compactHistory(original, base, aborting, controller.signal), /cancelled/i);
+  assert.equal(original[0].content.includes('Original task'), true);
+});
+
+test('local fallback refuses a non-reducing history', async () => {
+  const history: ChatMessage[] = [
+    { role: 'user', content: 'x'.repeat(350), images: [{ mediaType: 'image/png', data: 'YWJj', name: 'one.png' }] },
+    { role: 'assistant', content: 'Recent response.' },
+    { role: 'user', content: 'Continue.' },
+  ];
+  const provider: Provider = { id: 'test', label: 'test', async chat() { throw new Error('offline'); } };
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2, localFallback: true } });
+  const result = await compactHistory(history, c, provider, undefined, { preserveUserMessage: history[0] });
+  assert.equal(result.result.compacted, false);
+  assert.match(result.result.summary, /could not reduce/);
+  assert.strictEqual(result.newHistory, history);
+});
+
+test('automatic local fallback warns and preserves the original conversation', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-local-fallback-'));
+  try {
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      if (isSummary(req)) throw new Error('summary backend unavailable');
+      return { text: 'Task finished.', toolCalls: [] };
+    } };
+    const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, localFallback: true, keepLastMessages: 2, contextWindowTokens: 2000, threshold: 0.5 } });
+    const session = new HarnessSession({ host: new Host(dir), provider, config: c });
+    const before = longHistory();
+    session.restoreConversation(before);
+    const events: HarnessEvent[] = [];
+    const task = await session.runTask('Continue the work.', (event) => events.push(event));
+    assert.equal(task.outcome, 'complete');
+    const notice = events.find((event): event is Extract<HarnessEvent, { type: 'notice' }> => event.type === 'notice' && event.message.includes('Local fallback compacted'));
+    assert.equal(notice?.level, 'warn');
+    assert.match(notice?.message ?? '', /lossy.*summary backend unavailable/);
+    assert.deepEqual(session.originalConversationSnapshot.slice(0, before.length), before);
+    assert.ok(session.transcript.some((message) => message.content.includes('Local fallback: incomplete excerpts')));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

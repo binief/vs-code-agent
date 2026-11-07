@@ -87,6 +87,8 @@ test('a separate read-only child passes back only findings, with usage and denie
     assert.equal(result.usage.outputTokens, 8);
     assert.equal(fs.readFileSync(path.join(dir, 'secret.txt'), 'utf8'), 'Evidence from the file.\n');
     assert.ok(events.some(e => e.type === 'tool-end' && e.name === 'delegate_task' && e.summary.includes('warnings')));
+    assert.ok(events.some(e => e.type === 'subagent-progress' && e.step === 1));
+    assert.ok(events.some(e => e.type === 'subagent-progress' && e.tool === 'read_file'));
     assert.ok(isTranscriptWellFormed([...session.transcript]));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

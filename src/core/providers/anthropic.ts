@@ -169,6 +169,7 @@ export async function readAnthropicStream(
   let text = '';
   let thinking = '';
   let stopReason: string | undefined;
+  let streamComplete = false;
   let inputTokens: number | undefined;
   let cachedTokens: number | undefined;
   let outputTokens: number | undefined;
@@ -223,7 +224,11 @@ export async function readAnthropicStream(
       }
       case 'message_delta':
         stopReason = event.delta?.stop_reason ?? stopReason;
+        if (stopReason) streamComplete = true;
         outputTokens = event.usage?.output_tokens ?? outputTokens;
+        break;
+      case 'message_stop':
+        streamComplete = true;
         break;
       case 'error':
         errorMessage = event.error?.message ?? 'stream error';
@@ -273,6 +278,7 @@ export async function readAnthropicStream(
     text,
     toolCalls,
     finishReason: stopReason,
+    streamComplete,
     usage: inputTokens || outputTokens ? { inputTokens, outputTokens, ...(cachedTokens ? { cachedTokens } : {}) } : undefined,
     thinking: thinking || undefined,
   };

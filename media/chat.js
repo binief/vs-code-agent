@@ -575,6 +575,8 @@
     }
     const labels = {
       thinking: 'Thinking',
+      compacting: 'LLM compaction',
+      subagent: 'Subagent working',
       executing: 'Running ' + (next.tool || 'tool'),
       approval: 'Waiting for your approval',
       running: 'Working',
@@ -1464,7 +1466,7 @@
   btnReset.addEventListener('click', () => vscode.postMessage({ type: 'reset' }));
   btnImportChat.addEventListener('click', () => vscode.postMessage({ type: 'import-chat' }));
   btnExportChat.addEventListener('click', () => vscode.postMessage({ type: 'export-chat' }));
-  btnSettings.addEventListener('click', () => vscode.postMessage({ type: 'open-settings' }));
+  btnSettings.addEventListener('click', openFeatureModal);
   btnSelection.addEventListener('click', () => vscode.postMessage({ type: 'insert-selection' }));
   if (btnCompact) btnCompact.addEventListener('click', () => vscode.postMessage({ type: 'compact' }));
   if (btnMcp) btnMcp.addEventListener('click', openMcpModal);
@@ -1490,6 +1492,57 @@
       input.dispatchEvent(new Event('input'));
     });
   }
+
+  /* ------------------------------------------------------- quick settings */
+  const featureModal = document.getElementById('feature-modal');
+  const featureSubagents = document.getElementById('feature-subagents');
+  const featureLocal = document.getElementById('feature-local-fallback');
+  const featureTarget = document.getElementById('feature-target');
+  const featureStatus = document.getElementById('feature-status');
+  const featureSave = document.getElementById('feature-save');
+  const featureCompactLocal = document.getElementById('feature-compact-local');
+  let effectiveLocalFallback = false;
+  let featureRequested = null;
+
+  function openFeatureModal() {
+    featureModal.hidden = false;
+    featureStatus.classList.remove('error');
+    featureStatus.textContent = 'Loading…';
+    featureSave.disabled = true;
+    featureSubagents.disabled = true;
+    featureLocal.disabled = true;
+    featureCompactLocal.disabled = true;
+    vscode.postMessage({ type: 'get-feature-settings' });
+  }
+  function renderFeatureSettings(data) {
+    featureSubagents.checked = Boolean(data.subagentsEnabled);
+    featureLocal.checked = Boolean(data.localFallback);
+    effectiveLocalFallback = Boolean(data.localFallback);
+    featureTarget.querySelector('option[value="workspace"]').disabled = !data.hasWorkspace;
+    if (!data.hasWorkspace) featureTarget.value = 'user';
+    featureSubagents.disabled = false;
+    featureLocal.disabled = false;
+    featureSave.disabled = false;
+    featureCompactLocal.disabled = busy || !effectiveLocalFallback;
+  }
+  document.getElementById('feature-close').addEventListener('click', () => { featureModal.hidden = true; });
+  featureModal.addEventListener('click', (event) => { if (event.target === featureModal) featureModal.hidden = true; });
+  document.getElementById('feature-all-settings').addEventListener('click', () => {
+    featureModal.hidden = true;
+    vscode.postMessage({ type: 'open-settings' });
+  });
+  featureSave.addEventListener('click', () => {
+    featureRequested = { subagentsEnabled: featureSubagents.checked, localFallback: featureLocal.checked };
+    featureStatus.classList.remove('error');
+    featureStatus.textContent = 'Saving…';
+    featureSave.disabled = true;
+    vscode.postMessage({ type: 'save-feature-settings', ...featureRequested, target: featureTarget.value });
+  });
+  featureCompactLocal.addEventListener('click', () => {
+    if (busy || !effectiveLocalFallback) return;
+    featureModal.hidden = true;
+    vscode.postMessage({ type: 'compact-local' });
+  });
 
   /* --------------------------------------------------------- mcp settings */
 
@@ -1832,6 +1885,7 @@
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
     if (!mcpModal.hidden) closeMcpModal();
+    if (!featureModal.hidden) featureModal.hidden = true;
     if (agentsModal && !agentsModal.hidden) closeAgentsModal();
   });
   mcpAddServer.addEventListener('click', () => {
@@ -2100,6 +2154,26 @@
           } else {
             chipMcp.hidden = true;
           }
+        }
+        break;
+      case 'feature-settings':
+        if (featureModal.hidden) break;
+        renderFeatureSettings(message);
+        featureStatus.textContent = '';
+        break;
+      case 'feature-settings-saved':
+        if (featureModal.hidden) break;
+        featureSave.disabled = false;
+        if (message.ok) {
+          renderFeatureSettings(message.settings);
+          const overridden = featureRequested && (featureRequested.subagentsEnabled !== message.settings.subagentsEnabled || featureRequested.localFallback !== message.settings.localFallback);
+          featureStatus.classList.toggle('error', Boolean(overridden));
+          featureStatus.textContent = overridden ? 'Saved, but another settings scope overrides the effective value.' : 'Saved ✓';
+        } else {
+          featureStatus.classList.add('error');
+          featureStatus.textContent = message.error || 'Could not save settings.';
+          effectiveLocalFallback = Boolean(message.settings && message.settings.localFallback);
+          featureCompactLocal.disabled = busy || !effectiveLocalFallback;
         }
         break;
       case 'mcp-settings':

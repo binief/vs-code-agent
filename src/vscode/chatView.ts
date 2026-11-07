@@ -102,6 +102,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'compact':
         await this.controller.compactHistory();
         break;
+      case 'compact-local':
+        await this.controller.compactHistory(true);
+        break;
+      case 'get-feature-settings':
+        this.post({ type: 'feature-settings', ...this.controller.getFeatureSettings() });
+        break;
+      case 'save-feature-settings':
+        await this.controller.saveFeatureSettings({ subagentsEnabled: message.subagentsEnabled, localFallback: message.localFallback, target: message.target });
+        break;
       case 'mcp-reload':
         await this.controller.reloadMcpServers();
         break;

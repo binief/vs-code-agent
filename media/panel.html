@@ -168,6 +168,34 @@
     </div>
   </footer>
 
+  <div class="modal-backdrop" id="feature-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="feature-modal-title">
+      <div class="modal-head">
+        <span class="modal-title" id="feature-modal-title">Coding Harness settings</span>
+        <button type="button" class="icon-btn" id="feature-close" aria-label="Close settings" title="Close">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <label class="check-row"><input type="checkbox" id="feature-subagents" /><span>Enable read-only subagents</span></label>
+        <p>Selected agent files must also allow <code>subagent</code> (or <code>delegate_task</code>) and read/search tools. The model decides whether to delegate. The activity strip and tool card show when a subagent runs.</p>
+        <label class="check-row"><input type="checkbox" id="feature-local-fallback" /><span>Enable local fallback compaction</span></label>
+        <p>When LLM compaction fails, use local excerpts instead. This is lossy: older details may be omitted. Original messages remain in the session and saved chats when saving is enabled. Stop never triggers fallback.</p>
+        <button type="button" id="feature-compact-local">Compact locally now…</button>
+        <p>If an LLM request is stuck, press Stop first. Local compaction does not wait for the model and requires confirmation.</p>
+        <button type="button" id="feature-all-settings">Open all VS Code settings</button>
+      </div>
+      <div class="modal-foot">
+        <select id="feature-target" aria-label="Settings scope">
+          <option value="workspace">Workspace settings</option>
+          <option value="user">User settings</option>
+        </select>
+        <span class="modal-status" id="feature-status" aria-live="polite"></span>
+        <button type="button" class="primary" id="feature-save">Save</button>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-backdrop" id="mcp-modal" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mcp-modal-title">
       <div class="modal-head">

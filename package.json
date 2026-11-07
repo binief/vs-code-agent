@@ -2,7 +2,7 @@
   "name": "coding-harness",
   "displayName": "Coding Harness",
   "description": "A tool harness for VS Code: file create/edit/search, shell commands and MCP tools, with context about the environment and workspace. Project instructions come from your agent.md files.",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "publisher": "binief",
   "license": "MIT",
   "repository": {
@@ -476,6 +476,11 @@
           "minimum": 2,
           "maximum": 50,
           "markdownDescription": "Preferred number of recent messages to keep intact; may be reduced to meet the context budget."
+        },
+        "codingHarness.compaction.localFallback": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Allow lossy local excerpt compaction when LLM summarization fails, or when explicitly selected in the panel. Details may be omitted; saved original messages are preserved. Cancellation never triggers fallback."
         },
         "codingHarness.compaction.summaryModel": {
           "type": "string",
