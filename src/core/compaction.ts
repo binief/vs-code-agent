@@ -1,7 +1,7 @@
 import { estimateImageTokens } from './images';
 import { verbatimCompaction } from './verbatimCompaction';
 import { reduceArchivedToolOutputs } from './toolOutputReduction';
-import type { ChatMessage, HarnessConfig, Provider, ToolSpec, Usage } from './types';
+import type { ChatMessage, ContextBreakdown, HarnessConfig, Provider, ToolSpec, Usage } from './types';
 
 /** Conservative approximation only; providers use different tokenizers. */
 export function estimateTokens(text: string): number {
@@ -25,6 +25,27 @@ export function estimateMessagesTokens(messages: readonly ChatMessage[]): number
 /** Estimate full request input, including tool schemas; does not include output reserve. */
 export function estimateRequestTokens(messages: readonly ChatMessage[], tools: readonly ToolSpec[]): number {
   return estimateMessagesTokens(messages) + (tools.length ? estimateTokens(JSON.stringify(tools)) + 16 : 0);
+}
+
+/** Additive approximation of the exact messages and tool schemas used for this request. */
+export function contextBreakdown(messages: readonly ChatMessage[], tools: readonly ToolSpec[], outputReserve: number,
+  calibration = 1, reportedInput?: number, policyKnown = true): ContextBreakdown {
+  const systemMessages = messages.filter((message) => message.role === 'system');
+  const otherMessages = messages.filter((message) => message.role !== 'system');
+  const stripImages = (items: readonly ChatMessage[]) => items.map(({ images: _images, ...message }) => message);
+  const system = estimateMessagesTokens(stripImages(systemMessages)) - 3;
+  const conversation = estimateMessagesTokens(stripImages(otherMessages)) - 3;
+  const images = messages.reduce((sum, message) => sum + estimateImageTokens(message), 0);
+  const toolTokens = tools.length ? estimateTokens(JSON.stringify(tools)) + 16 : 0;
+  const framing = 3;
+  const base = system + conversation + images + toolTokens + framing;
+  const input = reportedInput !== undefined && reportedInput > 0 ? reportedInput : Math.ceil(base * calibration);
+  return { system, conversation, images, tools: toolTokens, framing, adjustment: input - base,
+    outputReserve: Math.max(0, outputReserve), source: reportedInput !== undefined && reportedInput > 0 ? 'provider' : 'estimate', policyKnown };
+}
+
+export function contextBreakdownTotal(b: ContextBreakdown): number {
+  return b.system + b.conversation + b.images + b.tools + b.framing + b.adjustment + b.outputReserve;
 }
 
 export interface CompactionResult {

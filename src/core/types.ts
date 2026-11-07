@@ -295,6 +295,8 @@ export interface HarnessConfig {
   maxSteps: number;
   temperature: number;
   maxOutputTokens: number;
+  /** Optional explicitly configured command to verify a completed task. */
+  verificationCommand?: string;
   editPolicy: EditPolicy;
   commandPolicy: CommandPolicy;
   allowDangerousCommands: boolean;
@@ -450,6 +452,19 @@ export interface AgentInstructionFile {
   truncated: boolean;
 }
 
+/** Approximate request components; adjustment accounts for provider usage or calibration. */
+export interface ContextBreakdown {
+  system: number;
+  conversation: number;
+  images: number;
+  tools: number;
+  framing: number;
+  adjustment: number;
+  outputReserve: number;
+  source: 'estimate' | 'provider';
+  policyKnown: boolean;
+}
+
 export type HarnessEvent =
   | { type: 'status'; status: 'idle' | 'thinking' | 'executing' | 'approval' }
   | { type: 'step'; index: number; maxSteps: number }
@@ -471,7 +486,7 @@ export type HarnessEvent =
   | { type: 'approval'; id: string; phase: 'request'; request: ApprovalRequest }
   | { type: 'approval'; id: string; phase: 'resolved'; request: ApprovalRequest; decision: ApprovalDecision }
   | { type: 'usage'; step: number; usage: Usage; durationMs?: number; tokensPerSecond?: number; contextTokens?: number; contextWindow?: number; contextPercent?: number; cumulative?: Usage }
-  | { type: 'context'; contextTokens: number; contextWindow: number; contextPercent: number }
+  | { type: 'context'; contextTokens: number; contextWindow: number; contextPercent: number; breakdown?: ContextBreakdown }
   | {
       type: 'agent-files';
       enabled: boolean;
@@ -496,6 +511,7 @@ export interface TaskResult {
   usage: Usage;
   tokensPerSecond?: number;
   contextTokens?: number;
+  contextBreakdown?: ContextBreakdown;
 }
 
 /* ---------------------------------------------------------------- tools */

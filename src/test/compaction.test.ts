@@ -158,6 +158,10 @@ test('provider-reported input usage updates context and calibrates later request
     const firstResult = await session.runTask('Small prompt.', (e) => first.push(e));
     assert.equal(firstResult.contextTokens, session.getContextUsage().tokens);
     assert.ok(first.some((e) => e.type === 'context' && e.contextTokens === 9128 && e.contextPercent === 91.28));
+    const reported = first.find((e) => e.type === 'context' && e.breakdown?.source === 'provider');
+    assert.ok(reported && reported.type === 'context' && reported.breakdown);
+    const b = reported.breakdown;
+    assert.equal(b.system + b.conversation + b.images + b.tools + b.framing + b.adjustment + b.outputReserve, 9128);
     const second: HarnessEvent[] = [];
     await session.runTask('Next.', (e) => second.push(e));
     const firstEstimate = second.find((e): e is Extract<HarnessEvent, { type: 'context' }> => e.type === 'context');
@@ -864,5 +868,39 @@ test('verbatim-only mode skips summary calls and preserves the live task request
     assert.deepEqual(session.originalConversationSnapshot.slice(0, original.length), original);
     assert.ok(events.some((e) => e.type === 'notice' && e.message.includes('Used local verbatim compaction')));
     assert.ok(!events.some((e) => e.type === 'notice' && e.message.includes('LLM compaction failed')));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('context breakdown includes reserved output and excludes tools denied by the selected agent policy', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-context-breakdown-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'agent.md'), '---\ntools: [read_file]\n---\nsmall instruction');
+    const large: Tool = { name: 'huge_mcp', description: 'extra schema '.repeat(10_000), parameters: { type: 'object' }, async run() { return { ok: true, content: 'unused' }; } };
+    const provider: Provider = { id: 'fake', label: 'fake', async chat() { return { text: 'done', toolCalls: [] }; } };
+    const c = config({ maxOutputTokens: 60_000, compaction: { ...DEFAULT_CONFIG.compaction, autoCompact: false, contextWindowTokens: 60_000 } });
+    const registry = new ToolRegistry(); registry.add(large);
+    const session = new HarnessSession({ host: new Host(dir), provider, config: c, tools: registry, agentSelection: ['agent.md'] });
+    const result = await session.runTask('hello', () => {});
+    const b = result.contextBreakdown!;
+    assert.equal(b.policyKnown, true);
+    assert.equal(b.outputReserve, 60_000);
+    assert.ok(b.tools < 10_000, 'disallowed huge schema is not counted');
+    assert.equal(result.contextTokens, b.system + b.conversation + b.images + b.tools + b.framing + b.adjustment + b.outputReserve);
+    assert.ok(result.contextTokens! > 60_000, 'output reservation alone consumes the window');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a new task with an oversized output reserve warns about fixed context without attempting empty compaction', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-context-reserve-'));
+  try {
+    let calls = 0;
+    const provider: Provider = { id: 'fake', label: 'fake', async chat() { calls++; return { text: 'done', toolCalls: [] }; } };
+    const c = config({ maxOutputTokens: 60_000, compaction: { ...DEFAULT_CONFIG.compaction, contextWindowTokens: 60_000 } });
+    const session = new HarnessSession({ host: new Host(dir), provider, config: c });
+    const events: HarnessEvent[] = [];
+    await session.runTask('One short prompt', (e) => events.push(e));
+    assert.equal(calls, 1);
+    assert.ok(events.some((e) => e.type === 'notice' && /before there is older history to compact/.test(e.message) && /60000-token output reserve/.test(e.message)));
+    assert.ok(!events.some((e) => e.type === 'notice' && /Could not compact conversation/.test(e.message)));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

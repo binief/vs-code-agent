@@ -244,6 +244,12 @@
           "default": 2048,
           "minimum": 128
         },
+        "codingHarness.verification.command": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Optional shell command to run once before reporting a task complete (for example a targeted test). Empty disables verification. Commands can modify files and remain subject to the active agent tool policy and command approval settings. Passing a command does not prove the task is correct."
+        },
         "codingHarness.editPolicy": {
           "type": "string",
           "enum": [
@@ -510,6 +516,7 @@
     "watch": "tsc -w -p ./",
     "test": "tsc -p ./ && node --test out/test/*.test.js",
     "demo": "tsc -p ./ && node out/demo/cli.js",
+    "benchmark:local": "tsc -p ./ && node out/benchmark/local.js",
     "package": "vsce package --allow-missing-repository --skip-license --out coding-harness.vsix"
   },
   "devDependencies": {

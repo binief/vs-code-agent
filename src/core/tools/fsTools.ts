@@ -374,16 +374,36 @@ export const replaceInFileTool: Tool<{
     const replacement = normalizeEol(args.new_text ?? '');
     const occurrences = countOccurrences(normalizedOriginal, needle);
     if (occurrences === 0) {
+      // Only compare a bounded selection of the model-supplied lines. Return
+      // positions/counts, never unseen file text: edit permission need not
+      // imply read permission. No approximate edits are performed.
+      const candidates = needle.split('\n').map((line) => line.trim()).filter((line) => line.length >= 8 && line.length <= 256).slice(0, 12);
+      let hint = '';
+      for (const candidate of candidates) {
+        const position = normalizedOriginal.indexOf(candidate);
+        if (position < 0) continue;
+        const line = normalizedOriginal.slice(0, position).split('\n').length;
+        hint = ` A line from old_text occurs near line ${line}; the surrounding text or whitespace may differ.`;
+        break;
+      }
       return fail(
-        `old_text was not found in "${target.rel}". Line endings are matched regardless of platform; read the file and copy the exact snippet (including indentation).`,
+        `old_text was not found in "${target.rel}". No changes were made. Line endings are matched regardless of platform; read the file and copy the exact snippet (including indentation).${hint}`,
         'snippet not found',
         { relPath: target.rel },
       );
     }
 
     if (occurrences > 1 && args.count === undefined) {
+      const locations: number[] = [];
+      let position = 0;
+      while (locations.length < 5) {
+        const match = normalizedOriginal.indexOf(needle, position);
+        if (match < 0) break;
+        locations.push(normalizedOriginal.slice(0, match).split('\n').length);
+        position = match + needle.length;
+      }
       return fail(
-        `old_text matches ${occurrences} occurrences in "${target.rel}". No changes were made. ` +
+        `old_text matches ${occurrences} occurrences in "${target.rel}" (first line numbers: ${locations.join(', ')}${occurrences > locations.length ? ', …' : ''}). No changes were made. ` +
           'Read the relevant lines and include more surrounding context to select one occurrence, ' +
           'or explicitly pass count to replace the first N occurrences or -1 for all.',
         'ambiguous snippet',

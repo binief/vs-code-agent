@@ -518,3 +518,19 @@ test('a selected thinking stream stays readable and catches up after selection',
   assert.equal(body.textContent, 'Thinking aloud, now finished');
   h.close();
 });
+
+test('context breakdown is shown on demand and calls out a large output reserve', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [], state: { ...state, contextWindow: 60000, contextTokens: 69257, contextPercent: 115.4,
+    contextBreakdown: { system: 5000, conversation: 3000, images: 0, tools: 1254, framing: 3, adjustment: 0, outputReserve: 60000, source: 'estimate', policyKnown: true } }, activity: idle });
+  const panel = h.doc.getElementById('context-breakdown');
+  assert.equal(panel.hidden, true);
+  h.doc.getElementById('chip-context').click();
+  assert.equal(panel.hidden, false);
+  assert.match(panel.textContent, /reserved output 60000/);
+  assert.match(panel.textContent, /tool schemas 1254/);
+  assert.match(h.doc.getElementById('compact-text').textContent, /Max Output Tokens/);
+  h.doc.getElementById('btn-context-preview').click();
+  assert.ok(h.posted.some((m) => m.type === 'preview-context'));
+  h.close();
+});
