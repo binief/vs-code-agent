@@ -151,3 +151,9 @@ test('tool documentation in the manifest matches the tool registry', () => {
     assert.ok(registry.includes(tool), `tool ${tool} is not registered`);
   }
 });
+
+test('local compaction fallback is an opt-in setting', () => {
+  const setting = manifest.contributes.configuration.properties['codingHarness.compaction.localFallback'];
+  assert.equal(setting.type, 'boolean');
+  assert.equal(setting.default, false);
+});

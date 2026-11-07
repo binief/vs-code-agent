@@ -12,6 +12,7 @@ import {
   type ApprovalRequest,
   type ChatMessage,
   type ChatRequest,
+  type CompactionProgress,
   type HarnessConfig,
   type HarnessEvent,
   type HarnessHost,
@@ -226,7 +227,7 @@ export class HarnessSession {
   }
 
   /** Manually compact conversation history using the configured provider. */
-  async compact(): Promise<{ compacted: boolean; originalTokens: number; newTokens: number; removed: number; reason: string; strategy?: 'llm'; usedLongerSummary?: boolean; targetMet?: boolean }> {
+  async compact(onProgress?: (progress: CompactionProgress) => void, preferLocal = false): Promise<{ compacted: boolean; originalTokens: number; newTokens: number; removed: number; reason: string; strategy?: 'llm' | 'local'; fallbackReason?: string; usedLongerSummary?: boolean; targetMet?: boolean }> {
     if (this.busy) throw new Error('Cannot compact while a task is running.');
     this.busy = true;
     this.controller = new AbortController();
@@ -235,10 +236,10 @@ export class HarnessSession {
       const target = Math.max(0, Math.floor((c.compaction.contextWindowTokens * Math.min(0.6, c.compaction.threshold * 0.85) - Math.max(0, c.maxOutputTokens)) / this.inputCalibration) -
         estimateRequestTokens(this.lastSystemPrompt ? [{ role: 'system', content: this.lastSystemPrompt }] : [], this.toolsForEstimate()));
       const latestUser = [...this.history].reverse().find((message) => message.role === 'user');
-      const { newHistory, result } = await compactHistory(this.history, c, this.deps.provider, this.controller.signal, { targetHistoryTokens: target, preserveUserMessage: latestUser });
+      const { newHistory, result } = await compactHistory(this.history, c, this.deps.provider, this.controller.signal, { targetHistoryTokens: target, preserveUserMessage: latestUser, onProgress, preferLocal });
       if (result.usage) this.cumulativeUsage = mergeUsage(this.cumulativeUsage, result.usage);
       if (result.compacted) this.history = newHistory;
-      return { compacted: result.compacted, originalTokens: result.originalTokens, newTokens: result.newTokens, removed: result.removedMessages, reason: result.summary, strategy: result.strategy, usedLongerSummary: result.usedLongerSummary, targetMet: result.targetMet };
+      return { compacted: result.compacted, originalTokens: result.originalTokens, newTokens: result.newTokens, removed: result.removedMessages, reason: result.summary, strategy: result.strategy, fallbackReason: result.fallbackReason, usedLongerSummary: result.usedLongerSummary, targetMet: result.targetMet };
     } catch (err) {
       if (err instanceof CompactionCancelled && err.usage) this.cumulativeUsage = mergeUsage(this.cumulativeUsage, err.usage);
       throw err;
@@ -393,7 +394,11 @@ export class HarnessSession {
           // An endpoint rejection is evidence that our configured estimate is
           // too optimistic. Request a material reduction even for short chats.
           const target = providerOverflow ? Math.min(historyTarget(tools), Math.floor(estimateMessagesTokens(active) * 0.5)) : historyTarget(tools);
-          compacted = await compactHistory(active, this.deps.config, this.deps.provider, signal, { targetHistoryTokens: target, preserveUserMessage: userMessage });
+          compacted = await compactHistory(active, this.deps.config, this.deps.provider, signal, {
+            targetHistoryTokens: target,
+            preserveUserMessage: userMessage,
+            onProgress: (progress) => onEvent({ type: 'compaction-progress', progress }),
+          });
         } catch (err) {
           if (err instanceof CompactionCancelled && err.usage) {
             this.cumulativeUsage = mergeUsage(this.cumulativeUsage, err.usage);
@@ -401,6 +406,8 @@ export class HarnessSession {
             onEvent({ type: 'usage', step: steps, usage: err.usage, cumulative: { ...this.cumulativeUsage } });
           }
           throw err;
+        } finally {
+          onEvent({ type: 'compaction-progress', progress: null });
         }
         const { newHistory, result } = compacted;
         if (result.usage) {
@@ -418,9 +425,10 @@ export class HarnessSession {
         taskMessages.splice(0, taskMessages.length, ...newHistory);
         const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
         const lengthNote = result.usedLongerSummary ? ' A completed reducing summary exceeded the requested length; the best available summary was used.' : '';
+        const localNote = result.strategy === 'local' ? ` Local excerpts are lossy and may omit important details. ${result.fallbackReason ?? ''}` : '';
         if (result.targetMet === false) autoCompactRetryAt = this.history.length + taskMessages.length + 2;
-        onEvent({ type: 'notice', message: `LLM compacted conversation: removed ${result.removedMessages} messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${lengthNote}${targetNote}`, level: result.targetMet === false || result.usedLongerSummary ? 'warn' : 'info' });
-        host.log('info', `LLM compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens`);
+        onEvent({ type: 'notice', message: `${result.strategy === 'local' ? 'Local fallback' : 'LLM'} compacted conversation: removed ${result.removedMessages} messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${lengthNote}${targetNote}${localNote}`, level: result.strategy === 'local' || result.targetMet === false || result.usedLongerSummary ? 'warn' : 'info' });
+        host.log('info', `${result.strategy === 'local' ? 'Local fallback' : 'LLM'} compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens`);
         return true;
       };
 
@@ -916,11 +924,17 @@ export class HarnessSession {
       signal.addEventListener('abort', abortChild, { once: true });
       const issues: string[] = [];
       onEvent({ type: 'notice', level: 'info', message: 'Subagent started a read-only investigation with separate context.' });
+      onEvent({ type: 'subagent-progress' });
       try {
         if (signal.aborted) return finish({ ok: false, content: CANCELLED_TOOL_RESULT, summary: 'cancelled' });
         const prompt = `Delegated task: ${args.task.trim()}${typeof args.context === 'string' && args.context.trim() ? `\n\nRelevant context supplied by the parent:\n${args.context.trim()}` : ''}\n\nReturn findings with relevant file paths and evidence, and explicitly identify uncertainties or unverified details.`;
         const result = await child.runTask(prompt, (event) => {
-          if (event.type === 'tool-start') onEvent({ type: 'notice', level: 'info', message: `Subagent requested ${event.name}.` });
+          if (event.type === 'step') onEvent({ type: 'subagent-progress', step: event.index });
+          if (event.type === 'tool-start') {
+            onEvent({ type: 'subagent-progress', tool: event.name });
+            onEvent({ type: 'notice', level: 'info', message: `Subagent requested ${event.name}.` });
+          }
+          if (event.type === 'tool-end') onEvent({ type: 'subagent-progress' });
           if (event.type === 'tool-end' && !event.ok) issues.push(`${event.name}: ${event.summary}`);
           if (event.type === 'notice' && (event.level === 'warn' || event.level === 'error')) {
             issues.push(event.message);

@@ -26,6 +26,7 @@ import {
   type ApprovalRequest,
   type AgentInstructionFile,
   type ChatMessage,
+  type CompactionProgress,
   type ImageAttachment,
   type HarnessConfig,
   type McpServerConfig,
@@ -79,7 +80,7 @@ export type TranscriptItem =
 
 /** What the agent is doing right now, for the live activity strip. */
 export interface Activity {
-  status: 'idle' | 'thinking' | 'executing' | 'approval';
+  status: 'idle' | 'thinking' | 'executing' | 'approval' | 'compacting' | 'subagent';
   step: number;
   maxSteps: number;
   /** Tool currently executing, if any. */
@@ -833,6 +834,7 @@ export class HarnessController {
         threshold: typeof threshold === 'number' ? threshold : 0.75,
         contextWindowTokens: typeof contextWindow === 'number' ? contextWindow : 128000,
         keepLastMessages: typeof keepLast === 'number' ? keepLast : 10,
+        localFallback: c.get<boolean>('compaction.localFallback') === true,
         summaryModel: c.get<string>('compaction.summaryModel') || undefined,
       },
     });
@@ -1199,7 +1201,7 @@ export class HarnessController {
     await this.persistChat();
   }
 
-  async compactHistory(): Promise<void> {
+  async compactHistory(preferLocal = false): Promise<void> {
     await this.whenReady();
     if (this.isBusy) {
       void vscode.window.showWarningMessage('Stop or finish the current task before compacting the conversation.');
@@ -1208,6 +1210,20 @@ export class HarnessController {
     if (!this.session && !this.restoredHistory.length) {
       void vscode.window.showInformationMessage('No active session to compact.');
       return;
+    }
+    if (preferLocal) {
+      if (!this.readConfig().compaction.localFallback) {
+        void vscode.window.showWarningMessage('Enable local fallback compaction in settings first.');
+        return;
+      }
+      const choice = await vscode.window.showWarningMessage(
+        'Local compaction keeps only short excerpts of older context. Important details may be omitted. Original messages remain in the session and in saved chats when saving is enabled.',
+        { modal: true }, 'Compact locally');
+      if (choice !== 'Compact locally') return;
+      if (this.isBusy) {
+        void vscode.window.showWarningMessage('Stop or finish the current task before compacting the conversation.');
+        return;
+      }
     }
     this.cancelPendingStart = false;
     this.setStatus('thinking', true);
@@ -1218,13 +1234,14 @@ export class HarnessController {
         this.pushNotice('info', 'Compaction cancelled.');
         return;
       }
-      this.pushNotice('info', 'Checking context for LLM compaction; summarization may require an additional provider request.');
-      const result = await session.compact();
+      this.pushNotice('info', preferLocal ? 'Preparing local compaction excerpts.' : 'Checking context for LLM compaction; summarization may require an additional provider request.');
+      const result = await session.compact((progress) => this.showCompactionProgress(progress), preferLocal);
       this.cumulativeUsage = session.usage;
       if (result.compacted) {
         const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
         const lengthNote = result.usedLongerSummary ? ' A completed reducing summary exceeded the requested length; the best available summary was used.' : '';
-        this.pushNotice(result.targetMet === false || result.usedLongerSummary ? 'warn' : 'info', `Compacted conversation: removed ${result.removed} old messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${lengthNote}${targetNote}`);
+        const localNote = result.strategy === 'local' ? ` Local excerpts are lossy and may omit important details. ${result.fallbackReason ?? ''}` : '';
+        this.pushNotice(result.strategy === 'local' || result.targetMet === false || result.usedLongerSummary ? 'warn' : 'info', `${result.strategy === 'local' ? 'Local fallback compacted' : 'Compacted'} conversation: removed ${result.removed} old messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${lengthNote}${targetNote}${localNote}`);
         this.log.info(`manual ${result.strategy ?? 'LLM'} compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens, removed ${result.removed}`);
         const { tokens, window, percent, breakdown } = session.getContextUsage();
         this.state = { ...this.state, contextTokens: tokens, contextWindow: window, contextPercent: percent, contextBreakdown: breakdown, cumulativeUsage: this.cumulativeUsage };
@@ -1239,6 +1256,30 @@ export class HarnessController {
       void vscode.window.showWarningMessage(`Could not compact conversation: ${(err as Error).message}`);
     } finally {
       this.setStatus('idle', false);
+    }
+  }
+
+  getFeatureSettings(): { subagentsEnabled: boolean; localFallback: boolean; hasWorkspace: boolean } {
+    const config = this.readConfig();
+    return { subagentsEnabled: config.subagentsEnabled, localFallback: config.compaction.localFallback === true, hasWorkspace: Boolean(this.workspaceRoot()) };
+  }
+
+  async saveFeatureSettings(input: { subagentsEnabled?: unknown; localFallback?: unknown; target?: unknown }): Promise<void> {
+    await this.whenReady();
+    const fail = (error: string) => this.post({ type: 'feature-settings-saved', ok: false, error, settings: this.getFeatureSettings() });
+    if (this.isBusy) return fail('Stop or finish the current task before changing settings.');
+    if (typeof input.subagentsEnabled !== 'boolean' || typeof input.localFallback !== 'boolean' ||
+        (input.target !== 'user' && input.target !== 'workspace')) return fail('Invalid settings.');
+    if (input.target === 'workspace' && !this.workspaceRoot()) return fail('Saving workspace settings needs an open folder.');
+    const target = input.target === 'workspace' ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+    try {
+      const settings = vscode.workspace.getConfiguration('codingHarness');
+      await settings.update('subagents.enabled', input.subagentsEnabled, target);
+      await settings.update('compaction.localFallback', input.localFallback, target);
+      await this.refreshState();
+      this.post({ type: 'feature-settings-saved', ok: true, settings: this.getFeatureSettings() });
+    } catch (err) {
+      fail(`Could not save all settings: ${(err as Error).message}. Some settings may have changed.`);
     }
   }
 
@@ -1802,6 +1843,15 @@ export class HarnessController {
       case 'status':
         this.setStatus(event.status, this.state.busy);
         break;
+      case 'compaction-progress':
+        this.showCompactionProgress(event.progress);
+        break;
+      case 'subagent-progress':
+        this.activity = { ...this.activity, status: 'subagent', tool: event.tool ?? null,
+          detail: event.tool ? `Running ${event.tool}` : event.step ? `Read-only investigation · step ${event.step}` : 'Read-only investigation',
+          startedAt: this.activity.status === 'subagent' ? this.activity.startedAt : Date.now() };
+        this.postActivity();
+        break;
       case 'step':
         this.state = { ...this.state, step: event.index };
         this.activity = { ...this.activity, status: 'thinking', step: event.index, maxSteps: event.maxSteps, tool: null, detail: null, startedAt: Date.now() };
@@ -2101,6 +2151,26 @@ export class HarnessController {
       }
     }
     this.streams.clear();
+  }
+
+  private showCompactionProgress(progress: CompactionProgress | null): void {
+    if (!progress) {
+      if (this.activity.status === 'compacting') {
+        this.activity = { ...this.activity, status: 'thinking', tool: null, detail: null, startedAt: Date.now() };
+        this.postActivity();
+      }
+      return;
+    }
+    const phase = progress.phase === 'reasoning' ? `received ${progress.characters ?? 0} reasoning characters` :
+      progress.phase === 'receiving' ? `received ${progress.characters ?? 0} summary characters` : 'waiting for provider';
+    this.activity = {
+      ...this.activity,
+      status: 'compacting',
+      tool: null,
+      detail: `request ${progress.request}, attempt ${progress.attempt}/3 — ${phase} (Stop to cancel)`,
+      startedAt: progress.startedAt,
+    };
+    this.postActivity();
   }
 
   private postActivity(): void {

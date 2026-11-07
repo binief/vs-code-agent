@@ -78,6 +78,8 @@ export interface ProviderResponse {
   toolCalls: ToolCall[];
   usage?: Usage;
   finishReason?: string;
+  /** Whether an SSE response contained a terminal marker; undefined for buffered responses. */
+  streamComplete?: boolean;
   /** Reasoning/thinking text, when the backend returned any. */
   thinking?: string;
 }
@@ -275,6 +277,8 @@ export interface CompactionConfig {
   threshold: number; // 0-1, e.g. 0.75 means compact when 75% of context window used
   contextWindowTokens: number;
   keepLastMessages: number;
+  /** Allow lossy local excerpts if LLM summarization fails. */
+  localFallback?: boolean;
   summaryModel?: string; // optional model to use for summarization, defaults to main model
 }
 
@@ -357,6 +361,7 @@ export const DEFAULT_CONFIG: HarnessConfig = {
     threshold: 0.75,
     contextWindowTokens: 128_000,
     keepLastMessages: 10,
+    localFallback: false,
   },
 };
 
@@ -415,6 +420,7 @@ export function resolveConfig(partial: Partial<HarnessConfig> | undefined): Harn
       threshold: partial.compaction.threshold ?? DEFAULT_CONFIG.compaction.threshold,
       contextWindowTokens: partial.compaction.contextWindowTokens ?? DEFAULT_CONFIG.compaction.contextWindowTokens,
       keepLastMessages: partial.compaction.keepLastMessages ?? DEFAULT_CONFIG.compaction.keepLastMessages,
+      localFallback: partial.compaction.localFallback ?? DEFAULT_CONFIG.compaction.localFallback,
       summaryModel: partial.compaction.summaryModel ?? DEFAULT_CONFIG.compaction.summaryModel,
     };
   }
@@ -448,8 +454,20 @@ export interface ContextBreakdown {
   policyKnown: boolean;
 }
 
+/** Transient status of a summary request; never contains conversation text. */
+export interface CompactionProgress {
+  request: number;
+  attempt: number;
+  phase: 'waiting' | 'reasoning' | 'receiving';
+  /** Characters received in this phase, not the content itself. */
+  characters?: number;
+  startedAt: number;
+}
+
 export type HarnessEvent =
   | { type: 'status'; status: 'idle' | 'thinking' | 'executing' | 'approval' }
+  | { type: 'compaction-progress'; progress: CompactionProgress | null }
+  | { type: 'subagent-progress'; step?: number; tool?: string }
   | { type: 'step'; index: number; maxSteps: number }
   | { type: 'assistant-delta'; id: string; text: string }
   | { type: 'assistant'; id: string; text: string; final: boolean; streamed: boolean }

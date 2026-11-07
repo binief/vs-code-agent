@@ -1088,3 +1088,69 @@ test('manual compaction warns about longer reducing summaries and preserves save
     assert.ok(subject.controller.getTranscript().some((item: any) => item.kind === 'notice' && item.level === 'warn' && item.message.includes('exceeded the requested length')));
   } finally { delete settings['compaction.keepLastMessages']; }
 });
+
+test('manual compaction exposes live activity, supports Stop, and preserves saved history', async () => {
+  settings['compaction.keepLastMessages'] = 2;
+  try {
+    respond = toolProvider([]);
+    const subject = makeController('compaction-live-activity');
+    await subject.controller.run('Investigate these details. '.repeat(400));
+    await subject.controller.run('Follow up.');
+    const file = path.join(subject.storage, 'current-chat.json');
+    const before = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    respond = async (req) => {
+      req.onThinking?.('private reasoning');
+      req.onDelta?.('private summary');
+      entered();
+      return await new Promise<ProviderResponse>((_resolve, reject) => {
+        req.signal?.addEventListener('abort', () => reject(new Error('cancelled')), { once: true });
+      });
+    };
+    const pending = subject.controller.compactHistory();
+    await started;
+    assert.equal(subject.controller.isBusy, true);
+    const activities = subject.messages.filter((message: any) => message.type === 'activity').map((message: any) => message.activity);
+    assert.ok(activities.some((activity: any) => activity.status === 'compacting' && /request 1, attempt 1\/3 — waiting for provider/.test(activity.detail)));
+    assert.ok(activities.some((activity: any) => activity.status === 'compacting' && /received \d+ reasoning characters/.test(activity.detail)));
+    assert.ok(activities.some((activity: any) => activity.status === 'compacting' && /received \d+ summary characters/.test(activity.detail)));
+    assert.doesNotMatch(JSON.stringify(activities), /private/);
+    subject.controller.cancel();
+    await pending;
+    assert.equal(subject.controller.isBusy, false);
+    assert.equal(subject.controller.getActivity().status, 'idle');
+    const after = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
+    assert.deepEqual(after.history, before.history);
+    assert.deepEqual(after.originalHistory, before.originalHistory);
+  } finally { delete settings['compaction.keepLastMessages']; }
+});
+
+test('manual local fallback requires confirmation and retains the original saved history', async () => {
+  settings['compaction.keepLastMessages'] = 2;
+  settings['compaction.localFallback'] = true;
+  try {
+    respond = toolProvider([]);
+    const subject = makeController('manual-local-fallback');
+    await subject.controller.run('Original task constraints. '.repeat(300));
+    await subject.controller.run('Follow up.');
+    const file = path.join(subject.storage, 'current-chat.json');
+    const before = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
+    let calls = 0;
+    respond = async () => { calls++; throw new Error('must not call model'); };
+    dialogs.confirm = undefined;
+    await subject.controller.compactHistory(true);
+    assert.deepEqual(parseChatArchive(await fs.promises.readFile(file, 'utf8')).history, before.history);
+    dialogs.confirm = 'Compact locally';
+    await subject.controller.compactHistory(true);
+    assert.equal(calls, 0);
+    const after = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
+    assert.match(after.history[0].content, /Local fallback: incomplete excerpts/);
+    assert.deepEqual(after.originalHistory, before.originalHistory);
+    assert.ok(subject.controller.getTranscript().some((item: any) => item.kind === 'notice' && item.level === 'warn' && /lossy/.test(item.message)));
+  } finally {
+    delete settings['compaction.keepLastMessages'];
+    delete settings['compaction.localFallback'];
+    dialogs.confirm = undefined;
+  }
+});

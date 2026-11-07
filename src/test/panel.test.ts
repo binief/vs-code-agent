@@ -544,3 +544,70 @@ test('the delegated task is visible in its tool card', () => {
   assert.equal(h.doc.querySelector('.tool-icon use').getAttribute('href'), '#i-spark');
   h.close();
 });
+
+test('compaction activity shows request, elapsed time, and Stop without exposing model text', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [], state: { ...state, busy: true, status: 'thinking' }, activity: idle });
+  h.send({ type: 'activity', activity: {
+    ...idle, status: 'compacting', startedAt: Date.now() - 5000,
+    detail: 'request 2, attempt 1/3 — waiting for provider (Stop to cancel)',
+  } });
+  assert.equal(h.doc.getElementById('activity').hidden, false);
+  assert.equal(h.doc.getElementById('activity-text').textContent, 'LLM compaction');
+  assert.match(h.doc.getElementById('activity-detail').textContent, /request 2.*waiting for provider/);
+  assert.match(h.doc.getElementById('activity-elapsed').textContent, /\d+s/);
+  assert.equal(h.doc.getElementById('btn-stop').hidden, false);
+  h.doc.getElementById('btn-stop').click();
+  assert.ok(h.posted.some((message) => message.type === 'cancel'));
+  h.send({ type: 'activity', activity: idle });
+  assert.equal(h.doc.getElementById('activity').hidden, true);
+  h.close();
+});
+
+test('settings GUI exposes subagents and local fallback, saves scope, and launches local compaction', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [], state, activity: idle });
+  h.doc.getElementById('btn-settings').click();
+  assert.equal(h.doc.getElementById('feature-modal').hidden, false);
+  assert.ok(h.posted.some((m) => m.type === 'get-feature-settings'));
+  h.send({ type: 'feature-settings', subagentsEnabled: false, localFallback: false, hasWorkspace: true });
+  assert.equal(h.doc.getElementById('feature-compact-local').disabled, true);
+  const sub = h.doc.getElementById('feature-subagents');
+  const local = h.doc.getElementById('feature-local-fallback');
+  sub.checked = true;
+  local.checked = true;
+  h.doc.getElementById('feature-save').click();
+  assert.ok(h.posted.some((m) => m.type === 'save-feature-settings' && m.subagentsEnabled === true && m.localFallback === true && m.target === 'workspace'));
+  h.send({ type: 'feature-settings-saved', ok: true, settings: { subagentsEnabled: true, localFallback: true, hasWorkspace: true } });
+  assert.equal(h.doc.getElementById('feature-status').textContent, 'Saved ✓');
+  assert.equal(h.doc.getElementById('feature-compact-local').disabled, false);
+  h.doc.getElementById('feature-compact-local').click();
+  assert.ok(h.posted.some((m) => m.type === 'compact-local'));
+  assert.equal(h.doc.getElementById('feature-modal').hidden, true);
+  h.close();
+});
+
+test('settings GUI reports scope overrides and exposes the full settings screen', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [], state, activity: idle });
+  h.doc.getElementById('btn-settings').click();
+  h.send({ type: 'feature-settings', subagentsEnabled: false, localFallback: false, hasWorkspace: false });
+  assert.equal(h.doc.getElementById('feature-target').value, 'user');
+  h.doc.getElementById('feature-subagents').checked = true;
+  h.doc.getElementById('feature-save').click();
+  h.send({ type: 'feature-settings-saved', ok: true, settings: { subagentsEnabled: false, localFallback: false, hasWorkspace: false } });
+  assert.match(h.doc.getElementById('feature-status').textContent, /overrides/);
+  assert.equal(h.doc.getElementById('feature-subagents').checked, false);
+  h.doc.getElementById('feature-all-settings').click();
+  assert.ok(h.posted.some((m) => m.type === 'open-settings'));
+  h.close();
+});
+
+test('activity strip identifies active subagent work', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [], state: { ...state, busy: true }, activity: idle });
+  h.send({ type: 'activity', activity: { ...idle, status: 'subagent', startedAt: Date.now(), detail: 'Read-only investigation · step 2' } });
+  assert.equal(h.doc.getElementById('activity-text').textContent, 'Subagent working');
+  assert.match(h.doc.getElementById('activity-detail').textContent, /step 2/);
+  h.close();
+});

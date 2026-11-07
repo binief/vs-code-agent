@@ -1,5 +1,5 @@
 import { estimateImageTokens } from './images';
-import type { ChatMessage, ContextBreakdown, HarnessConfig, Provider, ToolSpec, Usage } from './types';
+import type { ChatMessage, CompactionProgress, ContextBreakdown, HarnessConfig, Provider, ToolSpec, Usage } from './types';
 
 /** Conservative approximation only; providers use different tokenizers. */
 export function estimateTokens(text: string): number {
@@ -52,7 +52,9 @@ export interface CompactionResult {
   newTokens: number;
   removedMessages: number;
   summary: string;
-  strategy?: 'llm';
+  strategy?: 'llm' | 'local';
+  /** Why the LLM was not used, when local fallback was selected. */
+  fallbackReason?: string;
   /** A completed reducing summary exceeded the requested length after retry. */
   usedLongerSummary?: boolean;
   targetMet?: boolean;
@@ -64,6 +66,10 @@ export interface CompactionOptions {
   targetHistoryTokens?: number;
   /** Current user request, retained intact during summarization. */
   preserveUserMessage?: ChatMessage;
+  /** Explicitly use local excerpts without waiting for an LLM, if enabled. */
+  preferLocal?: boolean;
+  /** Transient request status, without exposing summary or reasoning text. */
+  onProgress?: (progress: CompactionProgress) => void;
 }
 
 /** Carries costs of completed summary requests when a later chunk is cancelled. */
@@ -127,12 +133,58 @@ export async function compactHistory(
     }
   }
   if (cut <= 0) return unchanged('Conversation is too short to compact while preserving recent messages.');
-  if (provider.id === 'mock') return unchanged('LLM compaction is unavailable with the offline mock provider.');
   const older = history.slice(0, cut);
   const compactableTokens = estimateMessagesTokens(older.map(({ images: _images, ...message }) => message));
   if (compactableTokens < 100) return unchanged('Not enough older text to summarize usefully. Reduce compaction.keepLastMessages or continue the task.');
   const preservedRequest = options.preserveUserMessage && older.includes(options.preserveUserMessage) ? options.preserveUserMessage : undefined;
   const images = older.flatMap((message) => message === preservedRequest ? [] : (message.images ?? []));
+
+  // Local fallback is deliberately extractive, not a claim of understanding.
+  // Keep bounded, clearly quoted snippets with user requests prioritised. The
+  // complete uncompacted messages remain in the session's original history.
+  const localFallback = (reason: string) => {
+    if (!config.compaction.localFallback) return unchanged(reason);
+    if (signal?.aborted) throw new CompactionCancelled(usage);
+    const maxBytes = Math.min(6000, Math.max(0, Math.floor(compactableTokens * 0.25) * 3));
+    const priority = older.map((message, index) => ({ message, index }))
+      .filter(({ message }) => message !== preservedRequest && message.content.trim())
+      .sort((a, b) => Number(b.message.role === 'user') - Number(a.message.role === 'user') || a.index - b.index);
+    const selected: Array<{ index: number; text: string }> = [];
+    let remaining = maxBytes;
+    for (const { message, index } of priority) {
+      if (remaining < 100) break;
+      let excerpt = '';
+      let bytes = 0;
+      const limit = Math.min(420, remaining - 80);
+      for (const char of message.content) {
+        const size = Buffer.byteLength(char, 'utf8');
+        if (bytes + size > limit) break;
+        excerpt += char;
+        bytes += size;
+      }
+      if (!excerpt) continue;
+      const entry = `${message.role.toUpperCase()} excerpt: ${JSON.stringify(excerpt)}${excerpt.length < message.content.length ? ' [truncated]' : ''}`;
+      const entryBytes = Buffer.byteLength(entry, 'utf8');
+      if (entryBytes > remaining) continue;
+      remaining -= entryBytes;
+      selected.push({ index, text: entry });
+    }
+    selected.sort((a, b) => a.index - b.index);
+    const summary = '[Local fallback: incomplete excerpts of earlier conversation, not an LLM summary. ' +
+      'Messages and details have been omitted or truncated; do not assume these excerpts are complete.]\n' +
+      selected.map((entry) => entry.text).join('\n');
+    const summaryMessage: ChatMessage = { role: 'user', content: summary, ...(images.length ? { images } : {}) };
+    const newHistory = [summaryMessage, ...(preservedRequest ? [preservedRequest] : []), ...history.slice(cut)];
+    const newTokens = estimateMessagesTokens(newHistory);
+    if (newTokens >= originalTokens) return unchanged(`${reason} Local excerpts could not reduce the context.`);
+    return { newHistory, result: { compacted: true, originalTokens, newTokens,
+      removedMessages: cut - 1 - (preservedRequest ? 1 : 0), summary, strategy: 'local' as const,
+      fallbackReason: reason, targetMet: budget === undefined || newTokens <= budget, usage } };
+  };
+  if (options.preferLocal && !config.compaction.localFallback) return unchanged('Local fallback is disabled in settings.');
+  if (options.preferLocal) return localFallback('Local compaction was explicitly requested.');
+  if (provider.id === 'mock') return localFallback('LLM compaction is unavailable with the offline mock provider.');
+
   const serialized = older.map(({ images: attachments, ...message }) => ({
     ...message,
     ...(attachments?.length ? { images: attachments.map(({ name, mediaType }) => ({ name, mediaType })) } : {}),
@@ -199,10 +251,35 @@ export async function compactHistory(
       const maxTokens = Math.min(requested, available);
       if (++calls > maxCalls) throw new SummaryFailure(`Compaction exceeded the ${maxCalls}-request safety limit.`);
       budgets.push(maxTokens);
+      const startedAt = Date.now();
+      const request = calls;
+      let active = true;
+      let lastPhase: CompactionProgress['phase'] = 'waiting';
+      let lastUpdate = startedAt;
+      const characters = { reasoning: 0, receiving: 0 };
+      const progress = (phase: 'reasoning' | 'receiving', text: string): void => {
+        if (!active || signal?.aborted || !options.onProgress || !text) return;
+        characters[phase] += text.length;
+        const now = Date.now();
+        if (phase !== lastPhase || now - lastUpdate >= 2000) {
+          lastPhase = phase;
+          lastUpdate = now;
+          options.onProgress({ request, attempt: attempt + 1, phase, characters: characters[phase], startedAt });
+        }
+      };
+      options.onProgress?.({ request, attempt: attempt + 1, phase: 'waiting', startedAt });
+      if (signal?.aborted) throw new CompactionCancelled(usage);
       let response;
       try {
-        response = await provider.chat({ model: config.compaction.summaryModel || config.model, messages, tools: [], signal, temperature: 0, maxTokens });
+        response = await provider.chat({
+          model: config.compaction.summaryModel || config.model, messages, tools: [], signal, temperature: 0, maxTokens,
+          ...(config.stream && options.onProgress ? {
+            onDelta: (text: string) => progress('receiving', text),
+            onThinking: (text: string) => progress('reasoning', text),
+          } : {}),
+        });
       } catch (err) {
+        active = false;
         if (signal?.aborted) throw err;
         const message = (err as Error).message;
         if (!attached.length && depth < 8 && /context.{0,30}(?:length|window|exceed|limit)|maximum.{0,30}(?:context|tokens)|too many tokens|token limit exceeded|(?:input|prompt).{0,30}too (?:long|large)/i.test(message)) {
@@ -214,9 +291,12 @@ export async function compactHistory(
           }
         }
         throw new SummaryFailure(`LLM compaction failed: ${message}`);
+      } finally {
+        active = false;
       }
       addUsage(response.usage);
       if (signal?.aborted) throw new Error('Compaction cancelled.');
+      if (response.streamComplete === false) throw new SummaryFailure('LLM summary stream ended without a completion marker.');
       if (response.finishReason === 'length' || response.finishReason === 'max_tokens') {
         if (attempt < 2) continue;
         throw new SummaryFailure(`LLM compaction stopped at the output limit on three attempts (requested ${budgets.join(', ')} tokens; finish reason: ${response.finishReason}). Try a different codingHarness.compaction.summaryModel and verify codingHarness.compaction.contextWindowTokens.`);
@@ -283,11 +363,11 @@ export async function compactHistory(
     };
     const newHistory = [summaryMessage, ...(preservedRequest ? [preservedRequest] : []), ...history.slice(cut)];
     const newTokens = estimateMessagesTokens(newHistory);
-    if (newTokens >= originalTokens) return unchanged('LLM summary did not reduce the estimated context size.');
+    if (newTokens >= originalTokens) return localFallback('LLM summary did not reduce the estimated context size.');
     return { newHistory, result: { compacted: true, originalTokens, newTokens, removedMessages: cut - 1 - (preservedRequest ? 1 : 0), summary, strategy: 'llm', usedLongerSummary, targetMet: budget === undefined || newTokens <= budget, usage } };
   } catch (err) {
     if (signal?.aborted) throw new CompactionCancelled(usage);
-    return unchanged(err instanceof SummaryFailure ? err.message : `LLM compaction failed: ${(err as Error).message}`);
+    return localFallback(err instanceof SummaryFailure ? err.message : `LLM compaction failed: ${(err as Error).message}`);
   }
 }
 

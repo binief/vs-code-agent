@@ -44,7 +44,7 @@ class StubDisposable {
 const vscodeStub = {
   workspace: {
     workspaceFolders: [{ uri: { fsPath: root }, name: 'stub', index: 0 }],
-    getConfiguration: () => ({ get: (key: string) => settings[key] }),
+    getConfiguration: () => ({ get: (key: string) => settings[key], update: async (key: string, value: unknown, _target: number) => { settings[key] = value; } }),
     onDidChangeConfiguration: () => new StubDisposable(),
     onDidChangeWorkspaceFolders: () => new StubDisposable(),
     registerTextDocumentContentProvider: () => new StubDisposable(),
@@ -76,6 +76,7 @@ const vscodeStub = {
     createFile(): void {}
   },
   DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2, Hint: 3 },
+  ConfigurationTarget: { Global: 1, Workspace: 2 },
   Disposable: StubDisposable,
   EventEmitter: class {
     event = () => new StubDisposable();
@@ -380,4 +381,38 @@ test('context preview resolves explicit delegation permission with the setting o
     vscodeStub.window.showTextDocument = showDocument;
     delete settings['subagents.enabled'];
   }
+});
+
+test('quick settings persist and read back both feature toggles', async () => {
+  const { controller, messages } = makeController();
+  try {
+    assert.equal(controller.getFeatureSettings().subagentsEnabled, false);
+    assert.equal(controller.getFeatureSettings().localFallback, false);
+    await controller.saveFeatureSettings({ subagentsEnabled: true, localFallback: true, target: 'workspace' });
+    assert.equal(settings['subagents.enabled'], true);
+    assert.equal(settings['compaction.localFallback'], true);
+    assert.equal(controller.readConfig().subagentsEnabled, true);
+    assert.equal(controller.readConfig().compaction.localFallback, true);
+    assert.ok(messages.some((m) => m.type === 'feature-settings-saved' && m.ok && m.settings.localFallback));
+    await controller.saveFeatureSettings({ subagentsEnabled: false, localFallback: false, target: 'user' });
+    assert.equal(controller.readConfig().subagentsEnabled, false);
+    assert.equal(controller.readConfig().compaction.localFallback, false);
+    await controller.saveFeatureSettings({ subagentsEnabled: 'true', localFallback: true, target: 'workspace' });
+    assert.ok(messages.some((m) => m.type === 'feature-settings-saved' && !m.ok && /Invalid/.test(m.error)));
+  } finally {
+    delete settings['subagents.enabled'];
+    delete settings['compaction.localFallback'];
+  }
+});
+
+test('subagent progress is reflected in the live activity strip and clears on completion', () => {
+  const { controller, messages } = makeController();
+  (controller as any).handleEvent({ type: 'subagent-progress', step: 2 });
+  assert.equal(controller.getActivity().status, 'subagent');
+  assert.match(controller.getActivity().detail ?? '', /step 2/);
+  (controller as any).handleEvent({ type: 'subagent-progress', tool: 'read_file' });
+  assert.match(controller.getActivity().detail ?? '', /read_file/);
+  (controller as any).handleEvent({ type: 'tool-end', id: 'd', name: 'delegate_task', ok: true, summary: 'subagent finished', detail: '', durationMs: 10 });
+  assert.equal(controller.getActivity().status, 'thinking');
+  assert.ok(messages.some((message) => message.type === 'activity' && message.activity.status === 'subagent'));
 });

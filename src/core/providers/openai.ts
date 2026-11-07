@@ -173,12 +173,14 @@ export async function readOpenAiStream(
   let text = '';
   let thinking = '';
   let finishReason: string | undefined;
+  let streamComplete = false;
   let usage: Usage | undefined;
   let errorMessage: string | undefined;
 
   const handleData = (payload: string): void => {
     const data = payload.trim();
-    if (!data || data === '[DONE]') return;
+    if (!data) return;
+    if (data === '[DONE]') { streamComplete = true; return; }
     let json: OpenAiResponse & { error?: { message?: string } };
     try {
       json = JSON.parse(data) as OpenAiResponse;
@@ -193,7 +195,10 @@ export async function readOpenAiStream(
 
     const choice = json.choices?.[0];
     if (!choice) return;
-    if (choice.finish_reason) finishReason = choice.finish_reason;
+    if (choice.finish_reason) {
+      finishReason = choice.finish_reason;
+      streamComplete = true;
+    }
 
     const delta = choice.delta ?? choice.message ?? {};
 
@@ -260,6 +265,7 @@ export async function readOpenAiStream(
       }))
       .filter((call) => Boolean(call.name)),
     finishReason,
+    streamComplete,
     usage,
     thinking: thinking || undefined,
   };
