@@ -1223,7 +1223,8 @@ export class HarnessController {
       this.cumulativeUsage = session.usage;
       if (result.compacted) {
         const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
-        this.pushNotice(result.targetMet === false ? 'warn' : 'info', `Compacted conversation: removed ${result.removed} old messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${targetNote}`);
+        const lengthNote = result.usedLongerSummary ? ' A completed reducing summary exceeded the requested length; the best available summary was used.' : '';
+        this.pushNotice(result.targetMet === false || result.usedLongerSummary ? 'warn' : 'info', `Compacted conversation: removed ${result.removed} old messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${lengthNote}${targetNote}`);
         this.log.info(`manual ${result.strategy ?? 'LLM'} compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens, removed ${result.removed}`);
         const { tokens, window, percent, breakdown } = session.getContextUsage();
         this.state = { ...this.state, contextTokens: tokens, contextWindow: window, contextPercent: percent, contextBreakdown: breakdown, cumulativeUsage: this.cumulativeUsage };

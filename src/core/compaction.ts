@@ -53,6 +53,8 @@ export interface CompactionResult {
   removedMessages: number;
   summary: string;
   strategy?: 'llm';
+  /** A completed reducing summary exceeded the requested length after retry. */
+  usedLongerSummary?: boolean;
   targetMet?: boolean;
   usage?: Usage;
 }
@@ -83,6 +85,7 @@ export async function compactHistory(
   if (signal?.aborted) throw new CompactionCancelled();
   const originalTokens = estimateMessagesTokens(history);
   let usage: Usage | undefined;
+  let usedLongerSummary = false;
   const unchanged = (reason: string) => ({
     newHistory: history,
     result: { compacted: false, originalTokens, newTokens: originalTokens, removedMessages: 0, summary: reason, usage },
@@ -169,6 +172,7 @@ export async function compactHistory(
   };
   const ask = async (payload: string, target: number, attached: typeof images = [], depth = 0, requireReduction = true): Promise<string> => {
     let oversized = 0;
+    let bestReducing: string | undefined;
     const budgets: number[] = [];
     for (let attempt = 0; attempt < 3; attempt++) {
       const boundedTarget = Math.min(target, summaryTargetCap);
@@ -219,8 +223,22 @@ export async function compactHistory(
       }
       if (!response.text?.trim() || response.toolCalls?.length) throw new SummaryFailure('LLM compaction returned an empty or invalid summary.');
       const result = response.text.trim();
-      if (!requireReduction || (estimateTokens(result) < estimateTokens(payload) && estimateTokens(result) <= Math.max(128, Math.ceil(desired * 1.5)))) return result;
-      if (++oversized >= 2) throw new SummaryFailure('LLM summary did not reduce the estimated context size after a shorter retry.');
+      const resultTokens = estimateTokens(result);
+      if (!requireReduction) return result;
+      if (resultTokens < estimateTokens(payload)) {
+        if (resultTokens <= Math.max(128, Math.ceil(desired * 1.5))) return result;
+        if (!bestReducing || resultTokens < estimateTokens(bestReducing)) bestReducing = result;
+      }
+      if (++oversized >= 2) {
+        // The target is a preference, not proof of non-reduction. Keep the
+        // best complete, reducing response after a shorter retry. The final
+        // assembled history is still checked against the original below.
+        if (bestReducing) {
+          usedLongerSummary = true;
+          return bestReducing;
+        }
+        throw new SummaryFailure('LLM summaries did not reduce the estimated input size after a shorter retry.');
+      }
     }
     throw new SummaryFailure('LLM summary could not be completed.');
   };
@@ -266,7 +284,7 @@ export async function compactHistory(
     const newHistory = [summaryMessage, ...(preservedRequest ? [preservedRequest] : []), ...history.slice(cut)];
     const newTokens = estimateMessagesTokens(newHistory);
     if (newTokens >= originalTokens) return unchanged('LLM summary did not reduce the estimated context size.');
-    return { newHistory, result: { compacted: true, originalTokens, newTokens, removedMessages: cut - 1 - (preservedRequest ? 1 : 0), summary, strategy: 'llm', targetMet: budget === undefined || newTokens <= budget, usage } };
+    return { newHistory, result: { compacted: true, originalTokens, newTokens, removedMessages: cut - 1 - (preservedRequest ? 1 : 0), summary, strategy: 'llm', usedLongerSummary, targetMet: budget === undefined || newTokens <= budget, usage } };
   } catch (err) {
     if (signal?.aborted) throw new CompactionCancelled(usage);
     return unchanged(err instanceof SummaryFailure ? err.message : `LLM compaction failed: ${(err as Error).message}`);
