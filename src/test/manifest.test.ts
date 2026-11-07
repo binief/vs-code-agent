@@ -90,6 +90,12 @@ test('chat saving and its folder are configurable per workspace with backward-co
   assert.equal(properties['codingHarness.chat.saveFolder'].scope, 'window');
 });
 
+test('subagent delegation is an opt-in setting', () => {
+  const setting = manifest.contributes.configuration.properties['codingHarness.subagents.enabled'];
+  assert.equal(setting.type, 'boolean');
+  assert.equal(setting.default, false);
+});
+
 test('there is no built-in prompt setting; instructions come from agent files', () => {
   const properties = Object.keys(manifest.contributes?.configuration?.properties ?? {});
   assert.ok(!properties.includes('codingHarness.systemPromptExtra'), 'systemPromptExtra is a built-in prompt backdoor');

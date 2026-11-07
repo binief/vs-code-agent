@@ -344,3 +344,40 @@ test('the agents picker pins a subset, persists it and keeps the chip honest', a
   fs.rmSync(path.join(root, '.agents'), { recursive: true, force: true });
   fs.rmSync(path.join(root, 'agent.md'), { force: true });
 });
+
+test('subagents setting is off by default and follows VS Code configuration', () => {
+  const { controller } = makeController();
+  try {
+    assert.equal(controller.readConfig().subagentsEnabled, false);
+    settings['subagents.enabled'] = true;
+    assert.equal(controller.readConfig().subagentsEnabled, true);
+    settings['subagents.enabled'] = false;
+    assert.equal(controller.readConfig().subagentsEnabled, false);
+  } finally { delete settings['subagents.enabled']; }
+});
+
+test('context preview resolves explicit delegation permission with the setting on and off', async () => {
+  const { controller } = makeController();
+  const file = path.join(root, 'agent.md');
+  const previous = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : undefined;
+  const openDocument = vscodeStub.workspace.openTextDocument;
+  const showDocument = vscodeStub.window.showTextDocument;
+  let preview = '';
+  try {
+    fs.writeFileSync(file, '---\ntools: [read, delegate_task]\n---\nInstructions.');
+    (vscodeStub.workspace as any).openTextDocument = async (value: { content: string }) => { preview = value.content; return {}; };
+    (vscodeStub.window as any).showTextDocument = async () => ({});
+    settings['subagents.enabled'] = false;
+    await controller.previewContext();
+    assert.ok(preview.includes('read_file'));
+    assert.ok(!preview.includes('delegate_task'));
+    settings['subagents.enabled'] = true;
+    await controller.previewContext();
+    assert.ok(preview.includes('delegate_task'));
+  } finally {
+    if (previous === undefined) fs.rmSync(file, { force: true }); else fs.writeFileSync(file, previous);
+    vscodeStub.workspace.openTextDocument = openDocument;
+    vscodeStub.window.showTextDocument = showDocument;
+    delete settings['subagents.enabled'];
+  }
+});

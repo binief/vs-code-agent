@@ -307,6 +307,11 @@
           "default": true,
           "markdownDescription": "Show the model's reasoning stream in its own lane when the backend provides one (DeepSeek `reasoning_content`, OpenRouter `reasoning`, OpenAI-compatible reasoning models, Anthropic extended thinking). The reasoning is displayed only — it is never sent back to the model as conversation content."
         },
+        "codingHarness.subagents.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Allow the main agent to delegate focused read-only investigations when selected agent files also explicitly allow `subagent` or `delegate_task`. Subagents use the same provider, have separate context, cannot edit or use MCP, and may increase token usage."
+        },
         "codingHarness.chat.saveEnabled": {
           "type": "boolean",
           "scope": "window",
