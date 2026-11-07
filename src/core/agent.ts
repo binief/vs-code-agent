@@ -1,10 +1,11 @@
 import { agentFilesSummary, discoverAgentFiles, selectAgentFiles } from './agentFiles';
 import { CheckpointStore, type RevertReport } from './checkpoints';
-import { CompactionCancelled, compactHistory, estimateMessagesTokens, estimateRequestTokens, estimateTokens } from './compaction';
+import { CompactionCancelled, compactHistory, contextBreakdown, contextBreakdownTotal, estimateMessagesTokens, estimateRequestTokens, estimateTokens } from './compaction';
 import { isRetryableProviderError, retryDelayMs } from './providers/errors';
 import { ThinkingStreamGuard, RepeatedToolCallTracker, type ThinkingStopReason } from './loopTracking';
 import { buildSystemPrompt, summarizeDiagnostics } from './prompt';
-import { createDefaultTools, ToolRegistry } from './tools';
+import { createDefaultTools, runCommandTool, ToolRegistry } from './tools';
+import { randomUUID } from 'node:crypto';
 import { resolveAgentToolPolicy } from './toolPolicy';
 import { repairToolMessages } from './transcript';
 import { rankedArchiveSearch } from './rankedArchiveSearch';
@@ -137,6 +138,8 @@ export class HarnessSession {
   private cumulativeUsage: Usage = {};
   private inputCalibration = 1;
   private lastSystemPrompt = '';
+  /** Most recently resolved task policy; undefined means the estimate is provisional. */
+  private lastAllowedTools?: ToolSpec[];
   private readonly toolOutputCache = new Map<string, string>();
   private toolOutputBytes = 0;
   private nextOutputId = 1;
@@ -196,6 +199,8 @@ export class HarnessSession {
     // Older archives may already have been compacted or truncated.
     this.originalHistoryComplete = complete ?? (messages.length === 0);
     this.pendingOriginal = undefined;
+    this.lastSystemPrompt = '';
+    this.lastAllowedTools = undefined;
     this.cumulativeUsage = { ...usage };
   }
 
@@ -212,6 +217,7 @@ export class HarnessSession {
   /** Pin the instruction files for the next task; `null`/`undefined` means all. */
   setAgentSelection(selection: readonly string[] | null | undefined): void {
     this.deps.agentSelection = selection ?? undefined;
+    this.lastAllowedTools = undefined;
   }
 
   get agentSelection(): readonly string[] | undefined {
@@ -231,6 +237,7 @@ export class HarnessSession {
     this.cumulativeUsage = {};
     this.inputCalibration = 1;
     this.lastSystemPrompt = '';
+    this.lastAllowedTools = undefined;
     this.toolOutputCache.clear();
     this.toolOutputBytes = 0;
   }
@@ -246,17 +253,18 @@ export class HarnessSession {
 
   private toolsForEstimate(): ToolSpec[] {
     const helpers = this.originalHistory.length || this.pendingOriginal?.length ? [ARCHIVE_SEARCH, ARCHIVE_READ] : [];
-    return [...this.registry.specs(), ...helpers.filter((spec) => !this.registry.has(spec.name))];
+    return this.lastAllowedTools ?? [...this.registry.specs(), ...helpers.filter((spec) => !this.registry.has(spec.name))];
   }
 
   /** Estimate current context usage */
-  getContextUsage(systemPrompt?: string): { tokens: number; window: number; percent: number } {
+  getContextUsage(systemPrompt?: string): { tokens: number; window: number; percent: number; breakdown: import('./types').ContextBreakdown } {
     const system = systemPrompt ?? this.lastSystemPrompt;
     const messages: ChatMessage[] = system ? [{ role: 'system', content: system }, ...this.history] : [...this.history];
-    const total = Math.ceil(estimateRequestTokens(messages, this.toolsForEstimate()) * this.inputCalibration) + Math.max(0, this.deps.config.maxOutputTokens);
+    const breakdown = contextBreakdown(messages, this.toolsForEstimate(), this.deps.config.maxOutputTokens, this.inputCalibration, undefined, this.lastAllowedTools !== undefined);
+    const total = contextBreakdownTotal(breakdown);
     const window = this.deps.config.compaction.contextWindowTokens;
     const percent = window > 0 ? (total / window) * 100 : 0;
-    return { tokens: total, window, percent };
+    return { tokens: total, window, percent, breakdown };
   }
 
   /** Resolve the same current agent policy used by a task; fail closed on discovery errors. */
@@ -312,6 +320,8 @@ export class HarnessSession {
     this.nextOutputId = 1;
     this.controller = new AbortController();
     const signal = this.controller.signal;
+    this.lastSystemPrompt = '';
+    this.lastAllowedTools = undefined;
     const host = this.deps.host;
     const maxSteps = Math.max(1, this.deps.config.maxSteps);
 
@@ -408,6 +418,7 @@ export class HarnessSession {
       const archiveTools = [ARCHIVE_SEARCH, ARCHIVE_READ].filter((spec) => !this.registry.has(spec.name));
       const toolPolicy = resolveAgentToolPolicy(selected, [...this.registry.specs(), ...archiveTools], new Set(archiveTools.map((spec) => spec.name)));
       const allowedToolNames = new Set(toolPolicy.tools.map((tool) => tool.name));
+      this.lastAllowedTools = toolPolicy.tools;
       if (toolPolicy.restricted) {
         onEvent({ type: 'notice', level: 'info', message: `Selected agent tool policy: ${toolPolicy.tools.map((tool) => tool.name).join(', ') || 'no tools'}.` });
       }
@@ -538,7 +549,10 @@ export class HarnessSession {
         if (this.deps.config.compaction.enabled && this.deps.config.compaction.autoCompact &&
             this.history.length + taskMessages.length >= autoCompactRetryAt &&
             context.tokens + contextWindow * 0.1 >= contextWindow * this.deps.config.compaction.threshold) {
-          if (await compactTask(toolsForStep)) {
+          if (this.history.length === 0 && taskMessages.length === 1) {
+            autoCompactRetryAt = 3;
+            onEvent({ type: 'notice', level: 'warn', message: `Estimated context is already high before there is older history to compact. System context, tool schemas, images and the ${outputReserve}-token output reserve all count. Check Max Output Tokens and the configured model window.` });
+          } else if (await compactTask(toolsForStep)) {
             messages = buildMessages();
             context = measureContext();
             if (contextWindow > 0 && context.tokens >= contextWindow * 0.9) {
@@ -548,7 +562,7 @@ export class HarnessSession {
         }
         let contextTokens = context.tokens;
         let contextPercent = context.percent;
-        onEvent({ type: 'context', contextTokens, contextWindow, contextPercent });
+        onEvent({ type: 'context', contextTokens, contextWindow, contextPercent, breakdown: contextBreakdown(messages, toolsForStep, outputReserve, this.inputCalibration) });
 
         let text = '';
         let calls: ToolCall[] = [];
@@ -687,7 +701,7 @@ export class HarnessSession {
               this.inputCalibration = Math.max(this.inputCalibration, reportedInput / context.input);
               contextTokens = reportedInput + outputReserve;
               contextPercent = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
-              onEvent({ type: 'context', contextTokens, contextWindow, contextPercent });
+              onEvent({ type: 'context', contextTokens, contextWindow, contextPercent, breakdown: contextBreakdown(messages, toolsForStep, outputReserve, this.inputCalibration, reportedInput) });
             }
             // Compute tokens per second
             const outputTokens = response.usage.outputTokens ?? estimateTokens(text);
@@ -827,6 +841,34 @@ export class HarnessSession {
             continue;
           }
 
+          const verificationCommand = this.deps.config.verificationCommand?.trim();
+          if (verificationCommand && !isFinalStep) {
+            if (!allowedToolNames.has('run_command') || this.registry.get('run_command') !== runCommandTool) {
+              errorText = 'Configured verification could not run: the built-in run_command tool is unavailable or disallowed by the active tool policy.';
+              outcome = 'error';
+              if (trimmed || streamed) onEvent({ type: 'assistant', id: streamId, text: trimmed, final: true, streamed });
+              onEvent({ type: 'notice', level: 'error', message: `${errorText} Task completion is unverified.` });
+              break;
+            }
+            onEvent({ type: 'notice', level: 'info', message: 'Running the configured verification command once; normal command policy and approvals apply.' });
+            const check: ToolCall = { id: `harness-verification-${randomUUID()}`, name: 'run_command',
+              arguments: JSON.stringify({ command: verificationCommand, purpose: 'Configured task verification' }) };
+            addMessage({ role: 'assistant', content: '[Harness: configured verification]', toolCalls: [check] });
+            const checked = await this.executeToolCall(check, onEvent, signal, allowedToolNames, 2048);
+            toolCallsRun++;
+            addMessage({ role: 'tool', toolCallId: check.id, name: check.name, content: this.pageToolResult(checked.content, 2048, onEvent) });
+            if (signal.aborted) { outcome = 'cancelled'; break; }
+            if (!checked.ok) {
+              errorText = `Configured verification failed or was not run: ${checked.summary ?? 'unknown result'}. Task completion is unverified.`;
+              outcome = 'error';
+              if (trimmed || streamed) onEvent({ type: 'assistant', id: streamId, text: trimmed, final: true, streamed });
+              onEvent({ type: 'notice', level: 'error', message: errorText });
+              break;
+            }
+            onEvent({ type: 'notice', level: 'info', message: 'Configured verification command passed. A passing command does not prove the whole task is correct.' });
+          } else if (verificationCommand && isFinalStep) {
+            onEvent({ type: 'notice', level: 'warn', message: 'The step limit was reached; configured verification was not run and task completion is unverified.' });
+          }
           if (trimmed || streamed) {
             onEvent({ type: 'assistant', id: streamId, text: trimmed, final: true, streamed });
           }
@@ -933,6 +975,8 @@ export class HarnessSession {
       usage: this.cumulativeUsage,
       tokensPerSecond: lastTokensPerSecond,
     });
+    const contextUsage = this.getContextUsage();
+    onEvent({ type: 'context', contextTokens: contextUsage.tokens, contextWindow: contextUsage.window, contextPercent: contextUsage.percent, breakdown: contextUsage.breakdown });
     return {
       outcome,
       summary,
@@ -941,7 +985,8 @@ export class HarnessSession {
       filesChanged,
       usage: this.cumulativeUsage,
       tokensPerSecond: lastTokensPerSecond,
-      contextTokens: this.getContextUsage().tokens,
+      contextTokens: contextUsage.tokens,
+      contextBreakdown: contextUsage.breakdown,
     };
   }
 
@@ -1048,6 +1093,7 @@ export class HarnessSession {
       return result;
     };
 
+    if (signal.aborted) return finish({ ok: false, content: CANCELLED_TOOL_RESULT, summary: 'cancelled' });
     if (!allowedTools.has(call.name)) {
       return finish({ ok: false, content: `Tool "${call.name}" is not allowed by the selected agent tool policy or is unavailable.`, summary: 'tool not allowed' });
     }
@@ -1163,6 +1209,11 @@ export class HarnessSession {
       });
     }
 
+    if (createDefaultTools().includes(tool)) {
+      const issue = validateBuiltinArguments(tool.parameters, args);
+      if (issue) return finish({ ok: false, content: `Invalid arguments for "${call.name}": ${issue} No tool was run.`, summary: 'bad arguments' });
+    }
+
     const context: ToolContext = {
       root: host.workspaceRoot,
       host,
@@ -1198,6 +1249,22 @@ export class HarnessSession {
       });
     }
   }
+}
+
+/** Shallow, non-coercing checks for built-ins; custom and MCP schemas remain untouched. */
+function validateBuiltinArguments(schema: import('./types').JsonSchema, args: Record<string, unknown>): string | undefined {
+  for (const field of schema.required ?? []) {
+    if (!Object.prototype.hasOwnProperty.call(args, field) || args[field] === undefined || args[field] === null) return `required field "${field}" is missing.`;
+  }
+  for (const [name, spec] of Object.entries(schema.properties ?? {})) {
+    const value = args[name];
+    if (value === undefined || value === null || !spec.type) continue;
+    const valid = spec.type === 'array' ? Array.isArray(value) : spec.type === 'object' ? typeof value === 'object' && !Array.isArray(value) :
+      spec.type === 'integer' ? typeof value === 'number' && Number.isInteger(value) : typeof value === spec.type;
+    if (!valid) return `field "${name}" must be ${spec.type}.`;
+    if (spec.enum && !spec.enum.includes(value)) return `field "${name}" must be one of ${spec.enum.map(String).join(', ')}.`;
+  }
+  return undefined;
 }
 
 /** Tolerant JSON parsing for model-produced tool arguments. */

@@ -373,3 +373,16 @@ test('an in-flight snapshot keeps completed tool groups when a later task reuses
   release();
   await running;
 });
+
+test('malformed builtin tool arguments return actionable errors without executing or changing files', async () => {
+  const dir = makeWorkspace();
+  const provider = new StrictProvider((turn) => turn === 1 ? {
+    text: '', toolCalls: [{ id: 'bad', name: 'write_file', arguments: '{"path":42,"content":"x"}' }],
+  } : { text: 'done', toolCalls: [] });
+  const session = new HarnessSession({ host: new FakeHost(dir), provider, config: config({ stream: false }) });
+  const result = await session.runTask('Try', () => {});
+  assert.equal(result.outcome, 'complete');
+  const tool = session.transcript.find((m) => m.role === 'tool' && m.toolCallId === 'bad');
+  assert.match(tool?.content ?? '', /field "path" must be string.*No tool was run/);
+  assert.deepEqual(fs.readdirSync(dir), []);
+});

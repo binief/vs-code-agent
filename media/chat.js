@@ -34,6 +34,9 @@
   const chipTokens = document.getElementById('chip-tokens');
   const chipSpeed = document.getElementById('chip-speed');
   const chipContext = document.getElementById('chip-context');
+  const contextBreakdownPanel = document.getElementById('context-breakdown');
+  const contextBreakdownText = document.getElementById('context-breakdown-text');
+  const btnContextPreview = document.getElementById('btn-context-preview');
   const chipMcp = document.getElementById('chip-mcp');
   const chipAgents = document.getElementById('chip-agents');
   const chipStream = document.getElementById('chip-stream');
@@ -69,6 +72,7 @@
   let contextWindow = 128000;
   let contextTokens = 0;
   let contextPercent = 0;
+  let contextBreakdown = null;
   let codeSeq = 0;
 
   /* Images staged for the next message: { id, name, mediaType, dataUrl, bytes }. */
@@ -387,14 +391,20 @@
     if (chipContext) {
       const pct = contextPercent || 0;
       chipContext.textContent = 'ctx ~' + Math.round(pct) + '%';
-      chipContext.title = 'Estimated context: ' + contextTokens + ' / ' + contextWindow + ' tokens (~' + Math.round(pct) + '%). During requests, the estimate includes tools and output reserve; before the first request it may be incomplete. Verify your model’s configured window — click to preview the system message';
+      chipContext.title = 'Estimated context: ' + contextTokens + ' / ' + contextWindow + ' tokens (~' + Math.round(pct) + '%). Click for a breakdown.';
+      if (contextBreakdownText) {
+        const b = contextBreakdown;
+        contextBreakdownText.textContent = b ? 'Estimated tokens: system ' + b.system + ' · conversation ' + b.conversation + ' · images ' + b.images + ' · tool schemas ' + b.tools + ' · framing ' + b.framing + '\n' + (b.source === 'provider' ? 'Provider input adjustment ' : 'Calibration adjustment ') + b.adjustment + ' · reserved output ' + b.outputReserve + '\nTotal ' + contextTokens + ' / ' + contextWindow + '. Components are estimates; provider accounting may differ.' + (b.policyKnown ? '' : ' Tool policy is not yet resolved; schema estimate may include unavailable tools.') + (b.policyKnown ? ' The tool policy is from the most recent task and may change.' : '') : 'Context breakdown is available after the first request.';
+      }
       chipContext.classList.toggle('warn', pct >= 75 && pct < 90);
       chipContext.classList.toggle('error', pct >= 90);
       if (compactBanner && compactText) {
         if (pct >= 75 && !busy) {
           compactBanner.hidden = false;
           compactText.textContent =
-            pct >= 90
+            contextBreakdown && contextBreakdown.outputReserve >= contextWindow * 0.5
+              ? 'Estimated context ~' + Math.round(pct) + '% (' + contextTokens + '/' + contextWindow + '). Reserved output is ' + contextBreakdown.outputReserve + ' tokens; check Max Output Tokens and the model window.'
+              : pct >= 90
               ? 'Estimated context ~' + Math.round(pct) + '% full (' + contextTokens + '/' + contextWindow + ' tokens). Compact to avoid truncation.'
               : 'Estimated context ~' + Math.round(pct) + '% used. Compacting frees space for the next task.';
         } else if (pct < 70) {
@@ -522,6 +532,7 @@
     }
     if (state.cumulativeUsage) cumulativeUsage = state.cumulativeUsage;
     if (typeof state.tokensPerSecond === 'number') currentSpeed = state.tokensPerSecond;
+    if ('contextBreakdown' in state) contextBreakdown = state.contextBreakdown || null;
     if (typeof state.contextWindow === 'number') contextWindow = state.contextWindow;
     if (typeof state.contextTokens === 'number') contextTokens = state.contextTokens;
     if (typeof state.contextPercent === 'number') contextPercent = state.contextPercent;
@@ -1456,7 +1467,12 @@
   if (btnMcp) btnMcp.addEventListener('click', openMcpModal);
   if (btnAgents) btnAgents.addEventListener('click', () => vscode.postMessage({ type: 'open-agents' }));
   if (chipAgents) chipAgents.addEventListener('click', openAgentsModal);
-  if (chipContext) chipContext.addEventListener('click', () => vscode.postMessage({ type: 'preview-context' }));
+  if (chipContext && contextBreakdownPanel) {
+    const toggleContextBreakdown = () => { contextBreakdownPanel.hidden = !contextBreakdownPanel.hidden; chipContext.setAttribute('aria-expanded', String(!contextBreakdownPanel.hidden)); updateTokenChips(); };
+    chipContext.addEventListener('click', toggleContextBreakdown);
+    chipContext.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleContextBreakdown(); } });
+  }
+  if (btnContextPreview) btnContextPreview.addEventListener('click', () => vscode.postMessage({ type: 'preview-context' }));
   if (btnCompactBanner) btnCompactBanner.addEventListener('click', () => vscode.postMessage({ type: 'compact' }));
   if (btnCompactDismiss) {
     btnCompactDismiss.addEventListener('click', () => {
@@ -2066,6 +2082,7 @@
         }
         break;
       case 'context':
+        contextBreakdown = message.breakdown || null;
         if (typeof message.contextTokens === 'number') contextTokens = message.contextTokens;
         if (typeof message.contextWindow === 'number') contextWindow = message.contextWindow;
         if (typeof message.contextPercent === 'number') contextPercent = message.contextPercent;
@@ -2136,6 +2153,7 @@
         currentSpeed = 0;
         contextTokens = 0;
         contextPercent = 0;
+        contextBreakdown = null;
         updateTokenChips();
         stickToBottom = true;
         break;

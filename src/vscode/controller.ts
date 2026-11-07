@@ -115,6 +115,7 @@ export interface UiState {
   contextTokens?: number;
   contextWindow?: number;
   contextPercent?: number;
+  contextBreakdown?: import('../core/types').ContextBreakdown | null;
   /** MCP */
   mcpEnabled?: boolean;
   mcpServers?: number;
@@ -558,6 +559,7 @@ export class HarnessController {
       tokensPerSecond: 0,
       contextTokens,
       contextWindow,
+      contextBreakdown: null,
       contextPercent: contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0,
     };
     this.activity = { status: 'idle', step: 0, maxSteps: 0, tool: null, detail: null, startedAt: 0, taskStartedAt: 0 };
@@ -790,6 +792,7 @@ export class HarnessController {
       maxSteps: c.get('maxSteps'),
       temperature: c.get('temperature'),
       maxOutputTokens: c.get('maxOutputTokens'),
+      verificationCommand: c.get<string>('verification.command')?.trim() || undefined,
       editPolicy: c.get('editPolicy'),
       commandPolicy: c.get('commandPolicy'),
       allowDangerousCommands: c.get('allowDangerousCommands'),
@@ -1140,6 +1143,7 @@ export class HarnessController {
         cumulativeUsage: this.cumulativeUsage,
         tokensPerSecond: this.lastTokensPerSecond,
         contextTokens: result.contextTokens,
+        contextBreakdown: result.contextBreakdown,
         contextPercent: this.state.contextWindow && result.contextTokens !== undefined
           ? result.contextTokens / this.state.contextWindow * 100 : 0,
       };
@@ -1189,6 +1193,7 @@ export class HarnessController {
       tokensPerSecond: 0,
       contextTokens: 0,
       contextPercent: 0,
+      contextBreakdown: null,
       step: 0,
     };
     this.post({ type: 'reset' });
@@ -1236,9 +1241,9 @@ export class HarnessController {
           this.pushNotice(result.toolOutputsReduced || result.targetMet === false ? 'warn' : 'info', `Compacted conversation: removed ${result.removed} old messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${reductionNote}${targetNote}`);
         }
         this.log.info(`manual ${result.strategy ?? 'LLM'} compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens, removed ${result.removed}`);
-        const { tokens, window, percent } = session.getContextUsage();
-        this.state = { ...this.state, contextTokens: tokens, contextWindow: window, contextPercent: percent, cumulativeUsage: this.cumulativeUsage };
-        this.post({ type: 'context', contextTokens: tokens, contextWindow: window, contextPercent: percent });
+        const { tokens, window, percent, breakdown } = session.getContextUsage();
+        this.state = { ...this.state, contextTokens: tokens, contextWindow: window, contextPercent: percent, contextBreakdown: breakdown, cumulativeUsage: this.cumulativeUsage };
+        this.post({ type: 'context', contextTokens: tokens, contextWindow: window, contextPercent: percent, breakdown });
       } else {
         this.state = { ...this.state, cumulativeUsage: this.cumulativeUsage };
         void vscode.window.showWarningMessage(`Conversation not compacted: ${result.reason} Original context was retained.`);
@@ -1939,9 +1944,10 @@ export class HarnessController {
           contextTokens: event.contextTokens,
           contextWindow: event.contextWindow,
           contextPercent: event.contextPercent,
+          contextBreakdown: event.breakdown,
         };
         this.post({ type: 'state', state: this.state });
-        this.post({ type: 'context', contextTokens: event.contextTokens, contextWindow: event.contextWindow, contextPercent: event.contextPercent });
+        this.post({ type: 'context', contextTokens: event.contextTokens, contextWindow: event.contextWindow, contextPercent: event.contextPercent, breakdown: event.breakdown });
         break;
       }
       case 'agent-files': {

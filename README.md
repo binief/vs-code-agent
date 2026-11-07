@@ -509,6 +509,7 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.mcp.timeoutMs` | `10000` | Default timeout for MCP tool calls |
 | `codingHarness.mcp.loadFromFiles` | `true` | Read servers from workspace config files |
 | `codingHarness.mcp.configFiles` | `[".vscode/mcp.json",".mcp.json","mcp.json"]` | Files scanned for servers |
+| `codingHarness.verification.command` | `""` | Optional user-level command to run once before marking a task complete; normal command policy and approval apply |
 | `codingHarness.compaction.enabled` | `true` | Enable conversation compaction |
 | `codingHarness.compaction.autoCompact` | `true` | Compact automatically near the context limit |
 | `codingHarness.compaction.threshold` | `0.75` | Utilisation target; auto-compaction starts earlier to reserve tool-result headroom |
@@ -517,6 +518,21 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.compaction.method` | `"llm"` | Use `"verbatim"` to compact locally without any summary-model calls |
 | `codingHarness.compaction.verbatimFallback` | `true` | Use local verbatim excerpts if LLM compaction fails; set false to retain active history instead |
 | `codingHarness.compaction.summaryModel` | `""` | Optional model on the current provider for LLM summaries; empty uses the active model |
+
+### Local model reliability benchmark
+
+A small reproducible smoke benchmark runs synthetic find-and-edit tasks in fresh temporary directories:
+
+```bash
+npm run benchmark:local -- --model YOUR_MODEL_ID --base-url http://127.0.0.1:8080/v1 --runs 2
+```
+
+It accepts only a loopback OpenAI-compatible endpoint and prints JSON with each case's pass/fail, duration,
+steps, tool failures and loop warnings. A case passes only if its specific observable result matches;
+this is a narrow baseline, not a guarantee of correctness or a comparison across all tasks. The fixture
+registry exposes bounded workspace file tools, not shell commands or MCP; the model still modifies files
+in the temporary fixtures, which are removed afterward. Use `--timeout-ms` to set a per-task deadline.
+Do not use your real workspace as a benchmark fixture. Results vary by model and server configuration.
 
 ## Commands
 
@@ -611,11 +627,22 @@ error the provider will not accept twice. Everything that used to stop a task ea
   failure when the method is `"llm"`. Cancellation never invokes the fallback, and if the fallback
   cannot safely reduce history, any safe preliminary tool-output reduction can remain; otherwise the
   original active context remains intact. Export the chat before starting a new conversation.
+- **Optional verification gate.** Set the user-level `codingHarness.verification.command` to an explicit
+  command such as `npm test` to run it once before a task is marked complete. It runs in the workspace
+  root through the built-in `run_command` tool, only when the selected agent policy permits it, and
+  uses the normal command safety/approval policy and timeout. Commands may have side effects and shell
+  edits are not necessarily checkpointed. Failure, rejection or an unavailable tool marks the result
+  unverified; it does not automatically retry or repair. If the task reaches its step limit, verification
+  is not run. This applies to every normally completed task while configured, including non-coding tasks.
+  A passing command is evidence only; it cannot prove the full task is correct.
 - **Tool results have headroom.** The harness estimates space for the current request, output and a
   safety margin, and budgets tool results across each batch. Limits are approximate; especially large
   batches, schema overhead or provider tokenization can still exceed the real context window.
-- **Context usage is an estimate.** The `ctx ~` meter includes estimated tool schemas and reserved
-  output tokens, and uses reported input usage when available. Tokenizers, images, provider accounting,
+- **Context usage is an estimate.** Click `ctx ~` to see approximate system, conversation, image,
+  tool-schema, framing, calibration and reserved-output contributions, and to preview the system
+  context. The post-task tool estimate uses the last resolved agent policy; before a policy is
+  resolved, the estimate is marked provisional. Provider-reported input may adjust the component total.
+  The `ctx ~` meter includes estimated tool schemas and reserved output tokens, and uses reported input usage when available. Tokenizers, images, provider accounting,
   and model context sizes vary: set `codingHarness.compaction.contextWindowTokens` to the actual limit
   of the model and endpoint. An inaccurate window setting can still lead to a context-limit error.
 

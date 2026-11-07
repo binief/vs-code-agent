@@ -827,3 +827,16 @@ test('read_file paginates long Unicode lines without losing text and reports con
   assert.match(next.content, /2\| next/);
   assert.equal(fs.readFileSync(path.join(root, 'long.txt'), 'utf8'), `${line}\r\nnext\r\n`);
 });
+
+test('failed replace suggests bounded locations without exposing unseen file content or editing', async () => {
+  const original = 'PRIVATE SECRET\nfirst line unique\nother line\n';
+  const root = makeTempWorkspace({ 'file.txt': original });
+  const host = new FakeHost(root);
+  const ctx = makeContext(root, host);
+  const result = await replaceInFileTool.run({ path: 'file.txt', old_text: 'first line unique\nwrong next line', new_text: 'new' }, ctx);
+  assert.equal(result.ok, false);
+  assert.match(result.content, /near line 2/);
+  assert.doesNotMatch(result.content, /PRIVATE SECRET/);
+  assert.equal(fs.readFileSync(path.join(root, 'file.txt'), 'utf8'), original);
+  assert.equal(host.approvals.length, 0);
+});

@@ -80,9 +80,14 @@
     <span class="chip" id="chip-thinking" title="The model's reasoning stream, when the backend provides one">thinking</span>
     <span class="chip" id="chip-tokens" title="Total tokens used (input + output)">0 tokens</span>
     <span class="chip" id="chip-speed" title="Current generation speed" hidden>0 tok/s</span>
-    <span class="chip" id="chip-context" title="Context window utilisation — click to preview the system context">ctx 0%</span>
+    <span class="chip" id="chip-context" role="button" tabindex="0" aria-expanded="false" title="Context window utilisation — click for a breakdown">ctx 0%</span>
     <span class="chip" id="chip-mcp" title="MCP servers" hidden>mcp: off</span>
     <span class="chip" id="chip-workspace" title=""></span>
+  </div>
+
+  <div class="context-breakdown" id="context-breakdown" hidden>
+    <div id="context-breakdown-text">Context breakdown is available after the first request.</div>
+    <button type="button" id="btn-context-preview">Preview system context</button>
   </div>
 
   <div class="compact-banner" id="compact-banner" hidden>

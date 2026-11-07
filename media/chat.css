@@ -1947,3 +1947,12 @@ body.dragging .composer-box {
 .stream::-webkit-scrollbar-corner {
   background: transparent;
 }
+
+.context-breakdown {
+  margin: 4px 8px;
+  padding: 8px;
+  border: 1px solid var(--vscode-panel-border);
+  color: var(--vscode-descriptionForeground);
+  white-space: pre-line;
+}
+.context-breakdown button { margin-top: 6px; }

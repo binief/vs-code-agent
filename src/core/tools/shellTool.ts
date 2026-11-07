@@ -23,6 +23,10 @@ export function runShellCommand(
 ): Promise<CommandOutput> {
   return new Promise((resolve) => {
     const started = Date.now();
+    if (opts.signal?.aborted) {
+      resolve({ exitCode: null, stdout: '', stderr: 'Cancelled before starting.', timedOut: false, durationMs: 0 });
+      return;
+    }
     const child = spawn(command, {
       cwd: opts.cwd,
       shell: true,
@@ -160,6 +164,7 @@ export const runCommandTool: Tool<{
       }
     }
 
+    if (ctx.signal?.aborted) return fail('Cancelled before running this command.', 'cancelled', { cancelled: true });
     const timeoutMs = Math.max(1000, Math.min(args.timeout_ms ?? ctx.config.commandTimeoutMs, 10 * 60_000));
     ctx.host.log('info', `run_command${verdict.decision === 'allow' ? ' (auto)' : ''}: ${args.command} [cwd=${cwd.rel}]`);
     const result = await runShellCommand(args.command, { cwd: cwd.abs, timeoutMs, signal: ctx.signal });
