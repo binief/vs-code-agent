@@ -1,6 +1,8 @@
 name: Release VSIX
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -12,11 +14,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out selected branch
+      - name: Check out the triggering commit
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -39,19 +41,35 @@ jobs:
         run: |
           VERSION="$(node -p "require('./package.json').version")"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Building Coding Harness v${VERSION}"
+          echo "Built Coding Harness v${VERSION} from ${GITHUB_SHA}"
 
-      - name: Ensure release does not already exist
+      - name: Upload VSIX build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coding-harness-v${{ steps.metadata.outputs.version }}-${{ github.sha }}
+          path: coding-harness.vsix
+          if-no-files-found: error
+
+      # Never replace an existing version/tag: the artifact above is still
+      # available for every successful build, even without a version bump.
+      - name: Check whether this version can be released
+        if: github.ref == 'refs/heads/main'
+        id: release_check
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.metadata.outputs.version }}
         run: |
-          if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::Release v${VERSION} already exists."
-            exit 1
+          TAG="v${VERSION}"
+          EXISTING="$(git ls-remote --tags origin "refs/tags/${TAG}")"
+          if [ -n "$EXISTING" ]; then
+            echo "::warning::Tag ${TAG} already exists; leaving the existing release unchanged. The VSIX is available as a workflow artifact. Increment package.json for a new release."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create GitHub release
+        if: github.ref == 'refs/heads/main' && steps.release_check.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.metadata.outputs.version }}

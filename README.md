@@ -803,6 +803,20 @@ src/test/            node --test suites (paths, policy, tools, loop, SSE
 playground/          toy project for the F5 sandbox
 ```
 
+### Automated VSIX builds and releases
+
+Every push to `main` (including a merged pull request) runs the **Release VSIX** workflow. It checks
+out that exact commit, installs dependencies, runs the full test suite, builds `coding-harness.vsix`,
+and uploads it as a GitHub Actions artifact named with the version and commit SHA. A failed test or
+build prevents the upload and release. The workflow can also be started manually; a manual run on a
+non-`main` branch builds an artifact but does not publish a release.
+
+For a commit on `main`, the workflow creates a GitHub release and attaches the VSIX if the package
+version's `v<version>` tag does not already exist. It never overwrites an existing tag or release. If
+the version was not incremented, the build is still available as an Actions artifact, but the existing
+release remains unchanged. Increment `package.json` **and** `package-lock.json` (for example with
+`npm version patch --no-git-tag-version`) before a merge that should publish a new release.
+
 ### Test runtime
 
 The release workflow runs the suite on Node 20, the same major as the extension
