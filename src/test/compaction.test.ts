@@ -278,7 +278,7 @@ test('an oversized summary retries with a shorter target and aggregates both usa
   assert.deepEqual(result.newHistory.slice(-2), history.slice(-2));
 });
 
-test('two oversized or incomplete summaries retain original messages and report both costs', async () => {
+test('oversized or incomplete summaries retain original messages and report all costs', async () => {
   for (const finishReason of [undefined, 'length']) {
     let calls = 0;
     const provider: Provider = { id: 'test', label: 'test', async chat() {
@@ -289,9 +289,10 @@ test('two oversized or incomplete summaries retain original messages and report 
     const { newHistory, result } = await compactHistory(history, config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } }), provider);
     assert.strictEqual(newHistory, history);
     assert.equal(result.compacted, false);
-    assert.equal(calls, 2);
-    assert.equal(result.usage?.totalTokens, 60);
-    assert.match(result.summary, finishReason ? /incomplete summary twice/ : /did not reduce/);
+    assert.equal(calls, finishReason ? 3 : 2);
+    assert.equal(result.usage?.totalTokens, finishReason ? 90 : 60);
+    assert.match(result.summary, finishReason ? /output limit on three attempts/ : /did not reduce/);
+    assert.doesNotMatch(result.summary, /Original context retained/);
   }
 });
 
@@ -544,4 +545,70 @@ test('summary target fits the reserved output capacity of a small configured win
     assert.ok(target <= (req.maxTokens ?? 0), `summary target ${target} must fit ${req.maxTokens} output tokens`);
     assert.ok(estimateMessagesTokens(req.messages) + (req.maxTokens ?? 0) <= 900);
   }
+});
+
+test('length-stopped summaries get larger output budgets and succeed without losing original history', async () => {
+  for (const finishReason of ['length', 'max_tokens']) {
+    const requests: ChatRequest[] = [];
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      requests.push(req);
+      if (requests.length < 3) return { text: requests.length === 1 ? '' : 'Partial', toolCalls: [], finishReason, usage: { inputTokens: 10, outputTokens: 20 } };
+      return { text: 'Concise complete summary.', toolCalls: [], finishReason: 'stop', usage: { inputTokens: 10, outputTokens: 5 } };
+    } };
+    const original = longHistory();
+    const snapshot = JSON.stringify(original);
+    const { result, newHistory } = await compactHistory(original, config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } }), provider);
+    assert.equal(result.compacted, true);
+    assert.equal(requests.length, 3);
+    assert.ok(requests[1].maxTokens! > requests[0].maxTokens!);
+    assert.ok(requests[2].maxTokens! > requests[1].maxTokens!);
+    assert.ok(requests[2].maxTokens! <= 8192);
+    assert.ok(requests.every((req) => estimateMessagesTokens(req.messages) + req.maxTokens! <= DEFAULT_CONFIG.compaction.contextWindowTokens * 0.9));
+    assert.equal(JSON.stringify(original), snapshot);
+    assert.ok(newHistory[0].content.includes('Concise complete summary.'));
+    assert.equal(result.usage?.totalTokens, 75);
+  }
+});
+
+test('a constrained context window bounds every retry even when summaries are truncated', async () => {
+  const requests: ChatRequest[] = [];
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+    requests.push(req);
+    return { text: '', toolCalls: [], finishReason: 'length' };
+  } };
+  const history = longHistory();
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, contextWindowTokens: 1000, keepLastMessages: 2 } });
+  const { result, newHistory } = await compactHistory(history, c, provider);
+  assert.equal(result.compacted, false);
+  assert.strictEqual(newHistory, history);
+  assert.match(result.summary, /output limit on three attempts/);
+  assert.equal(requests.length, 3);
+  for (const req of requests) {
+    assert.ok(estimateMessagesTokens(req.messages) + req.maxTokens! <= 900);
+    assert.ok(req.maxTokens! <= 300);
+  }
+});
+
+test('automatic compaction failure reports one retention notice and leaves original context intact', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-compact-length-'));
+  try {
+    let summaries = 0;
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      if (isSummary(req)) { summaries++; return { text: 'Partial', toolCalls: [], finishReason: 'length', usage: { inputTokens: 10, outputTokens: 20 } }; }
+      return { text: 'Continued.', toolCalls: [] };
+    } };
+    const c = config({ maxSteps: 3, compaction: { ...DEFAULT_CONFIG.compaction, autoCompact: true, keepLastMessages: 2, contextWindowTokens: 2000, threshold: 0.5 } });
+    const session = new HarnessSession({ host: new Host(dir), provider, config: c });
+    const history = longHistory();
+    session.restoreConversation(history, {}, history, true);
+    const events: HarnessEvent[] = [];
+    await session.runTask('Continue', (event) => events.push(event));
+    assert.equal(summaries, 3);
+    assert.deepEqual(session.transcript.slice(0, history.length), history);
+    assert.deepEqual(session.originalConversationSnapshot.slice(0, history.length), history);
+    const notice = events.find((event): event is Extract<HarnessEvent, { type: 'notice' }> => event.type === 'notice' && event.message.includes('Could not compact'));
+    assert.ok(notice);
+    assert.match(notice.message, /output limit on three attempts/);
+    assert.equal((notice.message.match(/Original context/gi) ?? []).length, 1);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

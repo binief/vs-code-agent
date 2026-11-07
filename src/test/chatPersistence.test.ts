@@ -1061,3 +1061,21 @@ test('after restart the model can explicitly retrieve a detail removed by compac
   const after = parseChatArchive(await fs.promises.readFile(path.join(source.storage, 'current-chat.json'), 'utf8'));
   assert.ok(after.originalHistory?.some((m) => m.role === 'tool' && m.name === 'read_conversation' && m.content.includes('submarine-pineapple-734')));
 });
+
+test('failed manual compaction preserves both histories in the saved chat and reports the output limit once', async () => {
+  respond = toolProvider([]);
+  const subject = makeController('failed-manual-original');
+  for (let i = 0; i < 4; i++) await subject.controller.run(`Retain task ${i}`);
+  const file = path.join(subject.storage, 'current-chat.json');
+  const before = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
+  let calls = 0;
+  respond = async () => { calls++; return { text: 'Partial', toolCalls: [], finishReason: 'length', usage: { inputTokens: 10, outputTokens: 20 } }; };
+  await subject.controller.compactHistory();
+  assert.equal(calls, 3);
+  const after = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
+  assert.deepEqual(after.history, before.history);
+  assert.deepEqual(after.originalHistory, before.originalHistory);
+  const warning = dialogs.warnings.at(-1) ?? '';
+  assert.match(warning, /output limit on three attempts/);
+  assert.equal((warning.match(/Original context/gi) ?? []).length, 1);
+});

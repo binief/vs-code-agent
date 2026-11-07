@@ -74,7 +74,9 @@ export async function compactHistory(
   if (!history.length) return unchanged('Conversation is too short to compact.');
 
   const window = Math.max(256, config.compaction.contextWindowTokens);
-  const outputCap = Math.max(128, Math.min(4096, Math.floor(window * 0.3)));
+  // Allow bounded growth after a length stop. Some providers count hidden
+  // reasoning against the output limit even when the visible summary is short.
+  const outputCap = Math.max(128, Math.min(8192, Math.floor(window * 0.3)));
   const summaryTargetCap = Math.max(32, Math.floor(outputCap * 0.55));
   const keepLast = Math.max(2, config.compaction.keepLastMessages);
   let cut = Math.max(0, history.length - keepLast);
@@ -137,7 +139,9 @@ export async function compactHistory(
     return chunks;
   };
   const ask = async (payload: string, target: number, attached: typeof images = [], depth = 0, requireReduction = true): Promise<string> => {
-    for (let attempt = 0; attempt < 2; attempt++) {
+    let oversized = 0;
+    const budgets: number[] = [];
+    for (let attempt = 0; attempt < 3; attempt++) {
       const boundedTarget = Math.min(target, summaryTargetCap);
       const desired = attempt ? Math.max(24, Math.floor(boundedTarget / 2)) : boundedTarget;
       const prompt = 'Summarize the following conversation for continuation by a coding agent. ' +
@@ -148,8 +152,9 @@ export async function compactHistory(
         (attempt ? 'The previous summary was too long or incomplete; make this one more concise. ' : '') +
         '\n\nConversation JSON or consecutive fragment:\n' + payload;
       const messages: ChatMessage[] = [{ role: 'user', content: prompt, ...(attached.length ? { images: attached } : {}) }];
-      const maxTokens = Math.min(outputCap, Math.max(attempt ? 768 : 512, desired * (attempt ? 3 : 2)));
-      if (estimateMessagesTokens(messages) + maxTokens > window * 0.9) {
+      const requested = Math.min(outputCap, Math.max(512, boundedTarget * 2) * (2 ** attempt));
+      const available = Math.floor(window * 0.9 - estimateMessagesTokens(messages));
+      if (available < Math.max(128, desired)) {
         if (attached.length) throw new SummaryFailure('Image attachments exceed the summary request budget.');
         if (depth >= 8) throw new SummaryFailure('Summary input cannot be divided further.');
         const pieces = splitHalf(payload);
@@ -158,7 +163,9 @@ export async function compactHistory(
         for (const piece of pieces) summaries.push(await ask(piece, Math.max(32, Math.floor(target / pieces.length)), [], depth + 1));
         return merge(summaries, target, depth + 1);
       }
+      const maxTokens = Math.min(requested, available);
       if (++calls > maxCalls) throw new SummaryFailure(`Compaction exceeded the ${maxCalls}-request safety limit.`);
+      budgets.push(maxTokens);
       let response;
       try {
         response = await provider.chat({ model: config.compaction.summaryModel || config.model, messages, tools: [], signal, temperature: 0, maxTokens });
@@ -177,15 +184,16 @@ export async function compactHistory(
       }
       addUsage(response.usage);
       if (signal?.aborted) throw new Error('Compaction cancelled.');
-      if (!response.text?.trim() || response.toolCalls?.length) throw new SummaryFailure('LLM compaction returned an empty or invalid summary.');
       if (response.finishReason === 'length' || response.finishReason === 'max_tokens') {
-        if (!attempt) continue;
-        throw new SummaryFailure('LLM compaction returned an incomplete summary twice. Original context retained.');
+        if (attempt < 2) continue;
+        throw new SummaryFailure(`LLM compaction stopped at the output limit on three attempts (requested ${budgets.join(', ')} tokens; finish reason: ${response.finishReason}). Try a different codingHarness.compaction.summaryModel and verify codingHarness.compaction.contextWindowTokens.`);
       }
+      if (!response.text?.trim() || response.toolCalls?.length) throw new SummaryFailure('LLM compaction returned an empty or invalid summary.');
       const result = response.text.trim();
       if (!requireReduction || (estimateTokens(result) < estimateTokens(payload) && estimateTokens(result) <= Math.max(128, Math.ceil(desired * 1.5)))) return result;
+      if (++oversized >= 2) throw new SummaryFailure('LLM summary did not reduce the estimated context size after a shorter retry.');
     }
-    throw new SummaryFailure('LLM summary did not reduce the estimated context size after a shorter retry.');
+    throw new SummaryFailure('LLM summary could not be completed.');
   };
   const merge = async (summaries: string[], target: number, depth: number): Promise<string> => {
     if (depth > 8) throw new SummaryFailure('Could not reduce chunk summaries within the safety limit.');
@@ -203,7 +211,7 @@ export async function compactHistory(
     const json = JSON.stringify(serialized);
     const parts = split(json, chunkBytes);
     let summary: string;
-    const singleImageFits = parts.length === 1 && estimateMessagesTokens([{ role: 'user', content: json, images }]) + outputCap + 250 < window * 0.9;
+    const singleImageFits = parts.length === 1 && estimateMessagesTokens([{ role: 'user', content: json, images }]) + Math.min(outputCap, Math.max(512, firstTarget * 2)) + 250 < window * 0.9;
     const minimumCalls = parts.length === 1 && (!images.length || singleImageFits)
       ? 1 : parts.length + images.length + (parts.length + images.length > 1 ? 1 : 0);
     if (minimumCalls > maxCalls) {

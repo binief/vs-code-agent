@@ -569,11 +569,14 @@ error the provider will not accept twice. Everything that used to stop a task ea
   vision requests. Summary calls cost time and tokens, may lose detail, and are capped at 64 requests
   per compaction; the active history is unchanged if any stage fails or is cancelled. The original
   messages are also kept separately for optional retrieval, as described under Saved chats. The offline
-  mock cannot produce LLM summaries. A rejected summary input can be split further and retried.
-  Summary-model capacity is assumed to match `contextWindowTokens`; a smaller provider/model window,
+  mock cannot produce LLM summaries. A rejected summary input can be split further and retried. If a
+  provider stops a summary at its output limit, the harness retries with progressively larger bounded
+  output budgets (up to 8,192 tokens per request and at most three attempts); reasoning tokens may
+  consume part of that budget. Retries can increase cost and still fail if the model cannot complete.
+  A failed compaction leaves the active context and its estimated size unchanged. Summary-model capacity is assumed to match `contextWindowTokens`; a smaller provider/model window,
   image overhead, output reservations, huge fixed instructions or inaccurate estimates can still
   prevent compaction. If this happens, choose a compatible summary model, lower the threshold, reduce
-  fixed context or start a new conversation.
+  fixed context or export the chat before starting a new conversation.
 - **Tool results have headroom.** The harness estimates space for the current request, output and a
   safety margin, and budgets tool results across each batch. Limits are approximate; especially large
   batches, schema overhead or provider tokenization can still exceed the real context window.
@@ -638,6 +641,9 @@ extension storage**, outside the project. Reopen the same folder or workspace af
 to see it again and send a follow-up. Both the visible transcript and the model's conversation history
 are restored, including images and tool results; LLM compaction can still apply. Use **Coding Harness:
 Show Chat Storage Location** in the Command Palette to see and copy the exact path on the extension host.
+There is no separate backup file: original messages are in the `originalHistory` field of that JSON.
+If it is absent, check that saving is enabled, the correct workspace is open, and no save warning was
+reported; a remote workspace writes on the remote extension host.
 If VS Code closes during a task, the latest saved progress is shown as interrupted. Tools and approval
 requests are not restarted or applied automatically.
 
