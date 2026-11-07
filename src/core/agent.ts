@@ -13,6 +13,7 @@ import {
   type ChatMessage,
   type ChatRequest,
   type CompactionProgress,
+  type CompactionTraceEvent,
   type HarnessConfig,
   type HarnessEvent,
   type HarnessHost,
@@ -227,7 +228,7 @@ export class HarnessSession {
   }
 
   /** Manually compact conversation history using the configured provider. */
-  async compact(onProgress?: (progress: CompactionProgress) => void, preferLocal = false): Promise<{ compacted: boolean; originalTokens: number; newTokens: number; removed: number; reason: string; strategy?: 'llm' | 'local'; fallbackReason?: string; usedLongerSummary?: boolean; targetMet?: boolean }> {
+  async compact(onProgress?: (progress: CompactionProgress) => void, preferLocal = false, onTrace?: (event: CompactionTraceEvent) => void): Promise<{ compacted: boolean; originalTokens: number; newTokens: number; removed: number; reason: string; strategy?: 'llm' | 'local'; fallbackReason?: string; usedLongerSummary?: boolean; targetMet?: boolean }> {
     if (this.busy) throw new Error('Cannot compact while a task is running.');
     this.busy = true;
     this.controller = new AbortController();
@@ -236,7 +237,7 @@ export class HarnessSession {
       const target = Math.max(0, Math.floor((c.compaction.contextWindowTokens * Math.min(0.6, c.compaction.threshold * 0.85) - Math.max(0, c.maxOutputTokens)) / this.inputCalibration) -
         estimateRequestTokens(this.lastSystemPrompt ? [{ role: 'system', content: this.lastSystemPrompt }] : [], this.toolsForEstimate()));
       const latestUser = [...this.history].reverse().find((message) => message.role === 'user');
-      const { newHistory, result } = await compactHistory(this.history, c, this.deps.provider, this.controller.signal, { targetHistoryTokens: target, preserveUserMessage: latestUser, onProgress, preferLocal });
+      const { newHistory, result } = await compactHistory(this.history, c, this.deps.provider, this.controller.signal, { targetHistoryTokens: target, preserveUserMessage: latestUser, onProgress, preferLocal, onTrace });
       if (result.usage) this.cumulativeUsage = mergeUsage(this.cumulativeUsage, result.usage);
       if (result.compacted) this.history = newHistory;
       return { compacted: result.compacted, originalTokens: result.originalTokens, newTokens: result.newTokens, removed: result.removedMessages, reason: result.summary, strategy: result.strategy, fallbackReason: result.fallbackReason, usedLongerSummary: result.usedLongerSummary, targetMet: result.targetMet };
@@ -398,6 +399,7 @@ export class HarnessSession {
             targetHistoryTokens: target,
             preserveUserMessage: userMessage,
             onProgress: (progress) => onEvent({ type: 'compaction-progress', progress }),
+            onTrace: (trace) => onEvent({ type: 'compaction-trace', trace }),
           });
         } catch (err) {
           if (err instanceof CompactionCancelled && err.usage) {
@@ -929,6 +931,7 @@ export class HarnessSession {
         if (signal.aborted) return finish({ ok: false, content: CANCELLED_TOOL_RESULT, summary: 'cancelled' });
         const prompt = `Delegated task: ${args.task.trim()}${typeof args.context === 'string' && args.context.trim() ? `\n\nRelevant context supplied by the parent:\n${args.context.trim()}` : ''}\n\nReturn findings with relevant file paths and evidence, and explicitly identify uncertainties or unverified details.`;
         const result = await child.runTask(prompt, (event) => {
+          if (event.type === 'compaction-trace') onEvent({ type: 'compaction-trace', trace: event.trace, source: 'subagent' });
           if (event.type === 'step') onEvent({ type: 'subagent-progress', step: event.index });
           if (event.type === 'tool-start') {
             onEvent({ type: 'subagent-progress', tool: event.name });

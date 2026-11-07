@@ -79,6 +79,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           items: this.controller.getTranscript(),
           state: this.controller.getState(),
           activity: this.controller.getActivity(),
+          compactionTrace: this.controller.getCompactionTrace(),
         });
         break;
       case 'submit':
@@ -104,6 +105,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'compact-local':
         await this.controller.compactHistory(true);
+        break;
+      case 'clear-compaction-trace':
+        this.controller.clearCompactionTrace();
         break;
       case 'get-feature-settings':
         this.post({ type: 'feature-settings', ...this.controller.getFeatureSettings() });

@@ -1,5 +1,5 @@
 import { estimateImageTokens } from './images';
-import type { ChatMessage, CompactionProgress, ContextBreakdown, HarnessConfig, Provider, ToolSpec, Usage } from './types';
+import type { ChatMessage, CompactionProgress, CompactionTraceEvent, ContextBreakdown, HarnessConfig, Provider, ToolSpec, Usage } from './types';
 
 /** Conservative approximation only; providers use different tokenizers. */
 export function estimateTokens(text: string): number {
@@ -70,6 +70,8 @@ export interface CompactionOptions {
   preferLocal?: boolean;
   /** Transient request status, without exposing summary or reasoning text. */
   onProgress?: (progress: CompactionProgress) => void;
+  /** Transient diagnostics, separate from conversation history and persistence. */
+  onTrace?: (event: CompactionTraceEvent) => void;
 }
 
 /** Carries costs of completed summary requests when a later chunk is cancelled. */
@@ -89,6 +91,7 @@ export async function compactHistory(
   options: CompactionOptions = {},
 ): Promise<{ newHistory: ChatMessage[]; result: CompactionResult }> {
   if (signal?.aborted) throw new CompactionCancelled();
+  options.onTrace?.({ kind: 'begin' });
   const originalTokens = estimateMessagesTokens(history);
   let usage: Usage | undefined;
   let usedLongerSummary = false;
@@ -269,17 +272,31 @@ export async function compactHistory(
       };
       options.onProgress?.({ request, attempt: attempt + 1, phase: 'waiting', startedAt });
       if (signal?.aborted) throw new CompactionCancelled(usage);
+      const model = config.compaction.summaryModel || config.model;
+      options.onTrace?.({ kind: 'request', request, attempt: attempt + 1, model, maxTokens, streaming: config.stream,
+        prompt, images: attached.map(({ name, mediaType }) => ({ name, mediaType })) });
+      if (signal?.aborted) {
+        options.onTrace?.({ kind: 'failed', request, cancelled: true });
+        throw new CompactionCancelled(usage);
+      }
       let response;
       try {
         response = await provider.chat({
-          model: config.compaction.summaryModel || config.model, messages, tools: [], signal, temperature: 0, maxTokens,
-          ...(config.stream && options.onProgress ? {
-            onDelta: (text: string) => progress('receiving', text),
-            onThinking: (text: string) => progress('reasoning', text),
+          model, messages, tools: [], signal, temperature: 0, maxTokens,
+          ...(config.stream && (options.onProgress || options.onTrace) ? {
+            onDelta: (text: string) => {
+              progress('receiving', text);
+              if (active && !signal?.aborted && text) options.onTrace?.({ kind: 'delta', request, channel: 'response', text });
+            },
+            onThinking: (text: string) => {
+              progress('reasoning', text);
+              if (active && !signal?.aborted && text && config.showThinking) options.onTrace?.({ kind: 'delta', request, channel: 'reasoning', text });
+            },
           } : {}),
         });
       } catch (err) {
         active = false;
+        options.onTrace?.({ kind: 'failed', request, cancelled: Boolean(signal?.aborted) });
         if (signal?.aborted) throw err;
         const message = (err as Error).message;
         if (!attached.length && depth < 8 && /context.{0,30}(?:length|window|exceed|limit)|maximum.{0,30}(?:context|tokens)|too many tokens|token limit exceeded|(?:input|prompt).{0,30}too (?:long|large)/i.test(message)) {
@@ -295,7 +312,12 @@ export async function compactHistory(
         active = false;
       }
       addUsage(response.usage);
-      if (signal?.aborted) throw new Error('Compaction cancelled.');
+      if (signal?.aborted) {
+        options.onTrace?.({ kind: 'failed', request, cancelled: true });
+        throw new Error('Compaction cancelled.');
+      }
+      options.onTrace?.({ kind: 'complete', request, text: response.text, reasoning: config.showThinking ? response.thinking : undefined,
+        finishReason: response.finishReason, streamComplete: response.streamComplete, usage: response.usage, toolCalls: response.toolCalls });
       if (response.streamComplete === false) throw new SummaryFailure('LLM summary stream ended without a completion marker.');
       if (response.finishReason === 'length' || response.finishReason === 'max_tokens') {
         if (attempt < 2) continue;

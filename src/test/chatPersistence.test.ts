@@ -1154,3 +1154,53 @@ test('manual local fallback requires confirmation and retains the original saved
     dialogs.confirm = undefined;
   }
 });
+
+test('manual compaction sends live trace to the panel without persisting diagnostic output', async () => {
+  settings['compaction.keepLastMessages'] = 2;
+  try {
+    respond = toolProvider([]);
+    const subject = makeController('compaction-trace-ephemeral');
+    await subject.controller.run('Prior important user context. '.repeat(400));
+    await subject.controller.run('Follow up.');
+    const file = path.join(subject.storage, 'current-chat.json');
+    const before = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let sawLive!: () => void;
+    const live = new Promise<void>((resolve) => { sawLive = resolve; });
+    const listener = subject.controller.onUiMessage((message: any) => {
+      if (message.type === 'compaction-trace' && message.trace.entries.some((entry: any) => entry.response.includes('UNSAVED_PARTIAL_MODEL_OUTPUT'))) sawLive();
+    });
+    respond = async (req) => {
+      req.onThinking?.('UNSAVED_REASONING');
+      req.onDelta?.('UNSAVED_PARTIAL_MODEL_OUTPUT');
+      entered();
+      return await new Promise<ProviderResponse>((_resolve, reject) => {
+        req.signal?.addEventListener('abort', () => reject(new Error('cancelled')), { once: true });
+      });
+    };
+    const pending = subject.controller.compactHistory();
+    await started;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([live, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('no live compaction update')), 3000); })]);
+    } finally { if (timer) clearTimeout(timer); }
+    const trace = subject.controller.getCompactionTrace();
+    assert.equal(trace.entries.length, 1);
+    assert.match(trace.entries[0].prompt, /Prior important user context/);
+    assert.match(trace.entries[0].response, /UNSAVED_PARTIAL_MODEL_OUTPUT/);
+    assert.match(trace.entries[0].reasoning, /UNSAVED_REASONING/);
+    assert.doesNotMatch(JSON.stringify(trace), /top-secret-api-key/);
+    subject.controller.cancel();
+    await pending;
+    assert.equal(subject.controller.getCompactionTrace().entries[0].status, 'cancelled');
+    const bytes = await fs.promises.readFile(file, 'utf8');
+    const after = parseChatArchive(bytes);
+    assert.deepEqual(after.history, before.history);
+    assert.deepEqual(after.originalHistory, before.originalHistory);
+    assert.doesNotMatch(bytes, /UNSAVED_PARTIAL_MODEL_OUTPUT|UNSAVED_REASONING/);
+    subject.controller.clearCompactionTrace();
+    assert.deepEqual(subject.controller.getCompactionTrace().entries, []);
+    listener.dispose();
+  } finally { delete settings['compaction.keepLastMessages']; }
+});

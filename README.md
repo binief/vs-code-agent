@@ -275,6 +275,13 @@ child, subject to the provider honoring cancellation. These findings are unverif
 misstate details; the main agent should inspect evidence when necessary. Additional model calls can
 increase time and cost. The offline mock planner does not autonomously decide to delegate.
 
+If saving these panel settings reports that a `codingHarness` setting is not registered, stop or finish
+any running task and run **Developer: Reload Window**, then try again. VS Code may not yet have loaded
+an updated extension's setting contributions. If reloading does not help, confirm the intended Coding
+Harness version is installed and enabled in the active extension host (local or remote), reinstall it
+if necessary, and reload. The panel checks both feature settings before writing; if a later write fails,
+it reports whether some settings may already have changed.
+
 ### Commands
 
 | Command | What it does |
@@ -611,8 +618,15 @@ fixed step limit or automatic loop/thinking interruption; long runs can consume 
   During manual and automatic compaction, the activity strip shows the current request, attempt,
   elapsed time and whether it is waiting for the provider or receiving streamed output. When streaming
   is enabled, summaries use it for activity updates without displaying the summary or reasoning; a
-  backend that buffers responses may still show only "waiting for provider". Some providers omit token
-  usage from streamed responses, so reported compaction usage may be incomplete. A long wait can be model
+  backend that buffers responses may still show only "waiting for provider". Open **LLM compaction
+  details — request and response** below the activity strip to inspect each logical model request,
+  streamed response, optional reasoning, finish reason and reported usage. This view may expose
+  sensitive conversation text; the diagnostic trace is held in memory and is not saved or exported.
+  A successful summary still becomes part of saved conversation history. Request headers and image
+  contents are not shown. It keeps the last 10 requests and truncates long displays; use **Clear** to
+  discard the view. Clearing during a request hides that request until the next one. When streaming is
+  disabled or a backend buffers its response, the response appears only when the provider returns.
+  Some providers omit token usage from streamed responses, so reported compaction usage may be incomplete. A long wait can be model
   loading, prompt processing, generation, a queued request, or a stalled backend; check the provider's
   logs. **Stop** cancels compaction and retains the original active history. No timeout is imposed on
   slow models. To bypass an LLM request that is still waiting, press **Stop**, then use **Settings →
