@@ -340,7 +340,7 @@ export class HarnessController {
       void vscode.window.showWarningMessage(settings.error ?? 'No chat storage location is available until a workspace is open.');
     } else {
       const file = settings.location.file.fsPath;
-      const choice = await vscode.window.showInformationMessage(`Coding Harness chat storage: ${file}`, 'Copy Path');
+      const choice = await vscode.window.showInformationMessage(`Coding Harness chat and originalHistory are stored in: ${file}`, 'Copy Path');
       if (choice === 'Copy Path') await vscode.env.clipboard.writeText(file);
     }
   }
