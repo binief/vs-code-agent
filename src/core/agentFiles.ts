@@ -693,7 +693,7 @@ export function selectAgentFiles(result: AgentFilesResult, selection?: readonly 
   if (selection == null) return { ...result, available, missing: [] };
 
   const wanted = new Set(selection.map((entry) => toPosix(entry.trim()).replace(/^\.\//, '')).filter(Boolean));
-  if (wanted.size === 0) return { ...result, available, missing: [] };
+  if (wanted.size === 0) return { ...result, files: [], totalBytes: 0, available, selection: [], missing: [] };
 
   const files = result.files.filter(
     (file) => wanted.has(toPosix(file.displayPath)) || wanted.has(toPosix(file.path)),

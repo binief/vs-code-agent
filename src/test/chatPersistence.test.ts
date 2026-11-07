@@ -10,6 +10,7 @@ import { parseChatArchive } from '../vscode/chatArchive';
 
 /** Exercise the real controller and VS Code filesystem calls without an editor. */
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-chat-'));
+fs.writeFileSync(path.join(root, 'agent.md'), '---\ntools: [read]\n---\n');
 fs.writeFileSync(path.join(root, 'sample.txt'), 'The source file.\n');
 interface StubUri {
   fsPath: string;
@@ -34,7 +35,7 @@ let renameFailures = 0;
 let onRename: ((destination: StubUri) => void) | undefined;
 const settings: Record<string, unknown> = {
   provider: 'openai', model: 'test-model', stream: true, showThinking: true,
-  'mcp.enabled': false, 'agentFiles.enabled': false, 'context.diagnostics': false,
+  'mcp.enabled': false, 'agentFiles.enabled': true, 'context.diagnostics': false,
 };
 
 class StubDisposable {
@@ -122,8 +123,6 @@ let respond: (request: ChatRequest) => Promise<ProviderResponse>;
 afterEach(() => {
   delete settings['chat.saveEnabled'];
   delete settings['chat.saveFolder'];
-  delete settings['compaction.verbatimFallback'];
-  delete settings['compaction.method'];
   vscodeStub.workspace.workspaceFolders = [{ uri: uri(root), name: 'test', index: 0 }];
   vscodeStub.workspace.workspaceFile = undefined;
   readGate = undefined;
@@ -1031,39 +1030,6 @@ test('storage-limit save failures explain why automatic persistence stopped', as
   assert.match(dialogs.warnings.at(-1) ?? '', /start a new conversation/);
 });
 
-test('after restart the model can explicitly retrieve a detail removed by compaction', async () => {
-  respond = toolProvider([]);
-  const source = makeController('retrieve-after-restart');
-  await source.controller.run('Unique old detail: submarine-pineapple-734');
-  for (let i = 0; i < 5; i++) await source.controller.run(`Other task ${i}`);
-  await source.controller.compactHistory();
-  const saved = parseChatArchive(await fs.promises.readFile(path.join(source.storage, 'current-chat.json'), 'utf8'));
-  assert.ok(!saved.history.some((m) => m.content.includes('submarine-pineapple-734')));
-  assert.ok(saved.originalHistory?.some((m) => m.content.includes('submarine-pineapple-734')));
-  const reopened = makeController('retrieve-after-restart');
-  await reopened.controller.whenReady();
-  let step = 0;
-  respond = async (req) => {
-    switch (++step) {
-      case 1:
-        assert.ok(!req.messages.some((m) => m.content.includes('submarine-pineapple-734')));
-        assert.ok(req.tools.some((t) => t.name === 'search_conversation'));
-        return { text: '', toolCalls: [{ id: 'search', name: 'search_conversation', arguments: '{"query":"submarine-pineapple-734"}' }] };
-      case 2:
-        assert.match(req.messages.at(-1)?.content ?? '', /message_index=1/);
-        return { text: '', toolCalls: [{ id: 'read', name: 'read_conversation', arguments: '{"message_index":1}' }] };
-      case 3:
-        assert.match(req.messages.at(-1)?.content ?? '', /Unique old detail: submarine-pineapple-734/);
-        return { text: 'Found the old detail.', toolCalls: [] };
-      default: throw new Error('unexpected model request');
-    }
-  };
-  await reopened.controller.run('Find the old detail');
-  assert.equal(step, 3);
-  const after = parseChatArchive(await fs.promises.readFile(path.join(source.storage, 'current-chat.json'), 'utf8'));
-  assert.ok(after.originalHistory?.some((m) => m.role === 'tool' && m.name === 'read_conversation' && m.content.includes('submarine-pineapple-734')));
-});
-
 test('failed manual compaction preserves both histories in the saved chat and reports the output limit once', async () => {
   respond = toolProvider([]);
   const subject = makeController('failed-manual-original');
@@ -1082,41 +1048,7 @@ test('failed manual compaction preserves both histories in the saved chat and re
   assert.equal((warning.match(/Original context/gi) ?? []).length, 1);
 });
 
-test('verbatim fallback saves originals, reopens, and retrieves an omitted detail', async () => {
-  const detail = 'OMITTED-DETAIL-FA7B9';
-  const prompt = 'Start instructions ' + 'x'.repeat(10000) + detail + 'y'.repeat(10000) + ' end.';
-  respond = toolProvider([]);
-  const source = makeController('verbatim-reopen');
-  await source.controller.run(prompt);
-  for (let i = 0; i < 4; i++) await source.controller.run(`Follow-up ${i}`);
-  const file = path.join(source.storage, 'current-chat.json');
-  const before = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
-  let summaries = 0;
-  respond = async () => { summaries++; return { text: 'incomplete', toolCalls: [], finishReason: 'length', usage: { inputTokens: 5, outputTokens: 10 } }; };
-  await source.controller.compactHistory();
-  assert.equal(summaries, 3);
-  const saved = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
-  assert.ok(saved.history[0].content.includes('Conversation compacted without an LLM'));
-  assert.ok(!saved.history.some((m) => m.content.includes(detail)), 'only selected excerpts remain active');
-  assert.deepEqual(saved.originalHistory, before.originalHistory);
-  assert.ok(saved.originalHistory?.some((m) => m.content.includes(detail)));
-  assert.ok(source.controller.getTranscript().some((i) => i.kind === 'notice' && i.level === 'warn' && /local verbatim fallback/.test(i.message)));
-  assert.ok(isTranscriptWellFormed(saved.history));
-  const reopened = makeController('verbatim-reopen');
-  await reopened.controller.whenReady();
-  let turn = 0;
-  respond = async (req) => {
-    if (++turn === 1) return { text: '', toolCalls: [{ id: 's', name: 'search_conversation', arguments: JSON.stringify({ query: detail }) }] };
-    assert.match(req.messages.at(-1)?.content ?? '', /message_index=1/);
-    assert.ok(req.messages.at(-1)?.content.includes(detail));
-    return { text: 'Found', toolCalls: [] };
-  };
-  await reopened.controller.run('Find the earlier detail');
-  assert.equal(turn, 2);
-});
-
-test('disabling verbatim fallback leaves active history and saved originals unchanged on summary failure', async () => {
-  settings['compaction.verbatimFallback'] = false;
+test('summary failure leaves active history and saved originals unchanged', async () => {
   respond = toolProvider([]);
   const source = makeController('verbatim-disabled');
   await source.controller.run('Large input '.repeat(500));
@@ -1129,127 +1061,4 @@ test('disabling verbatim fallback leaves active history and saved originals unch
   assert.deepEqual(saved.history, before.history);
   assert.deepEqual(saved.originalHistory, before.originalHistory);
   assert.match(dialogs.warnings.at(-1) ?? '', /Original context was retained/);
-});
-
-test('verbatim fallback with saving disabled retains original messages in memory and exports them explicitly', async () => {
-  settings['chat.saveEnabled'] = false;
-  respond = toolProvider([]);
-  const source = makeController('verbatim-memory');
-  await source.controller.run('Memory only detail '.repeat(500));
-  for (let i = 0; i < 4; i++) await source.controller.run(`Follow-up ${i}`);
-  respond = async () => ({ text: 'partial', toolCalls: [], finishReason: 'length' });
-  await source.controller.compactHistory();
-  const file = path.join(root, 'verbatim-memory-export.json');
-  dialogs.save = uri(file);
-  await source.controller.exportChat();
-  const exported = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
-  assert.ok(exported.history[0].content.includes('Conversation compacted without an LLM'));
-  assert.ok(exported.originalHistory?.some((m) => m.content.includes('Memory only detail')));
-  assert.equal(fs.existsSync(path.join(source.storage, 'current-chat.json')), false);
-});
-
-test('verbatim fallback image groups survive automatic save and reopening', async () => {
-  respond = toolProvider([]);
-  const source = makeController('verbatim-images');
-  const images = (from: number, count: number) => Array.from({ length: count }, (_, i) => ({ name: `image-${from + i}.png`, dataUrl: `data:image/png;base64,${PNG}` }));
-  await source.controller.run('First image instructions '.repeat(400), images(0, 8));
-  await source.controller.run('Second image instructions', images(8, 4));
-  for (let i = 0; i < 4; i++) await source.controller.run(`Follow-up ${i}`);
-  respond = async () => ({ text: 'partial', toolCalls: [], finishReason: 'length' });
-  await source.controller.compactHistory();
-  const file = path.join(source.storage, 'current-chat.json');
-  const saved = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
-  assert.ok(saved.history[0].content.includes('Conversation compacted without an LLM'));
-  assert.equal(saved.history.flatMap((m) => m.images ?? []).length, 12);
-  assert.ok(saved.history.every((m) => (m.images?.length ?? 0) <= 8));
-  const reopened = makeController('verbatim-images');
-  await reopened.controller.whenReady();
-  const session = await (reopened.controller as any).ensureSession();
-  assert.equal(session.conversationSnapshot.flatMap((m: ChatMessage) => m.images ?? []).length, 12);
-  assert.equal(session.originalConversationSnapshot.flatMap((m: ChatMessage) => m.images ?? []).length, 12);
-});
-
-test('repeated verbatim fallback never replaces or duplicates recorded original messages', async () => {
-  respond = toolProvider([]);
-  const source = makeController('verbatim-repeat');
-  await source.controller.run('Initial unique requirement '.repeat(500));
-  for (let i = 0; i < 4; i++) await source.controller.run(`Early ${i}`);
-  respond = async () => ({ text: 'partial', toolCalls: [], finishReason: 'length' });
-  await source.controller.compactHistory();
-  const file = path.join(source.storage, 'current-chat.json');
-  const first = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
-  assert.ok(first.history[0].content.includes('Conversation compacted without an LLM'));
-  respond = toolProvider([]);
-  for (let i = 0; i < 4; i++) await source.controller.run(`Later ${i}`);
-  const beforeSecond = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
-  respond = async () => ({ text: 'partial', toolCalls: [], finishReason: 'length' });
-  await source.controller.compactHistory();
-  const after = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
-  assert.ok(after.history[0].content.includes('Conversation compacted without an LLM'));
-  assert.deepEqual(after.originalHistory, beforeSecond.originalHistory);
-  assert.deepEqual(after.originalHistory?.slice(0, first.originalHistory!.length), first.originalHistory);
-  assert.ok(!after.originalHistory?.some((m) => m.content.includes('Conversation compacted without an LLM')));
-});
-
-test('manual verbatim method compacts locally without a summary-model call', async () => {
-  respond = toolProvider([]);
-  const subject = makeController('verbatim-selected');
-  await subject.controller.run('Initial detail '.repeat(500));
-  for (let i = 0; i < 4; i++) await subject.controller.run(`Task ${i}`);
-  const file = path.join(subject.storage, 'current-chat.json');
-  const before = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
-  settings['compaction.method'] = 'verbatim';
-  settings['compaction.verbatimFallback'] = false;
-  let calls = 0;
-  respond = async () => { calls++; throw new Error('model should not be called'); };
-  await subject.controller.compactHistory();
-  assert.equal(calls, 0);
-  const after = parseChatArchive(await fs.promises.readFile(file, 'utf8'));
-  assert.ok(after.history[0].content.includes('Conversation compacted without an LLM'));
-  assert.deepEqual(after.originalHistory, before.originalHistory);
-  assert.ok(subject.controller.getTranscript().some((i) => i.kind === 'notice' && i.level === 'warn' && /Used local verbatim compaction/.test(i.message)));
-});
-
-test('shortened tool-output references and their exact originals survive autosave and restart', async () => {
-  const body = 'BEGIN\n' + 'evidence in original middle\n'.repeat(400) + 'END';
-  const history: ChatMessage[] = [
-    { role: 'user', content: 'Old task' },
-    { role: 'assistant', content: '', toolCalls: [{ id: 'old', name: 'read_file', arguments: '{"path":"sample.txt"}' }] },
-    { role: 'tool', toolCallId: 'old', name: 'read_file', content: body },
-    { role: 'assistant', content: 'Old answer' },
-    ...Array.from({ length: 7 }, (_, i): ChatMessage[] => [{ role: 'user', content: `Question ${i}` }, { role: 'assistant', content: `Answer ${i}` }]).flat(),
-  ];
-  const storage = path.join(root, 'storage', 'shortened-output');
-  await fs.promises.mkdir(storage, { recursive: true });
-  await fs.promises.writeFile(path.join(storage, 'current-chat.json'), JSON.stringify({
-    format: 'coding-harness-chat', version: 1, savedAt: new Date().toISOString(), inProgress: false,
-    items: [], history, originalHistory: history, originalHistoryComplete: true, usage: {},
-  }));
-  const source = makeController('shortened-output');
-  let calls = 0;
-  respond = async () => { calls++; throw new Error('compaction should not contact provider'); };
-  await source.controller.whenReady();
-  await source.controller.compactHistory();
-  assert.equal(calls, 0);
-  const stored = parseChatArchive(await fs.promises.readFile(path.join(source.storage, 'current-chat.json'), 'utf8'));
-  assert.match(stored.history[2].content, /message_index=3/);
-  assert.equal(stored.originalHistory?.[2].content, body);
-  assert.ok(isTranscriptWellFormed(stored.history));
-  assert.ok(source.controller.getTranscript().some((item) => item.kind === 'notice' && /Shortened 1 older recorded tool/.test(item.message)));
-
-  const reopened = makeController('shortened-output');
-  await reopened.controller.whenReady();
-  let turn = 0;
-  respond = async (request) => {
-    if (++turn === 1) {
-      assert.match(request.messages.find((m) => m.toolCallId === 'old')?.content ?? '', /message_index=3/);
-      return { text: '', toolCalls: [{ id: 'retrieve', name: 'read_conversation', arguments: '{"message_index":3,"offset":6}' }] };
-    }
-    assert.match(request.messages.at(-1)?.content ?? '', /evidence in original middle/);
-    return { text: 'retrieved', toolCalls: [] };
-  };
-  await reopened.controller.run('Retrieve the original');
-  assert.equal(turn, 2);
-  const after = parseChatArchive(await fs.promises.readFile(path.join(source.storage, 'current-chat.json'), 'utf8'));
-  assert.equal(after.originalHistory?.[2].content, body);
 });

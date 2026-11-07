@@ -275,10 +275,6 @@ export interface CompactionConfig {
   threshold: number; // 0-1, e.g. 0.75 means compact when 75% of context window used
   contextWindowTokens: number;
   keepLastMessages: number;
-  /** Prefer LLM summaries or use local verbatim excerpts directly. */
-  method?: 'llm' | 'verbatim';
-  /** Use a lossy local verbatim fallback when LLM compaction fails. */
-  verbatimFallback?: boolean;
   summaryModel?: string; // optional model to use for summarization, defaults to main model
 }
 
@@ -287,16 +283,8 @@ export interface HarnessConfig {
   model: string;
   baseUrl?: string;
   apiKey?: string;
-  /**
-   * Hard ceiling on model turns for one task. It is a safety net, not a
-   * schedule: raise it for long multi-step work, because reaching it forces the
-   * final turn to summarise and ends the run wherever the task got to.
-   */
-  maxSteps: number;
   temperature: number;
   maxOutputTokens: number;
-  /** Optional explicitly configured command to verify a completed task. */
-  verificationCommand?: string;
   editPolicy: EditPolicy;
   commandPolicy: CommandPolicy;
   allowDangerousCommands: boolean;
@@ -309,8 +297,6 @@ export interface HarnessConfig {
   stream: boolean;
   /** Show the model's reasoning stream, when the backend provides one. */
   showThinking: boolean;
-  /** Maximum streamed thinking characters per attempt; 0 disables this budget. */
-  thinkingMaxChars: number;
   /** Instructions loaded from agent.md/AGENTS.md files. */
   agentFiles: AgentFilesConfig;
   /** Which factual context is included in the system message. */
@@ -325,7 +311,6 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   provider: 'openai',
   model: 'gpt-4o-mini',
   baseUrl: 'https://api.openai.com/v1',
-  maxSteps: 40,
   temperature: 0.2,
   maxOutputTokens: 2048,
   editPolicy: 'ask',
@@ -337,7 +322,6 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   lineEndings: 'auto',
   stream: true,
   showThinking: true,
-  thinkingMaxChars: 12_000,
   agentFiles: {
     enabled: true,
     names: ['AGENTS.md', 'agent.md', 'agents.md', 'copilot-instructions.md'],
@@ -370,8 +354,6 @@ export const DEFAULT_CONFIG: HarnessConfig = {
     threshold: 0.75,
     contextWindowTokens: 128_000,
     keepLastMessages: 10,
-    method: 'llm',
-    verbatimFallback: true,
   },
 };
 
@@ -430,8 +412,6 @@ export function resolveConfig(partial: Partial<HarnessConfig> | undefined): Harn
       threshold: partial.compaction.threshold ?? DEFAULT_CONFIG.compaction.threshold,
       contextWindowTokens: partial.compaction.contextWindowTokens ?? DEFAULT_CONFIG.compaction.contextWindowTokens,
       keepLastMessages: partial.compaction.keepLastMessages ?? DEFAULT_CONFIG.compaction.keepLastMessages,
-      method: partial.compaction.method ?? DEFAULT_CONFIG.compaction.method,
-      verbatimFallback: partial.compaction.verbatimFallback ?? DEFAULT_CONFIG.compaction.verbatimFallback,
       summaryModel: partial.compaction.summaryModel ?? DEFAULT_CONFIG.compaction.summaryModel,
     };
   }

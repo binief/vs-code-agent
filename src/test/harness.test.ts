@@ -440,11 +440,12 @@ test('parseToolArguments tolerates fenced or padded JSON', () => {
 
 test('agent loop runs a full task with the mock provider', async () => {
   const root = makeTempWorkspace({ 'README.md': '# demo\n' });
+  fs.writeFileSync(path.join(root, 'agent.md'), '---\ntools: [read, search, edit, execute]\n---\n');
   const host = new FakeHost(root);
   const events: string[] = [];
   const session = new HarnessSession({
     host,
-    config: { ...DEFAULT_CONFIG, provider: 'mock', maxSteps: 8 },
+    config: { ...DEFAULT_CONFIG, provider: 'mock' },
     provider: new MockPlannerProvider(),
   });
 
@@ -465,10 +466,11 @@ test('agent loop runs a full task with the mock provider', async () => {
 
 test('agent surfaces a rejected edit to the model instead of failing the task', async () => {
   const root = makeTempWorkspace();
+  fs.writeFileSync(path.join(root, 'agent.md'), '---\ntools: [read, search, edit, execute]\n---\n');
   const host = new FakeHost(root, { decision: 'reject' });
   const session = new HarnessSession({
     host,
-    config: { ...DEFAULT_CONFIG, provider: 'mock', maxSteps: 8 },
+    config: { ...DEFAULT_CONFIG, provider: 'mock' },
     provider: new MockPlannerProvider(),
   });
 
@@ -480,10 +482,11 @@ test('agent surfaces a rejected edit to the model instead of failing the task', 
 
 test('a rejected edit is not counted as a file change', async () => {
   const root = makeTempWorkspace();
+  fs.writeFileSync(path.join(root, 'agent.md'), '---\ntools: [read, search, edit, execute]\n---\n');
   const host = new FakeHost(root, { decision: 'reject' });
   const session = new HarnessSession({
     host,
-    config: { ...DEFAULT_CONFIG, provider: 'mock', maxSteps: 8 },
+    config: { ...DEFAULT_CONFIG, provider: 'mock' },
     provider: new MockPlannerProvider(),
   });
 
@@ -496,26 +499,13 @@ test('a rejected edit is not counted as a file change', async () => {
   assert.deepEqual(revert.deleted, []);
 });
 
-test('agent stops at the step budget and still summarises', async () => {
-  const root = makeTempWorkspace();
-  const host = new FakeHost(root);
-  const session = new HarnessSession({
-    host,
-    config: { ...DEFAULT_CONFIG, provider: 'mock', maxSteps: 1 },
-    provider: new MockPlannerProvider(),
-  });
-
-  const result = await session.runTask('create a python script called budget.py', () => {});
-  assert.equal(result.outcome, 'max-steps');
-  assert.equal(result.steps, 1);
-});
-
 test('editPolicy=auto applies edits without prompting', async () => {
   const root = makeTempWorkspace();
+  fs.writeFileSync(path.join(root, 'agent.md'), '---\ntools: [read, search, edit, execute]\n---\n');
   const host = new FakeHost(root, { decision: 'reject' });
   const session = new HarnessSession({
     host,
-    config: { ...DEFAULT_CONFIG, provider: 'mock', editPolicy: 'auto', maxSteps: 8, context: { ...DEFAULT_CONFIG.context, diagnostics: false } },
+    config: { ...DEFAULT_CONFIG, provider: 'mock', editPolicy: 'auto', context: { ...DEFAULT_CONFIG.context, diagnostics: false } },
     provider: new MockPlannerProvider(),
   });
 
@@ -573,7 +563,7 @@ test('a pinned agent selection decides which instructions reach the model', asyn
   const provider = new CapturingProvider();
   const session = new HarnessSession({
     host: new FakeHost(root),
-    config: { ...DEFAULT_CONFIG, provider: 'mock', maxSteps: 2 },
+    config: { ...DEFAULT_CONFIG, provider: 'mock' },
     provider,
     agentSelection: ['agent.md'],
   });

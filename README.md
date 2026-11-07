@@ -1,13 +1,13 @@
 # Coding Harness — tools for coding, in VS Code
 
-Coding Harness is a **tool harness**, not a packaged assistant. It gives a model a small, sandboxed
+Coding Harness is a **tool harness**, not a packaged assistant. It can give a model a workspace-scoped
 set of coding tools — create, read, search and edit files, run shell commands, query the editor's
 diagnostics and call MCP servers — plus a factual snapshot of the environment, the workspace and the
 files you have open.
 
 General agent instructions come from files in your workspace (or an optional user-level file) —
 `AGENTS.md`, `agent.md`, or any Markdown file you put in `.agents/` (for example `code-review.md`,
-`test.md`). The harness also sends tool schemas and operational messages for recovery, loop handling,
+`test.md`). The harness also sends tool schemas and operational messages for recovery
 and LLM summarization; it is not literally free of all model-facing prompts. Edit your agent files
 to define the task behavior.
 
@@ -70,6 +70,9 @@ backend exposes a reasoning stream it renders in its own **thinking lane** above
 3. **Write `agent.md`** (or `AGENTS.md`) in the workspace root. This is where the instructions live:
 
    ```markdown
+   ---
+   tools: [read, search, edit, execute]
+   ---
    # Project instructions
 
    - Use TypeScript and the existing `pnpm` scripts.
@@ -87,8 +90,9 @@ backend exposes a reasoning stream it renders in its own **thinking lane** above
 ## Agent instruction files
 
 Agent files define project-specific instructions and optional tool permissions. If none is found,
-the panel shows an `agents: none` chip and the model receives context, tools, and any operational
-recovery messages, but no project-specific agent instructions.
+the panel shows an `agents: none` chip and the model receives context and operational
+recovery messages, but no project-specific agent instructions or tools. Add YAML tool permissions
+to a selected agent file to enable tools.
 
 ### Discovery rules
 
@@ -223,19 +227,17 @@ Review the code and report findings without modifying files.
 ```
 
 The list is enforced both when presenting tools to the model and when executing its calls. Available
-groups are `read` (`list_files`, `read_file`, `get_diagnostics`, `open_file`, `search_conversation`,
-`read_conversation`), `search` (`list_files`, `search_text`, `search_conversation`), `edit` (`create_file`, `write_file`, `replace_in_file`, `delete_file`), `execute`
-(`run_command`), and `mcp` (all registered `mcp_` tools). You may instead name an exact registered
-tool or either conversation helper. Groups without any currently registered tools permit none. `tools: []` permits no tools.
+groups are `read` (`list_files`, `read_file`, `get_diagnostics`, `open_file`), `search` (`list_files`,
+`search_text`), `edit` (`create_file`, `write_file`, `replace_in_file`, `delete_file`), `execute`
+(`run_command`), and `mcp` (all registered `mcp_` tools). You may instead name exact registered tools.
+`tools: []`, no selected files, or no selected file with a `tools` declaration permits no tools.
+In the panel, choosing “Use every discovered file” selects all discovered files.
 
-When several selected files declare `tools`, their permissions intersect, even for files whose
-instructions have a narrower directory scope: the policy applies to the whole task. A file with no
-`tools` declaration imposes no additional restriction, preserving older configurations; if none
-have one, all registered tools remain available. A temporary `read_tool_output` helper is exposed only
-when an allowed tool has produced a cached paged result; it can access only this task’s cached output
-and cannot invoke the original tool again. Agent files are reloaded for each task. Unknown or
-malformed tool metadata, truncated selected files, missing pins, and skipped files in the default
-all-files mode stop the task rather than silently grant access.
+When several selected files declare `tools`, their permissions intersect, even when their instruction
+scope is narrower: the policy applies to the whole task. A file without a declaration does not grant
+or further restrict tools. Agent files are reloaded for each task. Unknown or malformed metadata,
+truncated selected files, missing pins, and skipped files in default all-files mode stop the task rather
+than silently grant access.
 
 **Important:** This is a tool-name allowlist, not a sandbox. `execute` can run shell commands that
 modify files, and MCP servers may have arbitrary side effects, even when `edit` is absent. Existing
@@ -267,13 +269,13 @@ instructions:
 | `# Tools` | Tool names and descriptions, edit/command policies | `codingHarness.context.tools` |
 | `# Agent instructions` | The contents of every loaded agent file, labelled with path and scope | `codingHarness.agentFiles.enabled` |
 
-Tool JSON schemas are always sent to the provider as the API's `tools` parameter; the `# Tools`
+Permitted tool JSON schemas are sent to the provider as the API's `tools` parameter; the `# Tools`
 section is a readable catalogue on top of that. Turn individual context sections off when a model
 does not need them — for example `context.workspace: false` for a tiny local model with a small
 context window.
 
 The system message does not add a general persona or response format; the harness can also send
-operational recovery and loop-handling messages during a task and a dedicated summarization prompt
+operational recovery messages during a task and a dedicated summarization prompt
 when compacting history.
 
 ## Tools the agent can use
@@ -296,12 +298,8 @@ when compacting history.
 `start_column` (columns count Unicode code points). The per-file `codingHarness.maxFileBytes` limit
 still applies even to a slice. Files can change between page requests.
 
-Oversized results from other tools are paged to fit the approximate context budget. When possible,
-`read_tool_output` retrieves the rest by its `result_id` and `next_offset` (UTF-16 offsets), without
-re-executing the original tool. This helper is available only during that task; the in-memory cache is
-cleared at task end and is not restored with saved chats. The cache is limited to 16 MiB per task; if
-it cannot retain output, the panel and result explicitly warn that the remainder is unavailable.
-Tools can also apply their own output limits before the harness sees their result.
+Tools may limit or paginate their own output. Large tool results count toward the model's context;
+LLM compaction can summarize earlier complete tool groups without rerunning tools.
 
 Every write shows a diff — inline in the chat card and, on request, in VS Code's native diff editor.
 
@@ -475,7 +473,6 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.baseUrl` | `https://api.openai.com/v1` | Endpoint for OpenAI-compatible APIs |
 | `codingHarness.model` | `gpt-4o-mini` | Model id |
 | `codingHarness.apiKey` | `""` | Prefer the Set API Key command; env vars also work |
-| `codingHarness.maxSteps` | `40` | Hard ceiling on model turns per task (the last turn is forced to summarise) |
 | `codingHarness.temperature` / `maxOutputTokens` | `0.2` / `2048` | Sampling and response cap |
 | `codingHarness.editPolicy` | `ask` | `ask` \| `auto` for file writes and deletes |
 | `codingHarness.commandPolicy` | `auto-safe` | `auto-safe` \| `ask` \| `auto-all` \| `deny-all` |
@@ -486,7 +483,6 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.lineEndings` | `auto` | Preserve existing style; `lf` \| `crlf` \| `cr` \| `native` override it |
 | `codingHarness.stream` | `true` | Render output token by token; off = one response per turn |
 | `codingHarness.showThinking` | `true` | Show the model's reasoning lane when the backend provides one |
-| `codingHarness.thinkingMaxChars` | `12000` | Interrupt a streamed reasoning attempt at this character budget; `0` disables the budget (loop detection remains active) |
 | `codingHarness.chat.saveEnabled` | `true` | Automatically save and restore the current workspace chat |
 | `codingHarness.chat.saveFolder` | `""` | Folder for automatic saves; empty uses VS Code workspace storage |
 | `codingHarness.agentFiles.enabled` | `true` | Load agent instructions and tool permissions |
@@ -509,30 +505,12 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.mcp.timeoutMs` | `10000` | Default timeout for MCP tool calls |
 | `codingHarness.mcp.loadFromFiles` | `true` | Read servers from workspace config files |
 | `codingHarness.mcp.configFiles` | `[".vscode/mcp.json",".mcp.json","mcp.json"]` | Files scanned for servers |
-| `codingHarness.verification.command` | `""` | Optional user-level command to run once before marking a task complete; normal command policy and approval apply |
 | `codingHarness.compaction.enabled` | `true` | Enable conversation compaction |
 | `codingHarness.compaction.autoCompact` | `true` | Compact automatically near the context limit |
 | `codingHarness.compaction.threshold` | `0.75` | Utilisation target; auto-compaction starts earlier to reserve tool-result headroom |
 | `codingHarness.compaction.contextWindowTokens` | `128000` | Context window estimate for the meter |
 | `codingHarness.compaction.keepLastMessages` | `10` | Preferred recent messages to keep; may be reduced under context pressure |
-| `codingHarness.compaction.method` | `"llm"` | Use `"verbatim"` to compact locally without any summary-model calls |
-| `codingHarness.compaction.verbatimFallback` | `true` | Use local verbatim excerpts if LLM compaction fails; set false to retain active history instead |
 | `codingHarness.compaction.summaryModel` | `""` | Optional model on the current provider for LLM summaries; empty uses the active model |
-
-### Local model reliability benchmark
-
-A small reproducible smoke benchmark runs synthetic find-and-edit tasks in fresh temporary directories:
-
-```bash
-npm run benchmark:local -- --model YOUR_MODEL_ID --base-url http://127.0.0.1:8080/v1 --runs 2
-```
-
-It accepts only a loopback OpenAI-compatible endpoint and prints JSON with each case's pass/fail, duration,
-steps, tool failures and loop warnings. A case passes only if its specific observable result matches;
-this is a narrow baseline, not a guarantee of correctness or a comparison across all tasks. The fixture
-registry exposes bounded workspace file tools, not shell commands or MCP; the model still modifies files
-in the temporary fixtures, which are removed afterward. Use `--timeout-ms` to set a per-task deadline.
-Do not use your real workspace as a benchmark fixture. Results vary by model and server configuration.
 
 ## Commands
 
@@ -563,12 +541,11 @@ Do not use your real workspace as a benchmark fixture. Results vary by model and
    16/second); the activity strip switches to the running tool with a live elapsed timer.
 6. Each requested tool call is parsed (tolerant JSON), executed with a `ToolContext`, and its result
    is appended to the transcript. Mutating tools call `ctx.approval()` first.
-7. Repeat until the model stops calling tools or `maxSteps` is hit — on the last turn tools are
-   withheld and the model is told that the step budget is exhausted.
+7. Repeat until the model finishes, the user cancels, or an unrecoverable error occurs. There is no fixed step limit.
 8. Events stream to the panel; `done` reports the outcome and the files changed.
 
-A run is only ended by the model finishing, by the user cancelling, by the step ceiling, or by an
-error the provider will not accept twice. Everything that used to stop a task early is handled:
+A run ends when the model finishes, the user cancels, or an unrecoverable error occurs. There is no
+fixed step limit or automatic loop/thinking interruption; long runs can consume significant time and tokens.
 
 - **Transient provider failures are retried.** A 429, 5xx or dropped connection backs off (honouring
   `Retry-After`) and tries again up to three times, with a notice in the panel; only definitive
@@ -586,58 +563,14 @@ error the provider will not accept twice. Everything that used to stop a task ea
   remain attached. Large history is split
   into bounded requests and summaries may be summarized again. Image attachments may require separate
   vision requests. Summary calls cost time and tokens, may lose detail, and are capped at 64 requests
-  per compaction; a failed or cancelled LLM summary does not itself replace active history. The local
-  fallback described below may replace it after failure. The original messages are kept in the archive
-  field for optional retrieval, as described under Saved chats. The offline mock cannot produce LLM summaries. A rejected summary input can be split further and retried. If a
+  per compaction; a failed or cancelled LLM summary leaves active history unchanged. The original
+  messages remain in the saved chat as described under Saved chats. The offline mock cannot produce LLM summaries. A rejected summary input can be split further and retried. If a
   provider stops a summary at its output limit, the harness retries with progressively larger bounded
   output budgets (up to 8,192 tokens per request and at most three attempts); reasoning tokens may
   consume part of that budget. Retries can increase cost and still fail if the model cannot complete.
   Summary-model capacity is assumed to match `contextWindowTokens`; a smaller provider/model window,
   image overhead, output reservations, huge fixed instructions or inaccurate estimates can still
   prevent compaction.
-- **Selective older tool-output reduction.** Before either compaction method, the harness can shorten
-  large, older tool-result pages to their recorded beginning and end plus a `read_conversation` archive
-  message reference. It keeps tool calls/results paired, preserves the recent tail and current request,
-  and does not run tools again or modify the recorded originals. Only an exact, unambiguous match in the
-  current original archive qualifies; results with reused ambiguous IDs or unavailable originals are
-  left alone. This step is used only when the built-in archive reader is allowed by the selected agent
-  policy (not when a custom tool collides with its name). If it meets the estimated target, no summary
-  request is needed. Otherwise compaction may continue with an LLM summary or local fallback; if the
-  target still cannot be met, a warning says so. The omitted middle is no longer in active context and
-  might contain important errors or evidence: it is recoverable only from the recorded archive, subject
-  to retrieval permissions and successful saving/export. The archive is in memory during the session;
-  with saving disabled or failed it will not automatically survive restart. The recorded page itself may
-  already be clipped, and its expiring `read_tool_output` cache may no longer exist.
-- **Local verbatim fallback.** If the LLM cannot produce a valid, smaller summary (including output
-  truncation or provider errors), the default fallback keeps a recent tail where it fits, never splits
-  a tool-call group, and retains the current task request, all earlier images, and bounded word-for-word
-  excerpts from selected older user-role messages. It omits other older content from active model
-  context, including assistant and
-  tool messages; excerpts are **not** a comprehensive summary and may omit critical detail. The model
-  can use permitted conversation archive tools to retrieve previously recorded messages, but agent
-  tool policies may block retrieval. The existing `originalHistory` remains unchanged in the same saved
-  chat file; it is persistent
-  only when saving or exporting succeeds and may already be incomplete. No content lost before it was
-  recorded can be recovered. A visible warning identifies fallback use and whether the estimated target
-  was missed. Images, fixed instructions or the current request can still exceed the real window.
-  The fallback itself makes no provider calls, though earlier failed LLM attempts can incur charges.
-  Set `codingHarness.compaction.method` to `"verbatim"` to use the local method immediately without
-  making summary-model calls; normal task requests still use the configured model. Set
-  `codingHarness.compaction.verbatimFallback` to `false` to leave active history unchanged on LLM
-  failure when the method is `"llm"`. Cancellation never invokes the fallback, and if the fallback
-  cannot safely reduce history, any safe preliminary tool-output reduction can remain; otherwise the
-  original active context remains intact. Export the chat before starting a new conversation.
-- **Optional verification gate.** Set the user-level `codingHarness.verification.command` to an explicit
-  command such as `npm test` to run it once before a task is marked complete. It runs in the workspace
-  root through the built-in `run_command` tool, only when the selected agent policy permits it, and
-  uses the normal command safety/approval policy and timeout. Commands may have side effects and shell
-  edits are not necessarily checkpointed. Failure, rejection or an unavailable tool marks the result
-  unverified; it does not automatically retry or repair. If the task reaches its step limit, verification
-  is not run. This applies to every normally completed task while configured, including non-coding tasks.
-  A passing command is evidence only; it cannot prove the full task is correct.
-- **Tool results have headroom.** The harness estimates space for the current request, output and a
-  safety margin, and budgets tool results across each batch. Limits are approximate; especially large
-  batches, schema overhead or provider tokenization can still exceed the real context window.
 - **Context usage is an estimate.** Click `ctx ~` to see approximate system, conversation, image,
   tool-schema, framing, calibration and reserved-output contributions, and to preview the system
   context. The post-task tool estimate uses the last resolved agent policy; before a policy is
@@ -732,30 +665,11 @@ importing, exporting and session recreation carry the original history as well a
 A new conversation clears both from the live chat and, if automatic saving is enabled, overwrites the
 current saved chat; exports and files in former save folders are not deleted.
 
-The original archive is **not** automatically sent to the model. `search_conversation` defaults to
-literal search of the current conversation's recorded text and tool-call arguments. It also accepts
-`mode: "ranked"`: local BM25-style keyword scoring plus a strong boost for the exact query, useful for
-paths, symbols and errors. Results include message index, role, tool name where available, offset, score
-and a short surrounding excerpt. They are not semantic/vector search and ranking is **within each bounded
-scan window**, not globally across the entire archive. Ranked search normally skips exact messages
-already in active context; set `include_active: true` to include them. No history is silently inserted
-into a system prompt: the model must request the search and any subsequent read.
-
-Search scans at most 1,000 messages or 1,000,000 UTF-16 code units per call (plus message-serialization and active-context comparison
-overhead). Both modes return `next_start_index` and `next_start_offset` when more of the archive remains.
-Ranked mode also returns `next_result_offset` when more ranked matches are available in the current scan
-window: repeat the same query and start coordinates with that `result_offset`; to scan the next window,
-use the next start coordinates and reset the result offset. Results may change if the archive or active
-context changes between calls. `read_conversation` returns bounded pages of a selected message, using
-UTF-16 `next_offset` values. The tools do not open other conversations or files. Image attachments are
-stored in the archive but the text reader reports only their count. Results are historical, untrusted
-content, and the model must choose to use the tools. Agent-file permissions apply: the `search` group
-allows archive search; `read` allows search and reading; individual helper names may be listed explicitly.
-An exact `read_file` or `search_text` permission alone does not grant either archive helper. The final
-step has no tools, as with other tools.
+The original archive is **not** automatically sent to the model and no archive-search tools are
+provided. Export the chat to inspect its recorded original messages.
 
 The archive preserves the messages the harness recorded, **not** unseen data: outputs clipped inside a
-tool, unrequested pages, expired unpaged output, unsent reasoning or previously compacted-away messages
+tool, unrequested pages, unsent reasoning or previously compacted-away messages
 cannot be reconstructed. Display-only reasoning remains in the visible transcript (which is capped at
 400 items), not in `originalHistory`. Existing old-format chats load normally, but their available
 history may already be incomplete; the extension records that limitation and shows a warning. Older

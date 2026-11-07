@@ -246,7 +246,7 @@ export class HarnessController {
     status: 'idle',
     busy: false,
     step: 0,
-    maxSteps: DEFAULT_CONFIG.maxSteps,
+    maxSteps: 0,
     provider: 'openai',
     model: 'gpt-4o-mini',
     workspace: '',
@@ -789,10 +789,8 @@ export class HarnessController {
       model: c.get('model'),
       baseUrl: c.get('baseUrl'),
       apiKey: c.get('apiKey'),
-      maxSteps: c.get('maxSteps'),
       temperature: c.get('temperature'),
       maxOutputTokens: c.get('maxOutputTokens'),
-      verificationCommand: c.get<string>('verification.command')?.trim() || undefined,
       editPolicy: c.get('editPolicy'),
       commandPolicy: c.get('commandPolicy'),
       allowDangerousCommands: c.get('allowDangerousCommands'),
@@ -802,7 +800,6 @@ export class HarnessController {
       lineEndings: c.get('lineEndings'),
       stream: c.get('stream'),
       showThinking: c.get('showThinking'),
-      thinkingMaxChars: c.get('thinkingMaxChars'),
       agentFiles: {
         enabled: Boolean(agentEnabled),
         names: agentNames,
@@ -835,8 +832,6 @@ export class HarnessController {
         threshold: typeof threshold === 'number' ? threshold : 0.75,
         contextWindowTokens: typeof contextWindow === 'number' ? contextWindow : 128000,
         keepLastMessages: typeof keepLast === 'number' ? keepLast : 10,
-        method: c.get<unknown>('compaction.method') === 'verbatim' ? 'verbatim' : 'llm',
-        verbatimFallback: c.get<unknown>('compaction.verbatimFallback') === undefined || c.get<unknown>('compaction.verbatimFallback') === true,
         summaryModel: c.get<string>('compaction.summaryModel') || undefined,
       },
     });
@@ -971,7 +966,7 @@ export class HarnessController {
       workspace: root,
       editPolicy: config.editPolicy,
       commandPolicy: config.commandPolicy,
-      maxSteps: config.maxSteps,
+      maxSteps: 0,
       keyPresent: Boolean(apiKey),
       toolCount: this.session.toolNames.length,
       stream: config.stream,
@@ -1050,7 +1045,7 @@ export class HarnessController {
         workspace: this.workspaceRoot(),
         editPolicy: config.editPolicy,
         commandPolicy: config.commandPolicy,
-        maxSteps: config.maxSteps,
+        maxSteps: 0,
         keyPresent: Boolean(apiKey),
         stream: config.stream,
         showThinking: config.showThinking,
@@ -1222,24 +1217,12 @@ export class HarnessController {
         this.pushNotice('info', 'Compaction cancelled.');
         return;
       }
-      this.pushNotice('info', this.readConfig().compaction.method === 'verbatim' ? 'Checking context for local verbatim compaction.' : 'Checking context for LLM compaction; summarization may require an additional provider request.');
+      this.pushNotice('info', 'Checking context for LLM compaction; summarization may require an additional provider request.');
       const result = await session.compact();
       this.cumulativeUsage = session.usage;
       if (result.compacted) {
-        if (result.strategy === 'tool-output') {
-          const targetNote = result.targetMet === false ? ` Estimated target not met.${result.fallbackReason ? ` ${result.fallbackReason}` : ''}` : '';
-          const coverage = session.isOriginalConversationComplete ? '' : ' Earlier recorded history may already be incomplete.';
-          this.pushNotice('warn', `Shortened ${result.toolOutputsReduced} older recorded tool result(s), saving approximately ${result.originalTokens - result.newTokens} estimated tokens. Their middles are omitted from active context; recorded pages remain in the in-memory archive. They will not automatically survive restart if saving is disabled or fails; later retrieval also depends on tool permissions.${coverage}${targetNote}`);
-        } else if (result.strategy === 'verbatim') {
-          const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
-          const coverage = session.isOriginalConversationComplete ? '' : ' Earlier recorded history may already be incomplete.';
-          const method = result.fallbackReason ? `LLM compaction failed: ${result.fallbackReason} Used local verbatim fallback` : 'Used local verbatim compaction';
-          this.pushNotice('warn', `${method}; saved approximately ${result.originalTokens - result.newTokens} tokens. Only selected user-role excerpts and images remain from older messages; other details are omitted from active context. Recorded originals remain in the conversation archive, subject to saving and tool permissions.${coverage}${targetNote}`);
-        } else {
-          const reductionNote = result.toolOutputsReduced ? ` ${result.toolOutputsReduced} older recorded tool result(s) were shortened before summarization; omitted details remain only in the archive, subject to saving and permissions.` : '';
-          const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
-          this.pushNotice(result.toolOutputsReduced || result.targetMet === false ? 'warn' : 'info', `Compacted conversation: removed ${result.removed} old messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${reductionNote}${targetNote}`);
-        }
+        const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
+        this.pushNotice(result.targetMet === false ? 'warn' : 'info', `Compacted conversation: removed ${result.removed} old messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${targetNote}`);
         this.log.info(`manual ${result.strategy ?? 'LLM'} compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens, removed ${result.removed}`);
         const { tokens, window, percent, breakdown } = session.getContextUsage();
         this.state = { ...this.state, contextTokens: tokens, contextWindow: window, contextPercent: percent, contextBreakdown: breakdown, cumulativeUsage: this.cumulativeUsage };
@@ -1675,7 +1658,12 @@ export class HarnessController {
       return;
     }
     const template = [
+      '---',
+      'tools: []',
+      '---',
       '# Agent instructions',
+      '',
+      '<!-- No tools are enabled by default. Add read, search, edit, execute, mcp, or exact tool names above. -->',
       '',
       '<!-- Everything below is sent with every task when this file is selected. -->',
       '<!-- Add project conventions, commands to run, style rules and things to avoid. -->',
@@ -1699,7 +1687,7 @@ export class HarnessController {
     // without touching settings; mention it where the user sees the template.
     this.pushNotice(
       'info',
-      'Created agent.md. Any .md file under .agents/ is also loaded as instructions (code-review.md, test.md, …).',
+      'Created agent.md with no tools enabled. Edit its tools list to grant access; .md files under .agents/ are also loaded as instructions.',
     );
   }
 

@@ -15,6 +15,7 @@ import { after, test } from 'node:test';
  */
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-controller-'));
+fs.writeFileSync(path.join(root, 'agent.md'), '---\ntools: [read, search, edit, execute]\n---\n');
 
 const settings: Record<string, unknown> = {
   provider: 'mock',

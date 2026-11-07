@@ -123,7 +123,7 @@ test('a cancelled tool batch leaves a transcript the provider still accepts', as
         }
       : { text: 'Follow-up done.', usage: {}, toolCalls: [] },
   );
-  const session = new HarnessSession({ host: new FakeHost(dir), config: config({ maxSteps: 6 }), provider });
+  const session = new HarnessSession({ host: new FakeHost(dir), config: config({  }), provider });
 
   // Cancel as soon as the first of the three writes lands.
   const first = await session.runTask('write three files', (event: HarnessEvent) => {
@@ -197,7 +197,7 @@ test('a follow-up task after mid-task compaction sends a well-formed prompt', as
   };
 
   const compaction = { ...DEFAULT_CONFIG.compaction, threshold: 0.0001, contextWindowTokens: 500, keepLastMessages: 4 };
-  const session = new HarnessSession({ host: new FakeHost(dir), config: config({ maxSteps: 8, compaction }), provider });
+  const session = new HarnessSession({ host: new FakeHost(dir), config: config({ compaction }), provider });
 
   await session.runTask('first task', () => {});
   seen.length = 0;
@@ -227,7 +227,7 @@ test('a transient provider failure is retried and the task still finishes', asyn
     },
   };
 
-  const session = new HarnessSession({ host: new FakeHost(dir), config: config({ maxSteps: 4 }), provider });
+  const session = new HarnessSession({ host: new FakeHost(dir), config: config({  }), provider });
   const result = await session.runTask('do the thing', (event) => events.push(event));
 
   assert.equal(attempts, 2, 'the 429 must be retried once');
@@ -252,7 +252,7 @@ test('a permanent provider failure still ends the run with the provider message'
     },
   };
 
-  const session = new HarnessSession({ host: new FakeHost(dir), config: config({ maxSteps: 4 }), provider });
+  const session = new HarnessSession({ host: new FakeHost(dir), config: config({  }), provider });
   const result = await session.runTask('do the thing', () => {});
 
   assert.equal(attempts, 1, 'a bad request must not be retried');
@@ -279,7 +279,7 @@ test('a stream that dies mid-answer is retried and the half-rendered bubble is c
     },
   };
 
-  const session = new HarnessSession({ host: new FakeHost(dir), config: config({ maxSteps: 4 }), provider });
+  const session = new HarnessSession({ host: new FakeHost(dir), config: config({  }), provider });
   const result = await session.runTask('answer me', (event) => events.push(event));
 
   assert.equal(attempts, 2);
@@ -326,7 +326,7 @@ test('a reply cut off by the output limit is continued, not treated as the answe
     },
   };
 
-  const session = new HarnessSession({ host: new FakeHost(dir), config: config({ maxSteps: 4 }), provider });
+  const session = new HarnessSession({ host: new FakeHost(dir), config: config({  }), provider });
   const result = await session.runTask('write the function', () => {});
 
   assert.equal(turn, 2, 'the run must ask the model to continue instead of stopping');
@@ -337,6 +337,7 @@ test('a reply cut off by the output limit is continued, not treated as the answe
 
 test('an in-flight snapshot keeps completed tool groups when a later task reuses their id', async () => {
   const dir = makeWorkspace();
+  fs.writeFileSync(path.join(dir, 'agent.md'), '---\ntools: [test_tool]\n---\n');
   let entered!: () => void;
   let release!: () => void;
   const started = new Promise<void>((resolve) => { entered = resolve; });
@@ -376,6 +377,7 @@ test('an in-flight snapshot keeps completed tool groups when a later task reuses
 
 test('malformed builtin tool arguments return actionable errors without executing or changing files', async () => {
   const dir = makeWorkspace();
+  fs.writeFileSync(path.join(dir, 'agent.md'), '---\ntools: [edit]\n---\n');
   const provider = new StrictProvider((turn) => turn === 1 ? {
     text: '', toolCalls: [{ id: 'bad', name: 'write_file', arguments: '{"path":42,"content":"x"}' }],
   } : { text: 'done', toolCalls: [] });
@@ -384,5 +386,5 @@ test('malformed builtin tool arguments return actionable errors without executin
   assert.equal(result.outcome, 'complete');
   const tool = session.transcript.find((m) => m.role === 'tool' && m.toolCallId === 'bad');
   assert.match(tool?.content ?? '', /field "path" must be string.*No tool was run/);
-  assert.deepEqual(fs.readdirSync(dir), []);
+  assert.deepEqual(fs.readdirSync(dir), ['agent.md']);
 });
