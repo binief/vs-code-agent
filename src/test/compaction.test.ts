@@ -118,6 +118,8 @@ test('automatic LLM compaction can summarize the current task and keep a valid t
     assert.ok(events.some((e) => e.type === 'notice' && e.message.includes('LLM compacted')));
     assert.ok(events.some((e) => e.type === 'compaction-progress' && e.progress?.phase === 'waiting'));
     assert.ok(events.some((e) => e.type === 'compaction-progress' && e.progress === null));
+    assert.ok(events.some((e) => e.type === 'compaction-trace' && e.trace.kind === 'request'));
+    assert.ok(events.some((e) => e.type === 'compaction-trace' && e.trace.kind === 'complete'));
     assert.ok((session.usage.inputTokens ?? 0) >= 200, 'summary usage is counted');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
@@ -807,4 +809,90 @@ test('automatic local fallback warns and preserves the original conversation', a
     assert.deepEqual(session.originalConversationSnapshot.slice(0, before.length), before);
     assert.ok(session.transcript.some((message) => message.content.includes('Local fallback: incomplete excerpts')));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('compaction trace exposes logical request and streamed response without attachment data or credentials', async () => {
+  const events: import('../core/types').CompactionTraceEvent[] = [];
+  const history = longHistory();
+  history[0].images = [{ mediaType: 'image/png', name: 'evidence.png', data: 'PRIVATE_IMAGE_BYTES' }];
+  let requestSeen: ChatRequest | undefined;
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+    requestSeen = req;
+    req.onThinking?.('Reasoning fragment');
+    req.onDelta?.('Partial summary');
+    return { text: 'Partial summary', thinking: 'Reasoning fragment', finishReason: 'stop', toolCalls: [], usage: { inputTokens: 10, outputTokens: 4 } };
+  } };
+  const c = config({ stream: true, showThinking: true, apiKey: 'PRIVATE_API_KEY', compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2, summaryModel: 'summary-model' } });
+  const { result } = await compactHistory(history, c, provider, undefined, { onTrace: (event) => events.push(event) });
+  assert.equal(result.compacted, true);
+  assert.equal(events[0].kind, 'begin');
+  const sent = events.find((event): event is Extract<typeof event, { kind: 'request' }> => event.kind === 'request');
+  assert.ok(sent);
+  assert.equal(sent.model, 'summary-model');
+  assert.equal(sent.prompt, requestSeen?.messages[0].content);
+  assert.equal(sent.maxTokens, requestSeen?.maxTokens);
+  assert.deepEqual(sent.images, [{ name: 'evidence.png', mediaType: 'image/png' }]);
+  assert.ok(events.some((event) => event.kind === 'delta' && event.channel === 'response' && event.text === 'Partial summary'));
+  assert.ok(events.some((event) => event.kind === 'delta' && event.channel === 'reasoning' && event.text === 'Reasoning fragment'));
+  assert.ok(events.some((event) => event.kind === 'complete' && event.finishReason === 'stop' && event.text === 'Partial summary'));
+  assert.doesNotMatch(JSON.stringify(events), /PRIVATE_IMAGE_BYTES|PRIVATE_API_KEY/);
+});
+
+test('buffered summaries appear after completion and hidden reasoning stays hidden', async () => {
+  const events: import('../core/types').CompactionTraceEvent[] = [];
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+    assert.equal(req.onDelta, undefined);
+    return { text: 'Buffered summary.', thinking: 'private reasoning', toolCalls: [] };
+  } };
+  const c = config({ stream: false, showThinking: false, compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } });
+  await compactHistory(longHistory(), c, provider, undefined, { onTrace: (event) => events.push(event) });
+  const completed = events.find((event): event is Extract<typeof event, { kind: 'complete' }> => event.kind === 'complete');
+  assert.equal(completed?.text, 'Buffered summary.');
+  assert.equal(completed?.reasoning, undefined);
+  assert.doesNotMatch(JSON.stringify(events), /private reasoning/);
+});
+
+test('compaction trace marks failures and cancellation without exposing provider error details', async () => {
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } });
+  for (const cancelled of [false, true]) {
+    const events: import('../core/types').CompactionTraceEvent[] = [];
+    const abort = new AbortController();
+    const provider: Provider = { id: 'test', label: 'test', async chat() {
+      if (cancelled) abort.abort();
+      throw new Error('secret provider error');
+    } };
+    const task = compactHistory(longHistory(), c, provider, abort.signal, { onTrace: (event) => events.push(event) });
+    if (cancelled) await assert.rejects(task, /cancelled/i); else await task;
+    assert.ok(events.some((event) => event.kind === 'failed' && event.cancelled === cancelled));
+    assert.doesNotMatch(JSON.stringify(events), /secret provider error/);
+  }
+});
+
+test('streaming compaction trace respects the showThinking setting', async () => {
+  const events: import('../core/types').CompactionTraceEvent[] = [];
+  const c = config({ stream: true, showThinking: false, compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } });
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+    req.onThinking?.('HIDDEN_PRIVATE_REASONING');
+    req.onDelta?.('Visible summary');
+    return { text: 'Visible summary', thinking: 'HIDDEN_PRIVATE_REASONING', toolCalls: [] };
+  } };
+  await compactHistory(longHistory(), c, provider, undefined, { onTrace: (event) => events.push(event) });
+  assert.ok(events.some((event) => event.kind === 'delta' && event.channel === 'response'));
+  assert.doesNotMatch(JSON.stringify(events), /HIDDEN_PRIVATE_REASONING/);
+});
+
+test('compaction trace retains truncated attempts and exposes subsequent retries', async () => {
+  const events: import('../core/types').CompactionTraceEvent[] = [];
+  let count = 0;
+  const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+    count++;
+    req.onDelta?.(count === 1 ? 'Partial summary' : 'Complete summary');
+    return { text: count === 1 ? 'Partial summary' : 'Complete summary', toolCalls: [], finishReason: count === 1 ? 'length' : 'stop' };
+  } };
+  const c = config({ stream: true, compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } });
+  const { result } = await compactHistory(longHistory(), c, provider, undefined, { onTrace: (event) => events.push(event) });
+  assert.equal(result.compacted, true);
+  assert.deepEqual(events.filter((event) => event.kind === 'request').map((event) => event.attempt), [1, 2]);
+  assert.ok(events.some((event) => event.kind === 'complete' && event.request === 1 && event.finishReason === 'length' && event.text === 'Partial summary'));
+  assert.ok(events.some((event) => event.kind === 'complete' && event.request === 2 && event.finishReason === 'stop' && event.text === 'Complete summary'));
 });

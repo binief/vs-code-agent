@@ -46,6 +46,15 @@
   const activityText = document.getElementById('activity-text');
   const activityDetail = document.getElementById('activity-detail');
   const activityElapsed = document.getElementById('activity-elapsed');
+  const compactionTraceBox = document.getElementById('compaction-trace');
+  const compactionTraceRequest = document.getElementById('compaction-trace-request');
+  const compactionTraceMeta = document.getElementById('compaction-trace-meta');
+  const compactionTracePrompt = document.getElementById('compaction-trace-prompt');
+  const compactionTraceResponse = document.getElementById('compaction-trace-response');
+  const compactionTraceReasoning = document.getElementById('compaction-trace-reasoning');
+  const compactionTraceReasoningWrap = document.getElementById('compaction-trace-reasoning-wrap');
+  let compactionTraceEntries = [];
+  let compactionTraceDropped = 0;
   const btnJump = document.getElementById('jump-latest');
   const compactBanner = document.getElementById('compact-banner');
   const compactText = document.getElementById('compact-text');
@@ -589,10 +598,73 @@
   }
 
   function tickActivity() {
+    if (compactionTraceBox.open && !compactionTraceBox.hidden) renderCompactionTrace();
     if (!activity || !activity.status || activity.status === 'idle') return;
     const seconds = Math.max(0, Math.round((Date.now() - (activity.startedAt || Date.now())) / 1000));
     activityElapsed.textContent = seconds >= 1 ? seconds + 's' : '';
   }
+
+  function setTraceText(node, value) {
+    if (node.textContent === value) return;
+    if (selectionIntersects(node)) { node.dataset.pendingTrace = '1'; return; }
+    node.textContent = value;
+    delete node.dataset.pendingTrace;
+  }
+
+  function renderCompactionTrace() {
+    const entry = compactionTraceEntries.find((item) => String(item.request) === compactionTraceRequest.value);
+    if (!entry) return;
+    const usage = entry.usage ? ' · usage: ' + (entry.usage.inputTokens ?? '?') + ' input / ' + (entry.usage.outputTokens ?? '?') + ' output tokens' : '';
+    const imageNames = (entry.images || []).map((image) => (image.name || 'unnamed') + ' [' + image.mediaType + ']').join(', ');
+    const images = entry.imageCount ? ' · images: ' + entry.imageCount + ' (data omitted' + (imageNames ? '; ' + imageNames : '') + (entry.imageCount > (entry.images || []).length ? '; additional names omitted' : '') + ')' : '';
+    const finish = entry.finishReason ? ' · finish: ' + entry.finishReason : '';
+    const incomplete = entry.streamComplete === false ? ' · stream ended without completion marker' : '';
+    const dropped = compactionTraceDropped ? ' · ' + compactionTraceDropped + ' older requests omitted' : '';
+    const elapsed = entry.startedAt ? ' · ' + Math.max(0, Math.round(((entry.finishedAt || Date.now()) - entry.startedAt) / 1000)) + 's' : '';
+    compactionTraceMeta.textContent = (entry.source === 'subagent' ? 'Subagent · ' : 'Main agent · ') + 'Model: ' + entry.model + ' · max output: ' + entry.maxTokens +
+      ' · temperature: 0 · tools: none · ' + (entry.streaming ? 'stream requested' : 'buffered request') +
+      ' · ' + entry.status + elapsed + finish + incomplete + usage + images + dropped;
+    setTraceText(compactionTracePrompt, entry.prompt);
+    setTraceText(compactionTraceResponse, (entry.response || (['waiting', 'reasoning', 'receiving'].includes(entry.status) ? '(No response text received yet.)' : '(No response text.)')) +
+      (entry.toolCalls ? '\n\nUnexpected tool calls (up to 10; arguments may be truncated):\n' + entry.toolCalls : '') +
+      (entry.status === 'failed' ? '\n\nProvider request failed or was rejected. A later request may retry; check the conversation warning if compaction fails.' : '') +
+      (entry.status === 'cancelled' ? '\n\nRequest cancelled.' : ''));
+    if (!selectionIntersects(compactionTraceReasoning)) compactionTraceReasoningWrap.hidden = !entry.reasoning;
+    setTraceText(compactionTraceReasoning, entry.reasoning || '');
+  }
+
+  function applyCompactionTrace(trace) {
+    const selected = compactionTraceRequest.value;
+    const last = compactionTraceEntries.length ? String(compactionTraceEntries[compactionTraceEntries.length - 1].request) : '';
+    const followLatest = !selected || selected === last;
+    compactionTraceEntries = trace && Array.isArray(trace.entries) ? trace.entries : [];
+    compactionTraceDropped = trace && trace.dropped || 0;
+    compactionTraceBox.hidden = compactionTraceEntries.length === 0;
+    compactionTraceRequest.replaceChildren();
+    for (const entry of compactionTraceEntries) {
+      const option = document.createElement('option');
+      option.value = String(entry.request);
+      option.textContent = 'Request ' + entry.request + ' · attempt ' + entry.attempt + ' · ' + entry.status;
+      compactionTraceRequest.appendChild(option);
+    }
+    if (!compactionTraceEntries.length) {
+      compactionTraceBox.open = false;
+      compactionTraceMeta.textContent = '';
+      compactionTracePrompt.textContent = '';
+      compactionTraceResponse.textContent = '';
+      compactionTraceReasoning.textContent = '';
+      for (const node of [compactionTracePrompt, compactionTraceResponse, compactionTraceReasoning]) delete node.dataset.pendingTrace;
+      compactionTraceReasoningWrap.hidden = true;
+      return;
+    }
+    const newest = String(compactionTraceEntries[compactionTraceEntries.length - 1].request);
+    compactionTraceRequest.value = !followLatest && compactionTraceEntries.some((item) => String(item.request) === selected) ? selected : newest;
+    renderCompactionTrace();
+  }
+  compactionTraceRequest.addEventListener('change', renderCompactionTrace);
+  document.getElementById('compaction-trace-clear').addEventListener('click', () => vscode.postMessage({ type: 'clear-compaction-trace' }));
+  document.getElementById('compaction-copy-prompt').addEventListener('click', (event) => copyText(compactionTracePrompt.textContent, event.currentTarget));
+  document.getElementById('compaction-copy-response').addEventListener('click', (event) => copyText(compactionTraceResponse.textContent, event.currentTarget));
 
   /**
    * Kept for compatibility with the layout tests. Streaming thinking has no
@@ -715,7 +787,9 @@
   function selectedTranscriptText() {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || !selection.anchorNode || !selection.focusNode) return '';
-    if (!stream.contains(selection.anchorNode) || !stream.contains(selection.focusNode)) return '';
+    const inStream = stream.contains(selection.anchorNode) && stream.contains(selection.focusNode);
+    const inTrace = compactionTraceBox.contains(selection.anchorNode) && compactionTraceBox.contains(selection.focusNode);
+    if (!inStream && !inTrace) return '';
     return selection.toString();
   }
 
@@ -1275,6 +1349,7 @@
   }
 
   document.addEventListener('selectionchange', () => {
+    if (compactionTraceBox.querySelector('[data-pending-trace="1"]')) renderCompactionTrace();
     for (const node of stream.querySelectorAll('[data-pending-render="1"]')) {
       const item = items.get(node.dataset.id);
       if (!item) continue;
@@ -2076,6 +2151,7 @@
         rebuild(message.items);
         applyState(message.state);
         applyActivity(message.activity);
+        applyCompactionTrace(message.compactionTrace);
         if (message.usage) {
           cumulativeUsage = message.usage;
           updateTokenChips();
@@ -2097,6 +2173,9 @@
         break;
       case 'activity':
         applyActivity(message.activity);
+        break;
+      case 'compaction-trace':
+        applyCompactionTrace(message.trace);
         break;
       case 'usage': {
         const usage = message.usage;

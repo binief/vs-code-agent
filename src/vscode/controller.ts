@@ -27,6 +27,7 @@ import {
   type AgentInstructionFile,
   type ChatMessage,
   type CompactionProgress,
+  type CompactionTraceEvent,
   type ImageAttachment,
   type HarnessConfig,
   type McpServerConfig,
@@ -91,6 +92,28 @@ export interface Activity {
   startedAt: number;
   /** Epoch ms when the whole task began. */
   taskStartedAt: number;
+}
+
+/** In-memory only: these diagnostics are never added to exported or saved chats. */
+export interface CompactionTraceEntry {
+  request: number;
+  attempt: number;
+  source: 'main' | 'subagent';
+  model: string;
+  maxTokens: number;
+  streaming: boolean;
+  prompt: string;
+  images: Array<{ name?: string; mediaType: string }>;
+  imageCount: number;
+  response: string;
+  reasoning: string;
+  status: 'waiting' | 'receiving' | 'reasoning' | 'finished' | 'failed' | 'cancelled';
+  startedAt: number;
+  finishedAt?: number;
+  finishReason?: string;
+  streamComplete?: boolean;
+  usage?: Usage;
+  toolCalls?: string;
 }
 
 export interface UiState {
@@ -234,6 +257,9 @@ export class HarnessController {
   private readonly listeners = new Set<(message: unknown) => void>();
   /** Throttled streaming buffers, keyed by assistant message id. */
   private readonly streams = new Map<string, { timer?: NodeJS.Timeout }>();
+  private compactionTrace: CompactionTraceEntry[] = [];
+  private compactionTraceDropped = 0;
+  private compactionTraceTimer?: NodeJS.Timeout;
   private activity: Activity = {
     status: 'idle',
     step: 0,
@@ -732,6 +758,7 @@ export class HarnessController {
     }
     this.approvals.cancelAll();
     this.approvals.forgetAll();
+    this.clearCompactionTrace();
     this.applyChatArchive(archive);
     this.post({ type: 'chat-replaced', items: this.items, state: this.state, activity: this.activity });
     this.scheduleChatSave();
@@ -1177,6 +1204,7 @@ export class HarnessController {
       return;
     }
     this.session?.reset();
+    this.clearCompactionTrace();
     this.restoredHistory = [];
     this.restoredOriginalHistory = [];
     this.restoredOriginalComplete = true;
@@ -1235,7 +1263,7 @@ export class HarnessController {
         return;
       }
       this.pushNotice('info', preferLocal ? 'Preparing local compaction excerpts.' : 'Checking context for LLM compaction; summarization may require an additional provider request.');
-      const result = await session.compact((progress) => this.showCompactionProgress(progress), preferLocal);
+      const result = await session.compact((progress) => this.showCompactionProgress(progress), preferLocal, (trace) => this.recordCompactionTrace(trace));
       this.cumulativeUsage = session.usage;
       if (result.compacted) {
         const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
@@ -1272,14 +1300,28 @@ export class HarnessController {
         (input.target !== 'user' && input.target !== 'workspace')) return fail('Invalid settings.');
     if (input.target === 'workspace' && !this.workspaceRoot()) return fail('Saving workspace settings needs an open folder.');
     const target = input.target === 'workspace' ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+    let attempted = false;
+    const reloadAdvice = 'Stop or finish any running task, then run Developer: Reload Window and try again. If it persists, reinstall Coding Harness in the active extension host and reload.';
     try {
       const settings = vscode.workspace.getConfiguration('codingHarness');
+      // These settings both have boolean defaults in the extension manifest.
+      // A saved value alone does not mean VS Code registered its schema. Check
+      // both before writing either so a stale registry cannot cause a partial save.
+      const keys = ['subagents.enabled', 'compaction.localFallback'];
+      const missing = keys.filter((key) => typeof settings.inspect<boolean>(key)?.defaultValue !== 'boolean');
+      if (missing.length) {
+        return fail(`VS Code has not registered ${missing.map((key) => `codingHarness.${key}`).join(', ')}. No settings were changed. ${reloadAdvice}`);
+      }
+      attempted = true;
       await settings.update('subagents.enabled', input.subagentsEnabled, target);
       await settings.update('compaction.localFallback', input.localFallback, target);
       await this.refreshState();
       this.post({ type: 'feature-settings-saved', ok: true, settings: this.getFeatureSettings() });
     } catch (err) {
-      fail(`Could not save all settings: ${(err as Error).message}. Some settings may have changed.`);
+      const message = (err as Error).message;
+      const state = attempted ? 'Some settings may have changed.' : 'No settings were changed.';
+      const guidance = /not a registered configuration/i.test(message) ? ` ${reloadAdvice}` : '';
+      fail(`Could not save all settings: ${message}. ${state}${guidance}`);
     }
   }
 
@@ -1846,6 +1888,9 @@ export class HarnessController {
       case 'compaction-progress':
         this.showCompactionProgress(event.progress);
         break;
+      case 'compaction-trace':
+        this.recordCompactionTrace(event.trace, event.source);
+        break;
       case 'subagent-progress':
         this.activity = { ...this.activity, status: 'subagent', tool: event.tool ?? null,
           detail: event.tool ? `Running ${event.tool}` : event.step ? `Read-only investigation · step ${event.step}` : 'Read-only investigation',
@@ -2151,6 +2196,65 @@ export class HarnessController {
       }
     }
     this.streams.clear();
+  }
+
+  getCompactionTrace(): { entries: CompactionTraceEntry[]; dropped: number } {
+    return { entries: this.compactionTrace.map((entry) => ({ ...entry, images: entry.images.map((image) => ({ ...image })),
+      usage: entry.usage ? { ...entry.usage } : undefined })), dropped: this.compactionTraceDropped };
+  }
+
+  clearCompactionTrace(): void {
+    if (this.compactionTraceTimer) clearTimeout(this.compactionTraceTimer);
+    this.compactionTraceTimer = undefined;
+    this.compactionTrace = [];
+    this.compactionTraceDropped = 0;
+    this.post({ type: 'compaction-trace', trace: this.getCompactionTrace() });
+  }
+
+  private postCompactionTrace(): void {
+    if (this.compactionTraceTimer) clearTimeout(this.compactionTraceTimer);
+    this.compactionTraceTimer = undefined;
+    this.post({ type: 'compaction-trace', trace: this.getCompactionTrace() });
+  }
+
+  private recordCompactionTrace(event: CompactionTraceEvent, source: 'main' | 'subagent' = 'main'): void {
+    const limit = 48_000;
+    const marker = '\n… [display truncated; model request/response may be longer]';
+    const cap = (text: string) => text.length > limit ? text.slice(0, limit) + marker : text;
+    if (event.kind === 'begin') { this.clearCompactionTrace(); return; }
+    if (event.kind === 'request') {
+      this.compactionTrace.push({ request: event.request, attempt: event.attempt, source, model: event.model.slice(0, 512),
+        maxTokens: event.maxTokens, streaming: event.streaming, prompt: cap(event.prompt),
+        images: event.images.slice(0, 40).map((image) => ({ name: image.name?.slice(0, 256), mediaType: image.mediaType.slice(0, 128) })),
+        imageCount: event.images.length, response: '', reasoning: '', status: 'waiting', startedAt: Date.now() });
+      if (this.compactionTrace.length > 10) { this.compactionTrace.shift(); this.compactionTraceDropped++; }
+      this.postCompactionTrace();
+      return;
+    }
+    const entry = this.compactionTrace.find((item) => item.request === event.request);
+    if (!entry) return; // User cleared diagnostics while a request was running.
+    if (event.kind === 'delta') {
+      entry.status = event.channel === 'response' ? 'receiving' : 'reasoning';
+      const field = event.channel === 'response' ? 'response' : 'reasoning';
+      if (!entry[field].endsWith(marker)) entry[field] = cap(entry[field] + event.text.slice(0, limit + 1));
+      if (!this.compactionTraceTimer) this.compactionTraceTimer = setTimeout(() => this.postCompactionTrace(), 200);
+    } else if (event.kind === 'complete') {
+      if (event.text || !entry.response) entry.response = cap(event.text);
+      if (event.reasoning) entry.reasoning = cap(event.reasoning);
+      entry.status = 'finished';
+      entry.finishedAt = Date.now();
+      entry.finishReason = event.finishReason;
+      entry.streamComplete = event.streamComplete;
+      entry.usage = event.usage;
+      if (event.toolCalls?.length) entry.toolCalls = cap(JSON.stringify(event.toolCalls.slice(0, 10).map((call) => ({
+        id: call.id.slice(0, 256), name: call.name.slice(0, 256), arguments: call.arguments.slice(0, 4000),
+      })), null, 2) + (event.toolCalls.length > 10 ? '\n[additional tool calls omitted]' : ''));
+      this.postCompactionTrace();
+    } else {
+      entry.status = event.cancelled ? 'cancelled' : 'failed';
+      entry.finishedAt = Date.now();
+      this.postCompactionTrace();
+    }
   }
 
   private showCompactionProgress(progress: CompactionProgress | null): void {

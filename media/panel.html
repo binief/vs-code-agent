@@ -108,6 +108,22 @@
     <span class="activity-elapsed" id="activity-elapsed"></span>
   </div>
 
+  <details class="compaction-trace" id="compaction-trace" hidden>
+    <summary>LLM compaction details — request and response</summary>
+    <p>May contain sensitive conversation text. This diagnostic view is held in memory, not saved or exported as a trace. A successful summary is still part of the saved conversation history. Request headers and image data are not shown. Displays are limited to the last 10 requests and may be truncated. Clearing during a request stops showing it until the next request.</p>
+    <div class="compaction-trace-actions">
+      <label for="compaction-trace-request">Request</label>
+      <select id="compaction-trace-request" aria-label="Compaction request"></select>
+      <button type="button" id="compaction-trace-clear">Clear</button>
+    </div>
+    <div id="compaction-trace-meta"></div>
+    <div class="compaction-trace-heading"><strong>Model input (logical request, not HTTP headers)</strong><button type="button" id="compaction-copy-prompt">Copy</button></div>
+    <pre id="compaction-trace-prompt"></pre>
+    <div class="compaction-trace-heading"><strong>Model response</strong><button type="button" id="compaction-copy-response">Copy</button></div>
+    <pre id="compaction-trace-response"></pre>
+    <div id="compaction-trace-reasoning-wrap" hidden><strong>Model reasoning</strong><pre id="compaction-trace-reasoning"></pre></div>
+  </details>
+
   <div class="stream-wrap">
     <button type="button" class="jump-latest" id="jump-latest" hidden>Jump to latest</button>
     <main class="stream" id="stream" role="log" aria-live="polite" aria-relevant="additions" aria-label="Conversation">
@@ -184,13 +200,13 @@
         <button type="button" id="feature-compact-local">Compact locally now…</button>
         <p>If an LLM request is stuck, press Stop first. Local compaction does not wait for the model and requires confirmation.</p>
         <button type="button" id="feature-all-settings">Open all VS Code settings</button>
+        <div class="modal-status feature-status" id="feature-status" aria-live="polite"></div>
       </div>
       <div class="modal-foot">
         <select id="feature-target" aria-label="Settings scope">
           <option value="workspace">Workspace settings</option>
           <option value="user">User settings</option>
         </select>
-        <span class="modal-status" id="feature-status" aria-live="polite"></span>
         <button type="button" class="primary" id="feature-save">Save</button>
       </div>
     </div>

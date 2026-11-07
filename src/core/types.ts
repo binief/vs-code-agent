@@ -464,9 +464,18 @@ export interface CompactionProgress {
   startedAt: number;
 }
 
+/** Ephemeral, model-facing compaction diagnostics. Never includes image bytes or request headers. */
+export type CompactionTraceEvent =
+  | { kind: 'begin' }
+  | { kind: 'request'; request: number; attempt: number; model: string; maxTokens: number; streaming: boolean; prompt: string; images: Array<{ name?: string; mediaType: string }> }
+  | { kind: 'delta'; request: number; channel: 'response' | 'reasoning'; text: string }
+  | { kind: 'complete'; request: number; text: string; reasoning?: string; finishReason?: string; streamComplete?: boolean; usage?: Usage; toolCalls?: ToolCall[] }
+  | { kind: 'failed'; request: number; cancelled: boolean };
+
 export type HarnessEvent =
   | { type: 'status'; status: 'idle' | 'thinking' | 'executing' | 'approval' }
   | { type: 'compaction-progress'; progress: CompactionProgress | null }
+  | { type: 'compaction-trace'; trace: CompactionTraceEvent; source?: 'main' | 'subagent' }
   | { type: 'subagent-progress'; step?: number; tool?: string }
   | { type: 'step'; index: number; maxSteps: number }
   | { type: 'assistant-delta'; id: string; text: string }

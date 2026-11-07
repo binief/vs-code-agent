@@ -640,8 +640,12 @@ test('OpenAI-compatible compaction streams progress and accepts a buffered fallb
     });
     const stub = stubFetch(response);
     const events: import('../core/types').CompactionProgress[] = [];
+    const traces: import('../core/types').CompactionTraceEvent[] = [];
     const provider = new OpenAiCompatibleProvider({ baseUrl: 'https://example.test/v1' });
-    const { result, newHistory } = await compactHistory(history, c, provider, undefined, { onProgress: (event) => events.push(event) });
+    const { result, newHistory } = await compactHistory(history, c, provider, undefined, { onProgress: (event) => events.push(event), onTrace: (event) => traces.push(event) });
+    assert.ok(traces.some((event) => event.kind === 'request' && event.prompt.includes('Preserve these verified details')));
+    assert.ok(traces.some((event) => event.kind === 'delta' && event.channel === 'response' && event.text === 'Verified summary.'));
+    assert.ok(traces.some((event) => event.kind === 'complete' && event.text === 'Verified summary.' && event.finishReason === 'stop'));
     assert.equal((stub.calls[0] as any).body.stream, true);
     assert.equal(result.compacted, true);
     assert.match(newHistory[0].content, /Verified summary/);

@@ -433,6 +433,35 @@ kbd {
   min-height: 0;
 }
 
+/* Ephemeral compaction request/response inspector. */
+.compaction-trace {
+  flex: 0 1 auto;
+  max-height: 45vh;
+  overflow: auto;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 11px;
+  color: var(--vscode-foreground);
+}
+
+.compaction-trace[hidden] { display: none; }
+.compaction-trace summary { cursor: pointer; font-weight: 600; }
+.compaction-trace p, #compaction-trace-meta { color: var(--muted); line-height: 1.4; }
+.compaction-trace-actions { display: flex; align-items: center; gap: 6px; }
+.compaction-trace-actions select { min-width: 0; flex: 1; }
+.compaction-trace-heading { display: flex; align-items: center; justify-content: space-between; gap: 5px; }
+.compaction-trace pre {
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  font-family: var(--mono);
+  background: var(--vscode-textCodeBlock-background, var(--vscode-editor-background));
+  border: 1px solid var(--border-soft);
+  padding: 6px;
+}
+
 /* ----------------------------------------------------------- empty state */
 
 .empty {
@@ -1626,6 +1655,16 @@ body.dragging .composer-box {
 
 .modal-status.error {
   color: var(--vscode-errorForeground, #f14c4c);
+}
+
+.feature-status {
+  font-size: 11px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.feature-status:empty {
+  display: none;
 }
 
 .modal input[type='text'],

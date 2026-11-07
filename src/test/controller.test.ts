@@ -44,7 +44,7 @@ class StubDisposable {
 const vscodeStub = {
   workspace: {
     workspaceFolders: [{ uri: { fsPath: root }, name: 'stub', index: 0 }],
-    getConfiguration: () => ({ get: (key: string) => settings[key], update: async (key: string, value: unknown, _target: number) => { settings[key] = value; } }),
+    getConfiguration: () => ({ get: (key: string) => settings[key], inspect: (key: string) => ({ key, defaultValue: false }), update: async (key: string, value: unknown, _target: number) => { settings[key] = value; } }),
     onDidChangeConfiguration: () => new StubDisposable(),
     onDidChangeWorkspaceFolders: () => new StubDisposable(),
     registerTextDocumentContentProvider: () => new StubDisposable(),
@@ -415,4 +415,97 @@ test('subagent progress is reflected in the live activity strip and clears on co
   (controller as any).handleEvent({ type: 'tool-end', id: 'd', name: 'delegate_task', ok: true, summary: 'subagent finished', detail: '', durationMs: 10 });
   assert.equal(controller.getActivity().status, 'thinking');
   assert.ok(messages.some((message) => message.type === 'activity' && message.activity.status === 'subagent'));
+});
+
+test('unregistered feature settings are detected before either value is written', async () => {
+  const originalConfig = vscodeStub.workspace.getConfiguration;
+  try {
+    for (const missing of ['subagents.enabled', 'compaction.localFallback']) {
+      let writes = 0;
+      (vscodeStub.workspace as any).getConfiguration = () => ({
+        get: (key: string) => settings[key],
+        // A user value alone is not proof that VS Code registered the schema.
+        inspect: (key: string) => key === missing ? { key, workspaceValue: true } : { key, defaultValue: false },
+        update: async () => { writes++; },
+      });
+      const { controller, messages } = makeController();
+      await controller.saveFeatureSettings({ subagentsEnabled: true, localFallback: true, target: 'workspace' });
+      assert.equal(writes, 0);
+      const result = messages.find((message) => message.type === 'feature-settings-saved');
+      assert.equal(result.ok, false);
+      assert.match(result.error, new RegExp(`codingHarness\\.${missing.replace('.', '\\.')}`));
+      assert.match(result.error, /No settings were changed/);
+      assert.match(result.error, /Developer: Reload Window/);
+    }
+  } finally { vscodeStub.workspace.getConfiguration = originalConfig; }
+});
+
+test('registry errors during a write report partial success and reload guidance', async () => {
+  const originalConfig = vscodeStub.workspace.getConfiguration;
+  try {
+    const written: string[] = [];
+    (vscodeStub.workspace as any).getConfiguration = () => ({
+      get: (key: string) => settings[key],
+      inspect: (key: string) => ({ key, defaultValue: false }),
+      update: async (key: string, value: unknown) => {
+        if (key === 'compaction.localFallback') throw new Error('codingHarness.compaction.localFallback is not a registered configuration');
+        written.push(key);
+        settings[key] = value;
+      },
+    });
+    const { controller, messages } = makeController();
+    await controller.saveFeatureSettings({ subagentsEnabled: true, localFallback: true, target: 'user' });
+    assert.deepEqual(written, ['subagents.enabled']);
+    const result = messages.find((message) => message.type === 'feature-settings-saved');
+    assert.equal(result.ok, false);
+    assert.match(result.error, /Some settings may have changed/);
+    assert.match(result.error, /Developer: Reload Window/);
+    assert.equal(result.settings.subagentsEnabled, true);
+    assert.equal(result.settings.localFallback, false);
+  } finally {
+    delete settings['subagents.enabled'];
+    vscodeStub.workspace.getConfiguration = originalConfig;
+  }
+});
+
+test('unrelated settings failures keep their actual error rather than suggesting reload', async () => {
+  const originalConfig = vscodeStub.workspace.getConfiguration;
+  try {
+    (vscodeStub.workspace as any).getConfiguration = () => ({
+      get: (key: string) => settings[key],
+      inspect: (key: string) => ({ key, defaultValue: false }),
+      update: async () => { throw new Error('settings file is read-only'); },
+    });
+    const { controller, messages } = makeController();
+    await controller.saveFeatureSettings({ subagentsEnabled: true, localFallback: true, target: 'workspace' });
+    const result = messages.find((message) => message.type === 'feature-settings-saved');
+    assert.match(result.error, /read-only/);
+    assert.match(result.error, /Some settings may have changed/);
+    assert.doesNotMatch(result.error, /Reload Window/);
+  } finally { vscodeStub.workspace.getConfiguration = originalConfig; }
+});
+
+test('compaction diagnostics are bounded, clearable, and label child requests', () => {
+  const { controller } = makeController();
+  const emit = (trace: any, source?: 'main' | 'subagent') => (controller as any).handleEvent({ type: 'compaction-trace', trace, source });
+  emit({ kind: 'begin' });
+  for (let request = 1; request <= 12; request++) {
+    emit({ kind: 'request', request, attempt: 1, model: 'model', maxTokens: 512, streaming: true,
+      prompt: 'p'.repeat(49_000), images: [{ name: 'screen.png', mediaType: 'image/png' }] }, 'subagent');
+    emit({ kind: 'delta', request, channel: 'response', text: 'r'.repeat(60_000) }, 'subagent');
+    emit({ kind: 'complete', request, text: 'r'.repeat(60_000), finishReason: 'stop', toolCalls: [] }, 'subagent');
+  }
+  const trace = controller.getCompactionTrace();
+  assert.equal(trace.entries.length, 10);
+  assert.equal(trace.dropped, 2);
+  assert.equal(trace.entries[0].request, 3);
+  assert.equal(trace.entries[0].source, 'subagent');
+  assert.match(trace.entries[0].prompt, /display truncated/);
+  assert.match(trace.entries[0].response, /display truncated/);
+  assert.ok(trace.entries[0].response.length < 48_100);
+  controller.clearCompactionTrace();
+  emit({ kind: 'delta', request: 12, channel: 'response', text: 'late fragment' }, 'subagent');
+  assert.deepEqual(controller.getCompactionTrace().entries, []);
+  emit({ kind: 'request', request: 13, attempt: 1, model: 'model', maxTokens: 512, streaming: false, prompt: 'next', images: [] }, 'subagent');
+  assert.equal(controller.getCompactionTrace().entries[0].request, 13);
 });

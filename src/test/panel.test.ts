@@ -611,3 +611,77 @@ test('activity strip identifies active subagent work', () => {
   assert.match(h.doc.getElementById('activity-detail').textContent, /step 2/);
   h.close();
 });
+
+test('feature settings errors remain readable in the dialog body and allow retry', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [], state, activity: idle });
+  h.doc.getElementById('btn-settings').click();
+  h.send({ type: 'feature-settings', subagentsEnabled: false, localFallback: false, hasWorkspace: true });
+  h.doc.getElementById('feature-subagents').checked = true;
+  h.doc.getElementById('feature-save').click();
+  h.send({ type: 'feature-settings-saved', ok: false, error: 'VS Code has not registered codingHarness.subagents.enabled. No settings were changed. Run Developer: Reload Window.', settings: { subagentsEnabled: false, localFallback: false, hasWorkspace: true } });
+  const status = h.doc.getElementById('feature-status');
+  assert.ok(status.closest('.modal-body'));
+  assert.match(status.textContent, /Developer: Reload Window/);
+  assert.equal(status.classList.contains('error'), true);
+  assert.equal(h.doc.getElementById('feature-save').disabled, false);
+  assert.equal(h.doc.getElementById('feature-subagents').checked, true, 'unsaved edits remain visible');
+  h.close();
+});
+
+test('compaction inspector shows live requests and responses without treating text as HTML', () => {
+  const h = mount();
+  const entry = { request: 1, attempt: 1, source: 'main', model: 'local-model', maxTokens: 1024, streaming: true,
+    prompt: 'Summarize sensitive context <script>alert(1)</script>', response: 'First fragment', reasoning: 'Thinking fragment',
+    images: [], imageCount: 0, status: 'waiting' };
+  h.send({ type: 'init', items: [], state: { ...state, busy: true }, activity: idle, compactionTrace: { entries: [entry], dropped: 0 } });
+  const details = h.doc.getElementById('compaction-trace');
+  assert.equal(details.hidden, false);
+  assert.equal(details.open, false, 'sensitive details start collapsed');
+  details.open = true;
+  assert.equal(h.doc.getElementById('compaction-trace-prompt').textContent, entry.prompt);
+  assert.equal(h.doc.getElementById('compaction-trace-prompt').querySelector('script'), null);
+  assert.equal(h.doc.getElementById('compaction-trace-response').textContent, 'First fragment');
+  assert.equal(h.doc.getElementById('compaction-trace-reasoning').textContent, 'Thinking fragment');
+  assert.match(h.doc.getElementById('compaction-trace-meta').textContent, /local-model.*1024.*stream requested/);
+  h.send({ type: 'compaction-trace', trace: { entries: [{ ...entry, response: 'First fragment plus more' }], dropped: 0 } });
+  assert.equal(h.doc.getElementById('compaction-trace-response').textContent, 'First fragment plus more');
+  h.doc.getElementById('compaction-copy-prompt').click();
+  assert.ok(h.posted.some((m) => m.type === 'copy' && m.text === entry.prompt));
+  h.doc.getElementById('compaction-trace-clear').click();
+  assert.ok(h.posted.some((m) => m.type === 'clear-compaction-trace'));
+  h.send({ type: 'compaction-trace', trace: { entries: [], dropped: 0 } });
+  assert.equal(details.hidden, true);
+  assert.equal(h.doc.getElementById('compaction-trace-prompt').textContent, '');
+  assert.equal(h.doc.getElementById('compaction-trace-response').textContent, '');
+  h.close();
+});
+
+test('compaction inspector preserves a selected request across retries and defers selected text repaints', () => {
+  const h = mount();
+  const entry = { request: 1, attempt: 1, source: 'main', model: 'model', maxTokens: 512, streaming: true,
+    prompt: 'First prompt', response: 'Partial response', reasoning: '', images: [], imageCount: 0, status: 'waiting' };
+  h.send({ type: 'init', items: [], state, activity: idle, compactionTrace: { entries: [entry], dropped: 0 } });
+  h.doc.getElementById('compaction-trace').open = true;
+  const response = h.doc.getElementById('compaction-trace-response');
+  const selection = h.window.getSelection();
+  const range = h.doc.createRange();
+  range.selectNodeContents(response);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  h.send({ type: 'compaction-trace', trace: { entries: [{ ...entry, response: 'Partial response continued' }], dropped: 0 } });
+  assert.equal(response.textContent, 'Partial response');
+  assert.equal(selection.toString(), 'Partial response');
+  selection.removeAllRanges();
+  h.doc.dispatchEvent(new h.window.Event('selectionchange'));
+  assert.equal(response.textContent, 'Partial response continued');
+  const second = { ...entry, request: 2, attempt: 2, prompt: 'Second prompt', response: '', status: 'waiting' };
+  h.send({ type: 'compaction-trace', trace: { entries: [entry, second], dropped: 0 } });
+  assert.equal(h.doc.getElementById('compaction-trace-request').value, '2');
+  h.doc.getElementById('compaction-trace-request').value = '1';
+  h.doc.getElementById('compaction-trace-request').dispatchEvent(new h.window.Event('change'));
+  h.send({ type: 'compaction-trace', trace: { entries: [entry, second, { ...entry, request: 3 }], dropped: 1 } });
+  assert.equal(h.doc.getElementById('compaction-trace-request').value, '1');
+  assert.match(h.doc.getElementById('compaction-trace-meta').textContent, /older requests omitted/);
+  h.close();
+});
