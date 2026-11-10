@@ -42,6 +42,8 @@ class StubDisposable {
 }
 
 const vscodeStub = {
+  lm: { selectChatModels: async (_selector: unknown): Promise<any[]> => [] },
+  LanguageModelToolCallPart: class {},
   workspace: {
     workspaceFolders: [{ uri: { fsPath: root }, name: 'stub', index: 0 }],
     getConfiguration: () => ({ get: (key: string) => settings[key], inspect: (key: string) => ({ key, defaultValue: false }), update: async (key: string, value: unknown, _target: number) => { settings[key] = value; } }),
@@ -508,4 +510,72 @@ test('compaction diagnostics are bounded, clearable, and label child requests', 
   assert.deepEqual(controller.getCompactionTrace().entries, []);
   emit({ kind: 'request', request: 13, attempt: 1, model: 'model', maxTokens: 512, streaming: false, prompt: 'next', images: [] }, 'subagent');
   assert.equal(controller.getCompactionTrace().entries[0].request, 13);
+});
+
+test('Copilot model picker selects only exposed Copilot models and keeps other provider model settings', async () => {
+  const original = { ...settings };
+  const oldSelect = vscodeStub.lm.selectChatModels;
+  const oldCall = (vscodeStub as any).LanguageModelToolCallPart;
+  const oldPicker = (vscodeStub.window as any).showQuickPick;
+  const oldConfig = vscodeStub.workspace.getConfiguration;
+  try {
+    (vscodeStub as any).LanguageModelToolCallPart = class {};
+    vscodeStub.lm.selectChatModels = async (selector: unknown) => {
+      assert.deepEqual(selector, { vendor: 'copilot' });
+      return [{ vendor: 'other', name: 'Not Copilot', id: 'wrong', family: 'other', maxInputTokens: 100 },
+        { vendor: 'copilot', name: 'Copilot Model', id: 'copilot-id', family: 'family', maxInputTokens: 64000 }];
+    };
+    const lists: any[][] = [];
+    (vscodeStub.window as any).showQuickPick = async (items: any[]) => { lists.push(items); return items[0]; };
+    (vscodeStub.workspace as any).getConfiguration = () => ({
+      get: (key: string) => settings[key],
+      inspect: (key: string) => ({ defaultValue: key === 'provider' ? 'openai' : key === 'copilot.model' ? '' : false }),
+      update: async (key: string, value: unknown) => { settings[key] = value; },
+    });
+    settings.provider = 'openai';
+    settings.model = 'original-openai-model';
+    const { controller } = makeController();
+    await controller.whenReady();
+    await controller.selectCopilotModel();
+    assert.equal(lists[0].length, 1);
+    assert.equal(lists[0][0].modelId, 'copilot-id');
+    assert.equal(settings.provider, 'copilot');
+    assert.equal(settings['copilot.model'], 'copilot-id');
+    assert.equal(settings.model, 'original-openai-model');
+    assert.equal(controller.readConfig().model, 'copilot-id');
+    assert.equal(controller.getState().provider, 'copilot');
+    assert.equal(controller.getState().keyPresent, false);
+  } finally {
+    for (const key of Object.keys(settings)) delete settings[key];
+    Object.assign(settings, original);
+    vscodeStub.lm.selectChatModels = oldSelect;
+    (vscodeStub as any).LanguageModelToolCallPart = oldCall;
+    (vscodeStub.window as any).showQuickPick = oldPicker;
+    (vscodeStub.workspace as any).getConfiguration = oldConfig;
+  }
+});
+
+test('Copilot picker leaves settings unchanged when no models are available or selection is cancelled', async () => {
+  const original = { ...settings };
+  const oldSelect = vscodeStub.lm.selectChatModels;
+  const oldPicker = (vscodeStub.window as any).showQuickPick;
+  const oldWarn = vscodeStub.window.showWarningMessage;
+  try {
+    const warnings: string[] = [];
+    (vscodeStub.window as any).showWarningMessage = async (message: string) => { warnings.push(message); };
+    const { controller } = makeController();
+    await controller.whenReady();
+    vscodeStub.lm.selectChatModels = async () => [];
+    await controller.selectCopilotModel();
+    assert.match(warnings[0], /Copilot models are available/);
+    assert.deepEqual(settings, original);
+    vscodeStub.lm.selectChatModels = async () => [{ vendor: 'copilot', name: 'Model', id: 'id', family: 'f', maxInputTokens: 1 }];
+    (vscodeStub.window as any).showQuickPick = async () => undefined;
+    await controller.selectCopilotModel();
+    assert.deepEqual(settings, original);
+  } finally {
+    vscodeStub.lm.selectChatModels = oldSelect;
+    (vscodeStub.window as any).showQuickPick = oldPicker;
+    vscodeStub.window.showWarningMessage = oldWarn;
+  }
 });

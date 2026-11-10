@@ -191,7 +191,7 @@ export interface HarnessHost {
 
 /* --------------------------------------------------------------- config */
 
-export type ProviderId = 'openai' | 'anthropic' | 'mock';
+export type ProviderId = 'openai' | 'anthropic' | 'mock' | 'copilot';
 export type EditPolicy = 'ask' | 'auto';
 export type CommandPolicy = 'auto-safe' | 'ask' | 'auto-all' | 'deny-all';
 export type LineEndingPreference = 'auto' | 'lf' | 'crlf' | 'cr' | 'native';
@@ -467,7 +467,7 @@ export interface CompactionProgress {
 /** Ephemeral, model-facing compaction diagnostics. Never includes image bytes or request headers. */
 export type CompactionTraceEvent =
   | { kind: 'begin' }
-  | { kind: 'request'; request: number; attempt: number; model: string; maxTokens: number; streaming: boolean; prompt: string; images: Array<{ name?: string; mediaType: string }> }
+  | { kind: 'request'; request: number; attempt: number; provider: string; model: string; maxTokens: number; streaming: boolean; prompt: string; images: Array<{ name?: string; mediaType: string }> }
   | { kind: 'delta'; request: number; channel: 'response' | 'reasoning'; text: string }
   | { kind: 'complete'; request: number; text: string; reasoning?: string; finishReason?: string; streamComplete?: boolean; usage?: Usage; toolCalls?: ToolCall[] }
   | { kind: 'failed'; request: number; cancelled: boolean };

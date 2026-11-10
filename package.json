@@ -2,7 +2,7 @@
   "name": "coding-harness",
   "displayName": "Coding Harness",
   "description": "A tool harness for VS Code: file create/edit/search, shell commands and MCP tools, with context about the environment and workspace. Project instructions come from your agent.md files.",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "publisher": "binief",
   "license": "MIT",
   "repository": {
@@ -45,7 +45,8 @@
     "onCommand:codingHarness.reloadMcpServers",
     "onCommand:codingHarness.openAgentFiles",
     "onCommand:codingHarness.reloadAgentFiles",
-    "onCommand:codingHarness.previewContext"
+    "onCommand:codingHarness.previewContext",
+    "onCommand:codingHarness.selectCopilotModel"
   ],
   "contributes": {
     "viewsContainers": {
@@ -137,6 +138,10 @@
         "command": "codingHarness.previewContext",
         "title": "Coding Harness: Preview System Context",
         "icon": "$(eye)"
+      },
+      {
+        "command": "codingHarness.selectCopilotModel",
+        "title": "Coding Harness: Select Copilot Model"
       }
     ],
     "menus": {
@@ -201,15 +206,17 @@
           "enum": [
             "openai",
             "anthropic",
+            "copilot",
             "mock"
           ],
           "enumDescriptions": [
             "Any OpenAI-compatible /chat/completions endpoint (OpenAI, OpenRouter, Groq, Together, vLLM, Ollama, LM Studio, llama.cpp server).",
             "Anthropic Messages API.",
+            "GitHub Copilot models exposed by VS Code (requires Copilot Chat, sign-in, access and consent).",
             "Offline rule-based planner. No API key, no network. Useful to smoke-test the harness and to demo the tool loop."
           ],
           "default": "openai",
-          "markdownDescription": "Which model backend the harness talks to. Use `mock` for a zero-config offline demo."
+          "markdownDescription": "Which model backend the harness talks to. Choose a Copilot model with the **Coding Harness: Select Copilot Model** command. Use `mock` for a zero-config offline demo."
         },
         "codingHarness.baseUrl": {
           "type": "string",
@@ -481,6 +488,11 @@
           "type": "boolean",
           "default": false,
           "markdownDescription": "Allow lossy local excerpt compaction when LLM summarization fails, or when explicitly selected in the panel. Details may be omitted; saved original messages are preserved. Cancellation never triggers fallback."
+        },
+        "codingHarness.copilot.model": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "VS Code Language Model API Copilot model ID. Select an available model with **Coding Harness: Select Copilot Model**. Separate from `codingHarness.model`, which is used by other providers."
         },
         "codingHarness.compaction.summaryModel": {
           "type": "string",

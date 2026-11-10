@@ -685,3 +685,28 @@ test('compaction inspector preserves a selected request across retries and defer
   assert.match(h.doc.getElementById('compaction-trace-meta').textContent, /older requests omitted/);
   h.close();
 });
+
+test('Copilot selection is accessible in settings and does not claim an API key is missing', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [], state: { ...state, provider: 'copilot', model: 'chosen-id', keyPresent: false }, activity: idle });
+  const chip = h.doc.getElementById('chip-provider');
+  assert.match(chip.textContent, /copilot.*chosen-id/);
+  assert.match(chip.title, /VS Code sign-in/);
+  assert.equal(chip.classList.contains('warn'), false);
+  h.doc.getElementById('btn-settings').click();
+  h.doc.getElementById('feature-copilot').click();
+  assert.ok(h.posted.some((message) => message.type === 'select-copilot-model'));
+  h.close();
+});
+
+test('Copilot compaction details do not claim unsupported output limits or finish reasons', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [], state, activity: idle, compactionTrace: { dropped: 0, entries: [{ request: 1, attempt: 1,
+    source: 'main', provider: 'copilot', model: 'id', maxTokens: 512, streaming: true, prompt: 'prompt', response: 'summary',
+    reasoning: '', images: [], imageCount: 0, status: 'finished' }] } });
+  const meta = h.doc.getElementById('compaction-trace-meta').textContent;
+  assert.match(meta, /output limit and temperature controlled by VS Code/);
+  assert.match(meta, /finish reason unavailable/);
+  assert.doesNotMatch(meta, /max output: 512/);
+  h.close();
+});

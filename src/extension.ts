@@ -121,8 +121,16 @@ function registerCommands(
       await controller.revertLastTask();
     }),
 
+    vscode.commands.registerCommand('codingHarness.selectCopilotModel', async () => {
+      await controller.selectCopilotModel();
+    }),
+
     vscode.commands.registerCommand('codingHarness.setApiKey', async () => {
       const config = controller.readConfig();
+      if (config.provider === 'copilot') {
+        void vscode.window.showInformationMessage('Copilot uses your VS Code sign-in and consent; no Coding Harness API key is needed.');
+        return;
+      }
       const key = await vscode.window.showInputBox({
         title: `Coding Harness — API key for "${config.provider}"`,
         prompt: 'Stored in VS Code secret storage (not in settings.json or the workspace).',
