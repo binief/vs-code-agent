@@ -109,6 +109,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'clear-compaction-trace':
         this.controller.clearCompactionTrace();
         break;
+      case 'select-copilot-model':
+        await this.controller.selectCopilotModel();
+        break;
       case 'get-feature-settings':
         this.post({ type: 'feature-settings', ...this.controller.getFeatureSettings() });
         break;

@@ -896,3 +896,24 @@ test('compaction trace retains truncated attempts and exposes subsequent retries
   assert.ok(events.some((event) => event.kind === 'complete' && event.request === 1 && event.finishReason === 'length' && event.text === 'Partial summary'));
   assert.ok(events.some((event) => event.kind === 'complete' && event.request === 2 && event.finishReason === 'stop' && event.text === 'Complete summary'));
 });
+
+test('Copilot compaction requires a summary end marker because the VS Code API lacks a finish reason', async () => {
+  const history = longHistory();
+  const c = config({ compaction: { ...DEFAULT_CONFIG.compaction, keepLastMessages: 2 } });
+  let attempts = 0;
+  const incomplete: Provider = { id: 'copilot', label: 'Copilot', async chat() { attempts++; return { text: 'Incomplete summary', toolCalls: [] }; } };
+  const failure = await compactHistory(history, c, incomplete);
+  assert.equal(attempts, 3);
+  assert.equal(failure.result.compacted, false);
+  assert.deepEqual(failure.newHistory, history);
+  assert.match(failure.result.summary, /end marker/);
+  const complete: Provider = { id: 'copilot', label: 'Copilot', async chat(req) {
+    const marker = req.messages[0].content.match(/END_OF_SUMMARY_[0-9a-f-]+/)?.[0];
+    assert.ok(marker);
+    return { text: `Concise completed summary.\n${marker}`, toolCalls: [] };
+  } };
+  const success = await compactHistory(history, c, complete);
+  assert.equal(success.result.compacted, true);
+  assert.match(success.newHistory[0].content, /Concise completed summary/);
+  assert.doesNotMatch(success.newHistory[0].content, /END_OF_SUMMARY_/);
+});

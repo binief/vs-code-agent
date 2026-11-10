@@ -21,6 +21,8 @@ export function createProvider(opts: CreateProviderOptions): Provider {
       return new AnthropicProvider({ apiKey, baseUrl: config.baseUrl, headers: opts.extraHeaders });
     case 'mock':
       return new MockPlannerProvider();
+    case 'copilot':
+      throw new Error('GitHub Copilot requires the VS Code extension host; it is not available in the standalone harness.');
     case 'openai':
     default:
       return new OpenAiCompatibleProvider({ apiKey, baseUrl: config.baseUrl, headers: opts.extraHeaders });
@@ -29,6 +31,7 @@ export function createProvider(opts: CreateProviderOptions): Provider {
 
 /** Environment variable fallbacks, checked in order. */
 export function apiKeyFromEnv(provider: HarnessConfig['provider'], env = process.env): string | undefined {
+  if (provider === 'copilot' || provider === 'mock') return undefined;
   const candidates =
     provider === 'anthropic'
       ? ['HARNESS_API_KEY', 'ANTHROPIC_API_KEY']

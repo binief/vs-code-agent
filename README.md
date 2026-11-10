@@ -63,6 +63,7 @@ backend exposes a reasoning stream it renders in its own **thinking lane** above
    | Ollama (local) | `openai` | `http://localhost:11434/v1` | `qwen2.5-coder:14b` |
    | LM Studio / llama.cpp server | `openai` | `http://localhost:1234/v1` | your loaded model id |
    | Anthropic | `anthropic` | `https://api.anthropic.com` | `claude-sonnet-4-5` |
+   | Signed-in GitHub Copilot | `copilot` | – | Select using **Coding Harness: Select Copilot Model** |
    | Offline demo, no key | `mock` | – | – |
 
    Environment fallbacks: `HARNESS_API_KEY`, then `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`.
@@ -86,6 +87,37 @@ backend exposes a reasoning stream it renders in its own **thinking lane** above
 
 4. **Open the panel**: click the *Coding Harness* icon in the activity bar (or `Ctrl+Alt+K`, or
    *Coding Harness: Open Agent Panel*) and describe a task.
+
+## GitHub Copilot models
+
+Install and enable GitHub Copilot Chat in VS Code, sign in with an eligible GitHub Copilot account,
+then choose **Settings → Select GitHub Copilot model…** in the Coding Harness panel (or run
+**Coding Harness: Select Copilot Model** from the Command Palette). The picker lists the Copilot
+models currently exposed to this extension by VS Code. Select a model and whether to save it in
+User or Workspace settings. An overriding workspace setting can take precedence over a User
+selection. Switching this way preserves the separate `codingHarness.model` for other providers.
+
+VS Code manages sign-in and may ask for permission on the first request. No Copilot token or API
+key is collected by Coding Harness. Availability, access, model capabilities, premium request
+usage, quotas and organizational policy depend on your Copilot plan and VS Code installation;
+being signed in does not guarantee access to every model. If the list is empty, enable Copilot
+Chat, sign in, check access and try again. A selected model that disappears is reported as an
+error, not silently replaced. To switch back, change `codingHarness.provider` in VS Code settings.
+The public model/tool-calling API requires VS Code 1.96 or later; image input requires 1.106 or
+later and a vision-capable model. The rest of the extension can still run on older supported VS Code.
+
+Copilot requests use VS Code's public Language Model API, which exposes only user and assistant
+roles: harness system instructions and project context are sent as a leading **user** message,
+not a system message. Tools are still restricted and approvals enforced locally by the harness;
+choose a model that supports tool calling. The API does not reliably expose reasoning, token usage,
+finish reason, temperature or an output-token limit. Those settings cannot be enforced for this
+provider, token usage is estimated, and completion/truncation cannot be reliably determined.
+For Copilot compaction, the harness requests and checks an end marker before accepting a summary;
+this is a heuristic, not proof of completeness. Failed checks preserve the active history unless
+local fallback was explicitly enabled. `codingHarness.compaction.contextWindowTokens` remains a
+manual estimate; consult the selected model's reported input limit in the picker and leave room for
+output and overhead. `codingHarness.compaction.summaryModel`, if set, must be an available Copilot
+model ID when using this provider. The compaction inspector reports the API's limitations.
 
 ## Agent instruction files
 
@@ -506,9 +538,10 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `codingHarness.provider` | `openai` | `openai` \| `anthropic` \| `mock` |
+| `codingHarness.provider` | `openai` | `openai` \| `anthropic` \| `copilot` \| `mock` |
 | `codingHarness.baseUrl` | `https://api.openai.com/v1` | Endpoint for OpenAI-compatible APIs |
-| `codingHarness.model` | `gpt-4o-mini` | Model id |
+| `codingHarness.model` | `gpt-4o-mini` | Model id for API providers |
+| `codingHarness.copilot.model` | `""` | Copilot model ID, chosen from the VS Code model picker |
 | `codingHarness.apiKey` | `""` | Prefer the Set API Key command; env vars also work |
 | `codingHarness.temperature` / `maxOutputTokens` | `0.2` / `2048` | Sampling and response cap |
 | `codingHarness.editPolicy` | `ask` | `ask` \| `auto` for file writes and deletes |

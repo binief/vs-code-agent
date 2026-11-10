@@ -464,12 +464,12 @@
     if (chipProvider) {
       const provider = state.provider || 'mock';
       chipProvider.textContent = provider + (state.model ? ' · ' + state.model : '');
-      chipProvider.title = state.keyPresent
-        ? 'API key: configured'
-        : provider === 'mock'
-          ? 'Offline planner — no API key needed'
-          : 'No API key configured (Coding Harness: Set API Key)';
-      chipProvider.classList.toggle('warn', !state.keyPresent && provider !== 'mock');
+      chipProvider.title = provider === 'copilot'
+        ? (state.model ? 'Copilot uses VS Code sign-in and model-access consent; availability is checked on each request.' : 'Select a Copilot model in Settings.')
+        : state.keyPresent ? 'API key: configured'
+          : provider === 'mock' ? 'Offline planner — no API key needed'
+            : 'No API key configured (Coding Harness: Set API Key)';
+      chipProvider.classList.toggle('warn', provider === 'copilot' ? !state.model : !state.keyPresent && provider !== 'mock');
     }
 
     if (chipPolicy) {
@@ -617,12 +617,13 @@
     const usage = entry.usage ? ' · usage: ' + (entry.usage.inputTokens ?? '?') + ' input / ' + (entry.usage.outputTokens ?? '?') + ' output tokens' : '';
     const imageNames = (entry.images || []).map((image) => (image.name || 'unnamed') + ' [' + image.mediaType + ']').join(', ');
     const images = entry.imageCount ? ' · images: ' + entry.imageCount + ' (data omitted' + (imageNames ? '; ' + imageNames : '') + (entry.imageCount > (entry.images || []).length ? '; additional names omitted' : '') + ')' : '';
-    const finish = entry.finishReason ? ' · finish: ' + entry.finishReason : '';
+    const finish = entry.finishReason ? ' · finish: ' + entry.finishReason : (entry.provider === 'copilot' && entry.status === 'finished' ? ' · finish reason unavailable' : '');
     const incomplete = entry.streamComplete === false ? ' · stream ended without completion marker' : '';
     const dropped = compactionTraceDropped ? ' · ' + compactionTraceDropped + ' older requests omitted' : '';
     const elapsed = entry.startedAt ? ' · ' + Math.max(0, Math.round(((entry.finishedAt || Date.now()) - entry.startedAt) / 1000)) + 's' : '';
-    compactionTraceMeta.textContent = (entry.source === 'subagent' ? 'Subagent · ' : 'Main agent · ') + 'Model: ' + entry.model + ' · max output: ' + entry.maxTokens +
-      ' · temperature: 0 · tools: none · ' + (entry.streaming ? 'stream requested' : 'buffered request') +
+    const parameters = entry.provider === 'copilot' ? ' · output limit and temperature controlled by VS Code / model' : ' · max output: ' + entry.maxTokens + ' · temperature: 0';
+    compactionTraceMeta.textContent = (entry.source === 'subagent' ? 'Subagent · ' : 'Main agent · ') + 'Model: ' + entry.model + parameters +
+      ' · tools: none · ' + (entry.streaming ? 'stream requested' : 'buffered display') +
       ' · ' + entry.status + elapsed + finish + incomplete + usage + images + dropped;
     setTraceText(compactionTracePrompt, entry.prompt);
     setTraceText(compactionTraceResponse, (entry.response || (['waiting', 'reasoning', 'receiving'].includes(entry.status) ? '(No response text received yet.)' : '(No response text.)')) +
@@ -1602,6 +1603,10 @@
   }
   document.getElementById('feature-close').addEventListener('click', () => { featureModal.hidden = true; });
   featureModal.addEventListener('click', (event) => { if (event.target === featureModal) featureModal.hidden = true; });
+  document.getElementById('feature-copilot').addEventListener('click', () => {
+    featureModal.hidden = true;
+    vscode.postMessage({ type: 'select-copilot-model' });
+  });
   document.getElementById('feature-all-settings').addEventListener('click', () => {
     featureModal.hidden = true;
     vscode.postMessage({ type: 'open-settings' });

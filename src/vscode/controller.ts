@@ -42,6 +42,7 @@ import { VsCodeHost } from './host';
 import type { Logger } from './log';
 import type { ProposalStore } from './proposals';
 import { showProposalDiff } from './proposals';
+import { CopilotProvider, COPILOT_UNAVAILABLE_MESSAGE } from './copilotProvider';
 
 /** An attachment as the webview renders it: data URL plus a label. */
 export interface TranscriptImage {
@@ -99,6 +100,7 @@ export interface CompactionTraceEntry {
   request: number;
   attempt: number;
   source: 'main' | 'subagent';
+  provider: string;
   model: string;
   maxTokens: number;
   streaming: boolean;
@@ -814,7 +816,7 @@ export class HarnessController {
 
     return resolveConfig({
       provider: c.get('provider'),
-      model: c.get('model'),
+      model: c.get<string>('provider') === 'copilot' ? (c.get<string>('copilot.model') ?? '') : c.get('model'),
       baseUrl: c.get('baseUrl'),
       apiKey: c.get('apiKey'),
       temperature: c.get('temperature'),
@@ -882,10 +884,52 @@ export class HarnessController {
   }
 
   private async resolveApiKey(config: HarnessConfig): Promise<string | undefined> {
+    if (config.provider === 'copilot' || config.provider === 'mock') return undefined;
     if (config.apiKey?.trim()) return config.apiKey.trim();
     const stored = await this.secretKey();
     if (stored?.trim()) return stored.trim();
     return apiKeyFromEnv(config.provider);
+  }
+
+  /** List only Copilot models currently exposed to this extension; selecting does not send a request. */
+  async selectCopilotModel(): Promise<void> {
+    try {
+      if (!vscode.lm?.selectChatModels || !vscode.LanguageModelToolCallPart) {
+        void vscode.window.showWarningMessage('Copilot support requires a newer VS Code with the Language Model API and tool calling. Update VS Code and Copilot Chat.');
+        return;
+      }
+      const models = (await vscode.lm.selectChatModels({ vendor: 'copilot' })).filter((model) => model.vendor === 'copilot');
+      if (!models.length) { void vscode.window.showWarningMessage(COPILOT_UNAVAILABLE_MESSAGE); return; }
+      const selected = await vscode.window.showQuickPick(models.map((model) => ({
+        label: model.name, description: model.id, detail: `${model.family} · max input ${model.maxInputTokens} tokens`, modelId: model.id,
+      })), { title: 'Select a GitHub Copilot model', placeHolder: 'Models made available by VS Code; availability and usage limits depend on your Copilot account.' });
+      if (!selected) return;
+      const scopes = [{ label: 'User settings', target: vscode.ConfigurationTarget.Global },
+        ...(this.workspaceRoot() ? [{ label: 'Workspace settings', target: vscode.ConfigurationTarget.Workspace }] : [])];
+      const scope = await vscode.window.showQuickPick(scopes, { title: 'Save Copilot selection', placeHolder: 'Choose where to set the provider and model.' });
+      if (!scope) return;
+      const settings = vscode.workspace.getConfiguration('codingHarness');
+      if (typeof settings.inspect<string>('copilot.model')?.defaultValue !== 'string' || typeof settings.inspect<string>('provider')?.defaultValue !== 'string') {
+        void vscode.window.showWarningMessage('VS Code has not registered the Coding Harness Copilot settings. Reload the window and try again.');
+        return;
+      }
+      // Save the model first: a failed provider update cannot start using an unintended model.
+      await settings.update('copilot.model', selected.modelId, scope.target);
+      await settings.update('provider', 'copilot', scope.target);
+      await this.refreshState();
+      const actual = this.readConfig();
+      if (actual.provider !== 'copilot' || actual.model !== selected.modelId) {
+        void vscode.window.showWarningMessage('Copilot selection was saved, but another settings scope overrides it. Check Coding Harness provider and Copilot model settings.');
+      } else {
+        void vscode.window.showInformationMessage(`Coding Harness: selected Copilot model ${selected.label}. VS Code may request model-access consent on the first task.`);
+      }
+    } catch (err) {
+      void vscode.window.showErrorMessage(`Could not select a Copilot model: ${(err as Error).message}. Some settings may have changed.`);
+    }
+  }
+
+  private providerFor(config: HarnessConfig, apiKey?: string) {
+    return config.provider === 'copilot' ? new CopilotProvider() : createProvider({ config, apiKey });
   }
 
   /* ------------------------------------------------------------- session */
@@ -896,9 +940,9 @@ export class HarnessController {
 
     const config = this.readConfig();
     const apiKey = await this.resolveApiKey(config);
-    const provider = createProvider({ config, apiKey });
+    const provider = this.providerFor(config, apiKey);
 
-    if (config.provider !== 'mock' && !apiKey) {
+    if (config.provider !== 'mock' && config.provider !== 'copilot' && !apiKey) {
       this.post({
         type: 'notice',
         level: 'warn',
@@ -1093,7 +1137,7 @@ export class HarnessController {
       // ensureSession will apply changed settings on the next task.
       if (this.session && !this.isBusy && !this.session.isRunning) {
         this.session.updateConfig(config);
-        this.session.setProvider(createProvider({ config, apiKey }));
+        this.session.setProvider(this.providerFor(config, apiKey));
       }
     } catch (err) {
       this.log.warn(`refreshState failed: ${(err as Error).message}`);
@@ -1387,7 +1431,7 @@ export class HarnessController {
         this.session = new HarnessSession({
           host: this.host,
           config,
-          provider: createProvider({ config, apiKey: await this.resolveApiKey(config) }),
+          provider: this.providerFor(config, await this.resolveApiKey(config)),
           registry,
           agentSelection: this.agentSelection,
         });
@@ -1504,7 +1548,7 @@ export class HarnessController {
         this.session = new HarnessSession({
           host: this.host,
           config,
-          provider: createProvider({ config, apiKey: await this.resolveApiKey(config) }),
+          provider: this.providerFor(config, await this.resolveApiKey(config)),
           registry,
           agentSelection: this.agentSelection,
         });
@@ -2223,7 +2267,7 @@ export class HarnessController {
     const cap = (text: string) => text.length > limit ? text.slice(0, limit) + marker : text;
     if (event.kind === 'begin') { this.clearCompactionTrace(); return; }
     if (event.kind === 'request') {
-      this.compactionTrace.push({ request: event.request, attempt: event.attempt, source, model: event.model.slice(0, 512),
+      this.compactionTrace.push({ request: event.request, attempt: event.attempt, source, provider: event.provider, model: event.model.slice(0, 512),
         maxTokens: event.maxTokens, streaming: event.streaming, prompt: cap(event.prompt),
         images: event.images.slice(0, 40).map((image) => ({ name: image.name?.slice(0, 256), mediaType: image.mediaType.slice(0, 128) })),
         imageCount: event.images.length, response: '', reasoning: '', status: 'waiting', startedAt: Date.now() });
