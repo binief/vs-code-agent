@@ -317,7 +317,7 @@
         "codingHarness.subagents.enabled": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Allow the main agent to delegate focused read-only investigations when selected agent files also explicitly allow `subagent` or `delegate_task`. Subagents use the same provider, have separate context, cannot edit or use MCP, and may increase token usage."
+          "markdownDescription": "Start a read-only subagent before every task, if the selected agent files explicitly allow `subagent` or `delegate_task` and read/search tools. On failure or missing permission, warn and continue with the main agent. Subagents use the same provider, have separate context, cannot edit or use MCP, and may increase time and token usage."
         },
         "codingHarness.chat.saveEnabled": {
           "type": "boolean",

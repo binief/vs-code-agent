@@ -710,3 +710,12 @@ test('Copilot compaction details do not claim unsupported output limits or finis
   assert.doesNotMatch(meta, /max output: 512/);
   h.close();
 });
+
+test('settings describe automatic subagent attempts and warning fallback', () => {
+  const h = mount();
+  h.doc.getElementById('btn-settings').click();
+  const modalText = h.doc.getElementById('feature-modal').textContent;
+  assert.match(modalText, /Run a read-only subagent for every task/);
+  assert.match(modalText, /warning appears and the main agent continues/);
+  h.close();
+});

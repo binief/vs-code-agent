@@ -280,7 +280,7 @@ instructions alone do not enforce read-only access. In particular, a list that i
 ### Optional read-only subagents
 
 Subagents are **off by default**. In the chat panel, click **Settings** (sliders icon), enable
-**Read-only subagents**, and save. The same switch is available as `codingHarness.subagents.enabled`
+**Run a read-only subagent for every task**, and save. The same switch is available as `codingHarness.subagents.enabled`
 in VS Code Settings. Also explicitly allow `subagent` (or `delegate_task`) alongside the read/search
 tools in the selected agent file's YAML:
 
@@ -291,21 +291,29 @@ tools: [read, search, edit, execute, subagent]
 ```
 
 Every selected file that declares tools must permit delegation: their permissions still intersect.
-The main agent decides whether to call `delegate_task`, supplying a focused task and any relevant
-context. Each call runs a separate, sequential subagent conversation with the same model, workspace
-and selected instruction snapshot. Parent chat history and images are not automatically included.
-Only permitted built-in `list_files`, `read_file`, `search_text` and `get_diagnostics` are available
-to the subagent. It cannot edit, run commands, use MCP, open files in the editor, or delegate again.
-Its file access follows the existing workspace and outside-workspace settings. If no read-only tool is
-permitted, delegation fails instead of guessing.
+When enabled, the harness automatically attempts a read-only subagent **before every parent task**,
+including simple questions, without waiting for the model to choose delegation. If the selected policy
+forbids delegation or provides no permitted read-only tools, or the child fails, a warning is shown and
+the main agent continues without a successful handoff. Cancellation stops the task rather than falling
+back. This does not grant any new tools: malformed policies still fail closed. The parent may also
+choose additional delegations, and can still use its own permitted read/search tools. Starting a child
+cannot guarantee that its model actually searches or produces useful findings.
+
+Each call runs a separate, sequential subagent conversation with the same model, workspace and selected
+instruction snapshot. The automatic child receives the current user request, but not parent chat history
+or attached images; it is told when images were omitted. Only permitted built-in `list_files`,
+`read_file`, `search_text` and `get_diagnostics` are available to the subagent. It cannot edit, run
+commands, use MCP, open files in the editor, or delegate again. Its file access follows the existing
+workspace and outside-workspace settings.
 
 Only the child’s final findings and any warnings are sent back to the main conversation; the child’s
-intermediate transcript is not saved in the chat. When the model actually delegates, the activity strip
-shows **Subagent working**, and the `delegate_task` tool card and notices show its task and outcome.
-Enabling the switch alone does not force delegation. Child model usage is included in the session total. Cancellation of the main task also cancels the
-child, subject to the provider honoring cancellation. These findings are unverified and may omit or
-misstate details; the main agent should inspect evidence when necessary. Additional model calls can
-increase time and cost. The offline mock planner does not autonomously decide to delegate.
+intermediate transcript is not saved in the chat. The activity strip shows **Subagent working**, and
+the `delegate_task` tool card and notices show its task and outcome. Child model usage is included in
+the session total. Cancellation of the main task also cancels the child, subject to the provider
+honoring cancellation. These findings are unverified and may omit or misstate details; the main agent
+should inspect evidence when necessary. An extra model call on every task can increase time and cost;
+it does not shrink existing main history. The offline mock planner can receive an automatic task but
+is not a language model and does not autonomously decide to delegate.
 
 If saving these panel settings reports that a `codingHarness` setting is not registered, stop or finish
 any running task and run **Developer: Reload Window**, then try again. VS Code may not yet have loaded
@@ -575,7 +583,7 @@ Being an agent that edits code and runs shell commands, the interesting part is 
 | `codingHarness.mcp.timeoutMs` | `10000` | Default timeout for MCP tool calls |
 | `codingHarness.mcp.loadFromFiles` | `true` | Read servers from workspace config files |
 | `codingHarness.mcp.configFiles` | `[".vscode/mcp.json",".mcp.json","mcp.json"]` | Files scanned for servers |
-| `codingHarness.subagents.enabled` | `false` | Enable explicitly permitted, read-only subagent delegation |
+| `codingHarness.subagents.enabled` | `false` | Attempt a permitted read-only subagent before each task; warn and continue on failure |
 | `codingHarness.compaction.enabled` | `true` | Enable conversation compaction |
 | `codingHarness.compaction.autoCompact` | `true` | Compact automatically near the context limit |
 | `codingHarness.compaction.threshold` | `0.75` | Utilisation target; auto-compaction starts earlier to reserve tool-result headroom |
