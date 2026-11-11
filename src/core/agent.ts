@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { agentFilesSummary, discoverAgentFiles, selectAgentFiles, type SelectedAgentFiles } from './agentFiles';
 import { CheckpointStore, type RevertReport } from './checkpoints';
 import { CompactionCancelled, compactHistory, contextBreakdown, contextBreakdownTotal, estimateMessagesTokens, estimateRequestTokens, estimateTokens } from './compaction';
@@ -378,6 +379,37 @@ export class HarnessSession {
       });
 
       this.lastSystemPrompt = system;
+
+      // Enabling subagents requests one automatic read-only investigation for
+      // every parent task. Never bypass the agent-file permission ceiling, and
+      // never recursively start one for a delegated child. This is a synthetic
+      // tool call, not a claim that the parent model chose to delegate.
+      if (!this.deps.delegated && this.deps.config.subagentsEnabled && !signal.aborted) {
+        if (!allowedToolNames.has(DELEGATE_TOOL.name)) {
+          onEvent({ type: 'notice', level: 'warn', message: 'Automatic subagent skipped: selected agent files do not permit delegation. Continuing with the main agent. Allow subagent and read/search in every declaring agent file to enable it.' });
+        } else {
+          const task = `You are the delegated read-only subagent, not the main agent. Do not delegate further. Investigate the user's request using permitted read-only tools if relevant. Return concise findings, relevant paths and evidence; explicitly identify uncertainty or missing context. The parent will handle edits and commands.\n\nUser request:\n${text}` +
+            (images?.length ? '\nThe user attached images, but they are not available to you. Do not assume their contents; the parent can inspect them.' : '');
+          // The current request is already in parent history; don't duplicate
+          // its full text in the synthetic tool-call arguments.
+          const call: ToolCall = { id: `auto-subagent-${randomUUID()}`, name: DELEGATE_TOOL.name,
+            arguments: JSON.stringify({ task: 'Automatic read-only investigation of the current user request.' }) };
+          onEvent({ type: 'notice', level: 'info', message: 'Starting the automatic read-only subagent before the main agent.' });
+          addMessage({ role: 'assistant', content: '', toolCalls: [call] });
+          let result: ToolResult;
+          try {
+            result = await this.executeToolCall(call, onEvent, signal, allowedToolNames, 2048, selected, policySpecs, 0, task);
+          } catch (err) {
+            result = { ok: false, content: `Automatic subagent failed: ${(err as Error).message}`, summary: 'subagent failed' };
+            onEvent({ type: 'tool-end', id: call.id, name: call.name, ok: false, summary: result.summary ?? 'subagent failed', detail: result.content, durationMs: 0 });
+          }
+          toolCallsRun++;
+          addMessage({ role: 'tool', toolCallId: call.id, name: call.name, content: result.content });
+          if (!result.ok && !signal.aborted) {
+            onEvent({ type: 'notice', level: 'warn', message: `Automatic subagent did not complete (${result.summary ?? 'failed'}). Continuing with the main agent; its findings are unavailable or incomplete.` });
+          }
+        }
+      }
 
       // Compact both prior history and the current task. Keep the shared pending
       // array so autosave sees exactly the context that will be sent next.
@@ -880,6 +912,7 @@ export class HarnessSession {
     selected: SelectedAgentFiles,
     policySpecs: readonly ToolSpec[],
     step: number,
+    automaticTask?: string,
   ): Promise<ToolResult> {
     const started = Date.now();
     const host = this.deps.host;
@@ -929,7 +962,7 @@ export class HarnessSession {
       onEvent({ type: 'subagent-progress' });
       try {
         if (signal.aborted) return finish({ ok: false, content: CANCELLED_TOOL_RESULT, summary: 'cancelled' });
-        const prompt = `Delegated task: ${args.task.trim()}${typeof args.context === 'string' && args.context.trim() ? `\n\nRelevant context supplied by the parent:\n${args.context.trim()}` : ''}\n\nReturn findings with relevant file paths and evidence, and explicitly identify uncertainties or unverified details.`;
+        const prompt = `Delegated task: ${automaticTask ?? args.task.trim()}${typeof args.context === 'string' && args.context.trim() ? `\n\nRelevant context supplied by the parent:\n${args.context.trim()}` : ''}\n\nReturn findings with relevant file paths and evidence, and explicitly identify uncertainties or unverified details.`;
         const result = await child.runTask(prompt, (event) => {
           if (event.type === 'compaction-trace') onEvent({ type: 'compaction-trace', trace: event.trace, source: 'subagent' });
           if (event.type === 'step') onEvent({ type: 'subagent-progress', step: event.index });

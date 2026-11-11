@@ -204,3 +204,150 @@ test('a custom tool cannot impersonate a read-only builtin in a child', async ()
     assert.match(session.transcript.find(m => m.role === 'tool')?.content ?? '', /No read-only built-in tools/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('enabled mode automatically runs a separate child before every parent task', async () => {
+  const dir = workspace('read, search, subagent');
+  try {
+    const calls: Array<{ child: boolean; request: ChatRequest }> = [];
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      const child = isChild(req);
+      calls.push({ child, request: JSON.parse(JSON.stringify({ ...req, signal: undefined })) });
+      return child
+        ? { text: 'Evidence: secret.txt has a verified line.', toolCalls: [], usage: { inputTokens: 10, outputTokens: 2 } }
+        : { text: 'Parent response.', toolCalls: [], usage: { inputTokens: 5, outputTokens: 1 } };
+    } };
+    const session = new HarnessSession({ host: new Host(dir), config: config(true), provider });
+    session.restoreConversation([{ role: 'user', content: 'PRIVATE_OLD_PARENT_HISTORY' }]);
+    const events: HarnessEvent[] = [];
+    await session.runTask('First task UNIQUE_TASK_TEXT', e => events.push(e));
+    await session.runTask('Hello', e => events.push(e));
+    assert.deepEqual(calls.map(c => c.child), [true, false, true, false]);
+    assert.ok(calls[0].request.messages.some(m => m.content.includes('First task UNIQUE_TASK_TEXT')));
+    assert.ok(calls[2].request.messages.some(m => m.content.includes('Hello')));
+    assert.ok(!JSON.stringify(calls[0].request.messages).includes('PRIVATE_OLD_PARENT_HISTORY'));
+    assert.ok(calls[1].request.messages.some(m => m.role === 'tool' && m.name === 'delegate_task' && m.content.includes('Evidence: secret.txt')));
+    assert.ok(calls[0].request.tools.every(t => ['list_files', 'read_file', 'search_text', 'get_diagnostics'].includes(t.name)));
+    assert.ok(events.some(e => e.type === 'notice' && e.message.includes('automatic read-only subagent')));
+    assert.equal(events.filter(e => e.type === 'tool-start' && e.name === 'delegate_task').length, 2);
+    assert.equal(events.filter(e => e.type === 'subagent-progress' && e.step === 1).length, 2);
+    const synthetic = session.transcript.filter(m => m.role === 'assistant').flatMap(m => m.toolCalls ?? []).filter(call => call.id.startsWith('auto-subagent-'));
+    assert.equal(synthetic.length, 2);
+    assert.notEqual(synthetic[0].id, synthetic[1].id);
+    assert.ok(!synthetic[0].arguments.includes('UNIQUE_TASK_TEXT'), 'the original prompt must not be repeated in tool arguments');
+    assert.ok(isTranscriptWellFormed([...session.transcript]));
+    assert.equal(session.usage.inputTokens, 30);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('automatic delegation respects disabled and missing policy permissions and warns before fallback', async () => {
+  for (const [enabled, tools, warning] of [[false, 'read, subagent', false], [true, 'read', true], [true, 'subagent', true], [true, '', true]] as const) {
+    const dir = workspace(tools);
+    try {
+      const seen: ChatRequest[] = [];
+      const events: HarnessEvent[] = [];
+      const provider: Provider = { id: 'test', label: 'test', async chat(req) { seen.push(req); return { text: 'Main response.', toolCalls: [] }; } };
+      const session = new HarnessSession({ host: new Host(dir), config: config(enabled), provider });
+      const result = await session.runTask('Hello', e => events.push(e));
+      assert.equal(result.outcome, 'complete');
+      assert.equal(seen.length, 1);
+      assert.ok(!isChild(seen[0]));
+      assert.equal(events.some(e => e.type === 'notice' && e.level === 'warn' && e.message.includes('Automatic subagent')), warning);
+      assert.ok(isTranscriptWellFormed([...session.transcript]));
+      assert.equal(seen[0].tools.some(t => t.name === 'delegate_task'), enabled && tools === 'subagent');
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('automatic child failure warns and still allows the main agent to answer', async () => {
+  const dir = workspace('read, subagent');
+  try {
+    const seen: boolean[] = [];
+    const events: HarnessEvent[] = [];
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      const child = isChild(req); seen.push(child);
+      if (child) throw new Error('model unavailable');
+      return { text: 'Continuing without findings.', toolCalls: [] };
+    } };
+    const session = new HarnessSession({ host: new Host(dir), config: config(true), provider });
+    const result = await session.runTask('Inspect', e => events.push(e));
+    assert.equal(result.outcome, 'complete');
+    assert.deepEqual(seen, [true, false]);
+    assert.ok(events.some(e => e.type === 'notice' && e.level === 'warn' && e.message.includes('Continuing with the main agent')));
+    assert.ok(events.some(e => e.type === 'tool-end' && e.name === 'delegate_task' && !e.ok));
+    assert.ok(session.transcript.some(m => m.role === 'tool' && /Subagent error.*model unavailable/.test(m.content)));
+    assert.ok(isTranscriptWellFormed([...session.transcript]));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('automatic child omits images and cancellation prevents the parent model call', async () => {
+  const dir = workspace('read, subagent');
+  try {
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const calls: ChatRequest[] = [];
+    let aborted = false;
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      calls.push(req);
+      entered();
+      await new Promise<void>(resolve => req.signal?.addEventListener('abort', () => { aborted = true; resolve(); }, { once: true }));
+      throw new Error('cancelled');
+    } };
+    const session = new HarnessSession({ host: new Host(dir), config: config(true), provider });
+    const run = session.runTask('What is this?', () => {}, { images: [{ mediaType: 'image/png', data: 'c2VjcmV0' }] });
+    await started;
+    session.cancel();
+    const result = await run;
+    assert.equal(result.outcome, 'cancelled');
+    assert.equal(aborted, true);
+    assert.equal(calls.length, 1);
+    assert.ok(isChild(calls[0]));
+    assert.ok(calls[0].messages.some(m => m.content.includes('images, but they are not available')));
+    assert.ok(!JSON.stringify(calls[0].messages).includes('c2VjcmV0'));
+    assert.ok(isTranscriptWellFormed([...session.transcript]));
+    assert.match(session.transcript.find(m => m.role === 'tool')?.content ?? '', /cancelled/i);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('automatic delegation obeys intersected tool policies and keeps recovery snapshots valid', async () => {
+  const dir = workspace('read, subagent');
+  try {
+    fs.mkdirSync(path.join(dir, '.agents'));
+    fs.writeFileSync(path.join(dir, '.agents', 'restricted.md'), '---\ntools: [read]\n---\nReview.');
+    const calls: ChatRequest[] = [];
+    const events: HarnessEvent[] = [];
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) { calls.push(req); return { text: 'Main answer.', toolCalls: [] }; } };
+    const session = new HarnessSession({ host: new Host(dir), config: config(true), provider });
+    const result = await session.runTask('Inspect', e => events.push(e));
+    assert.equal(result.outcome, 'complete');
+    assert.equal(calls.length, 1);
+    assert.equal(isChild(calls[0]), false);
+    assert.ok(events.some(e => e.type === 'notice' && e.level === 'warn' && e.message.includes('do not permit delegation')));
+    assert.ok(!calls[0].tools.some(t => t.name === 'delegate_task'));
+    assert.ok(isTranscriptWellFormed(session.conversationSnapshot));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('in-flight automatic child preserves a provider-safe conversation snapshot', async () => {
+  const dir = workspace('read, subagent');
+  try {
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      if (isChild(req)) { entered(); await gate; return { text: 'Child findings.', toolCalls: [] }; }
+      return { text: 'Parent.', toolCalls: [] };
+    } };
+    const session = new HarnessSession({ host: new Host(dir), config: config(true), provider });
+    const run = session.runTask('Investigate', () => {});
+    await started;
+    const snapshot = session.conversationSnapshot;
+    assert.ok(isTranscriptWellFormed(snapshot));
+    assert.ok(snapshot.some(m => m.role === 'user' && m.content === 'Investigate'));
+    assert.ok(!snapshot.some(m => m.role === 'assistant' && m.toolCalls?.length));
+    release();
+    await run;
+    assert.ok(isTranscriptWellFormed(session.conversationSnapshot));
+    assert.ok(session.conversationSnapshot.some(m => m.role === 'tool' && m.content.includes('Child findings.')));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
