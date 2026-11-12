@@ -100,6 +100,7 @@ export class HarnessSession {
    * it as well so a restart can recover a partially completed conversation. */
   private pendingMessages?: ChatMessage[];
   private pendingAssistantText = '';
+  private subagentSequence = 0;
   private controller?: AbortController;
   private busy = false;
   private cumulativeUsage: Usage = {};
@@ -958,6 +959,7 @@ export class HarnessSession {
       const abortChild = () => child.cancel();
       signal.addEventListener('abort', abortChild, { once: true });
       const issues: string[] = [];
+      const delegation = ++this.subagentSequence;
       onEvent({ type: 'notice', level: 'info', message: 'Subagent started a read-only investigation with separate context.' });
       onEvent({ type: 'subagent-progress' });
       try {
@@ -965,16 +967,18 @@ export class HarnessSession {
         const prompt = `Delegated task: ${automaticTask ?? args.task.trim()}${typeof args.context === 'string' && args.context.trim() ? `\n\nRelevant context supplied by the parent:\n${args.context.trim()}` : ''}\n\nReturn findings with relevant file paths and evidence, and explicitly identify uncertainties or unverified details.`;
         const result = await child.runTask(prompt, (event) => {
           if (event.type === 'compaction-trace') onEvent({ type: 'compaction-trace', trace: event.trace, source: 'subagent' });
-          if (event.type === 'step') onEvent({ type: 'subagent-progress', step: event.index });
-          if (event.type === 'tool-start') {
-            onEvent({ type: 'subagent-progress', tool: event.name });
-            onEvent({ type: 'notice', level: 'info', message: `Subagent requested ${event.name}.` });
+          if (event.type === 'compaction-progress') {
+            const p = event.progress;
+            onEvent({ type: 'subagent-progress', detail: p ? `Compacting · request ${p.request}, attempt ${p.attempt} · ${p.phase === 'waiting' ? 'waiting for provider' : p.phase}` : 'Read-only investigation' });
           }
+          if (event.type === 'step') onEvent({ type: 'subagent-progress', step: event.index });
+          if (event.type === 'tool-start') onEvent({ type: 'subagent-progress', tool: event.name });
           if (event.type === 'tool-end') onEvent({ type: 'subagent-progress' });
           if (event.type === 'tool-end' && !event.ok) issues.push(`${event.name}: ${event.summary}`);
-          if (event.type === 'notice' && (event.level === 'warn' || event.level === 'error')) {
-            issues.push(event.message);
-            onEvent({ type: 'notice', level: event.level, message: `Subagent: ${event.message}` });
+          if (event.type === 'notice' && (event.level === 'warn' || event.level === 'error')) issues.push(event.message);
+          if (event.type === 'assistant-delta' || event.type === 'assistant' || event.type === 'thinking-delta' ||
+              event.type === 'thinking' || event.type === 'tool-start' || event.type === 'tool-end' || event.type === 'notice') {
+            onEvent({ type: 'subagent-event', id: call.id, delegation, event });
           }
         });
         this.cumulativeUsage = mergeUsage(this.cumulativeUsage, result.usage);

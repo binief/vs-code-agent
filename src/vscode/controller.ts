@@ -52,7 +52,7 @@ export interface TranscriptImage {
   bytes?: number;
 }
 
-export type TranscriptItem =
+export type TranscriptItem = (
   | { id: string; kind: 'user'; text: string; images?: TranscriptImage[] }
   | { id: string; kind: 'assistant'; text: string; final: boolean; streaming?: boolean }
   | {
@@ -78,7 +78,8 @@ export type TranscriptItem =
     }
   | { id: string; kind: 'approval'; approvalId: string; request: ApprovalRequest; decision?: 'apply' | 'reject'; interrupted?: boolean }
   | { id: string; kind: 'notice'; level: 'info' | 'warn' | 'error'; message: string }
-  | { id: string; kind: 'done'; reason: TaskOutcome; summary: string; filesChanged: string[]; usage?: Usage; tokensPerSecond?: number };
+  | { id: string; kind: 'done'; reason: TaskOutcome; summary: string; filesChanged: string[]; usage?: Usage; tokensPerSecond?: number }
+) & { source?: 'subagent'; parentToolCallId?: string };
 
 /** What the agent is doing right now, for the live activity strip. */
 export interface Activity {
@@ -206,6 +207,12 @@ export interface McpSettingsSnapshot {
 }
 
 const MAX_ITEMS = 400;
+const MAX_SUBAGENT_ITEMS = 120;
+const MAX_SUBAGENT_TEXT = 48_000;
+const SUBAGENT_TRUNCATED = '\n… [subagent display truncated]';
+function capSubagentText(text: string): string {
+  return text.length > MAX_SUBAGENT_TEXT ? text.slice(0, MAX_SUBAGENT_TEXT) + SUBAGENT_TRUNCATED : text;
+}
 const CHAT_FILE = 'current-chat.json';
 const CHAT_SAVE_DELAY_MS = 1500;
 const CHAT_STORAGE_LIMIT_MESSAGE = 'Chat exceeds the 512 MB storage limit; start a new conversation to continue saving.';
@@ -242,6 +249,8 @@ export class HarnessController {
   private readonly mcpInputCache = new Map<string, string>();
   private agentNoticeShown = false;
   private items: TranscriptItem[] = [];
+  /** Child display is transient and never enters chat saves or exports. */
+  private readonly subagentItemIds = new Set<string>();
   /** Restored before the first session is created, then handed to the agent. */
   private restoredHistory: ChatMessage[] = [];
   private restoredOriginalHistory: ChatMessage[] = [];
@@ -517,7 +526,7 @@ export class HarnessController {
       version: CHAT_ARCHIVE_VERSION,
       savedAt: new Date().toISOString(),
       inProgress: this.state.busy,
-      items: this.items,
+      items: this.items.filter((item) => !this.subagentItemIds.has(item.id)),
       history: this.session ? this.session.conversationSnapshot : this.restoredHistory,
       originalHistory: this.session ? this.session.originalConversationSnapshot : this.restoredOriginalHistory,
       originalHistoryComplete: this.session ? this.session.isOriginalConversationComplete : this.restoredOriginalComplete,
@@ -528,6 +537,7 @@ export class HarnessController {
   /** Recovered cards are historical: no interrupted tool or approval can resume. */
   private applyChatArchive(archive: ChatArchive): boolean {
     let interrupted = archive.inProgress;
+    this.subagentItemIds.clear();
     this.items = archive.items.map((item): TranscriptItem => {
       if (item.kind === 'assistant' && item.streaming) {
         interrupted = true;
@@ -1256,6 +1266,7 @@ export class HarnessController {
     this.cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
     this.lastTokensPerSecond = 0;
     this.items = [];
+    this.subagentItemIds.clear();
     this.state = {
       ...this.state,
       usage: { ...this.cumulativeUsage },
@@ -1937,9 +1948,12 @@ export class HarnessController {
         break;
       case 'subagent-progress':
         this.activity = { ...this.activity, status: 'subagent', tool: event.tool ?? null,
-          detail: event.tool ? `Running ${event.tool}` : event.step ? `Read-only investigation · step ${event.step}` : 'Read-only investigation',
+          detail: event.detail ?? (event.tool ? `Running ${event.tool}` : event.step ? `Read-only investigation · step ${event.step}` : 'Read-only investigation'),
           startedAt: this.activity.status === 'subagent' ? this.activity.startedAt : Date.now() };
         this.postActivity();
+        break;
+      case 'subagent-event':
+        this.handleSubagentEvent(event.id, event.delegation, event.event);
         break;
       case 'step':
         this.state = { ...this.state, step: event.index };
@@ -1979,6 +1993,7 @@ export class HarnessController {
         });
         break;
       case 'tool-end': {
+        if (event.name === 'delegate_task') this.closeSubagentItems(event.id);
         this.activity = {
           ...this.activity,
           status: 'thinking',
@@ -2132,7 +2147,77 @@ export class HarnessController {
       default:
         break;
     }
-    if (event.type !== 'status' && event.type !== 'step') this.scheduleChatSave();
+    if (event.type !== 'status' && event.type !== 'step' && event.type !== 'subagent-event') this.scheduleChatSave();
+  }
+
+  private closeSubagentItems(parentId: string): void {
+    for (const item of this.items) {
+      if (item.source !== 'subagent' || item.parentToolCallId !== parentId) continue;
+      if ((item.kind === 'assistant' || item.kind === 'thinking') && item.streaming) {
+        const entry = this.streams.get(item.id);
+        if (entry?.timer) clearTimeout(entry.timer);
+        this.streams.delete(item.id);
+        item.streaming = false;
+        this.post({ type: 'update', item: { ...item } });
+      } else if (item.kind === 'tool' && item.status === 'running') {
+        item.status = 'failed';
+        item.summary = 'Interrupted';
+        item.detail = 'The subagent stopped before this tool finished.';
+        this.post({ type: 'update', item: { ...item } });
+      }
+    }
+  }
+
+  private addSubagentItem(item: TranscriptItem): void {
+    this.subagentItemIds.add(item.id);
+    this.items.push(item);
+    this.post({ type: 'item', item: { ...item } });
+    this.trimItems();
+  }
+
+  private handleSubagentEvent(parentId: string, delegation: number, event: import('../core/types').SubagentDisplayEvent): void {
+    const source = { source: 'subagent' as const, parentToolCallId: parentId };
+    const prefix = `subagent:${JSON.stringify([parentId, delegation])}`;
+    switch (event.type) {
+      case 'assistant-delta':
+        this.appendDelta(`${prefix}:assistant:${event.id}`, event.text, parentId);
+        break;
+      case 'assistant':
+        this.finishAssistant(`${prefix}:assistant:${event.id}`, event.text, event.final, parentId);
+        break;
+      case 'thinking-delta':
+        this.appendThinkingDelta(`${prefix}:thinking:${event.id}`, event.text, parentId);
+        break;
+      case 'thinking':
+        this.finishThinking(`${prefix}:thinking:${event.id}`, event.text, event.durationMs, parentId);
+        break;
+      case 'tool-start': {
+        const id = `${prefix}:tool:${event.id}`;
+        this.addSubagentItem({ ...source, id, kind: 'tool', toolCallId: id, name: event.name.slice(0, 256),
+          args: capSubagentText(event.args), status: 'running', startedAt: Date.now() });
+        break;
+      }
+      case 'tool-end': {
+        const id = `${prefix}:tool:${event.id}`;
+        const item = this.items.find((entry): entry is Extract<TranscriptItem, { kind: 'tool' }> => entry.kind === 'tool' && entry.id === id);
+        if (item) {
+          item.status = event.ok ? 'ok' : 'failed';
+          item.summary = capSubagentText(event.summary);
+          item.detail = capSubagentText(event.detail);
+          item.durationMs = event.durationMs;
+          item.relPath = event.relPath;
+          this.post({ type: 'update', item: { ...item } });
+        } else {
+          this.addSubagentItem({ ...source, id, kind: 'tool', toolCallId: id, name: event.name.slice(0, 256), args: '',
+            status: event.ok ? 'ok' : 'failed', summary: capSubagentText(event.summary), detail: capSubagentText(event.detail),
+            durationMs: event.durationMs, relPath: event.relPath });
+        }
+        break;
+      }
+      case 'notice':
+        this.addSubagentItem({ ...source, id: this.id(), kind: 'notice', level: event.level, message: capSubagentText(event.message) });
+        break;
+    }
   }
 
   private patchApproval(approvalId: string, decision: 'apply' | 'reject'): void {
@@ -2146,16 +2231,19 @@ export class HarnessController {
   }
 
   /** Append a streamed fragment; creates the bubble on the first fragment. */
-  private appendDelta(id: string, text: string): void {
+  private appendDelta(id: string, text: string, parentId?: string): void {
     let item = this.items.find(
       (i): i is Extract<TranscriptItem, { kind: 'assistant' }> => i.kind === 'assistant' && i.id === id,
     );
     if (!item) {
-      item = { id, kind: 'assistant', text: '', final: false, streaming: true };
-      this.items.push(item);
-      this.post({ type: 'item', item: { ...item } });
+      item = { id, kind: 'assistant', text: '', final: false, streaming: true,
+        ...(parentId ? { source: 'subagent' as const, parentToolCallId: parentId } : {}) };
+      if (parentId) this.addSubagentItem(item);
+      else { this.items.push(item); this.post({ type: 'item', item: { ...item } }); }
     }
-    item.text += text;
+    if (parentId) {
+      if (!item.text.endsWith(SUBAGENT_TRUNCATED)) item.text = capSubagentText(item.text + text.slice(0, MAX_SUBAGENT_TEXT + 1));
+    } else item.text += text;
 
     // Repaint at most ~16 times a second so the webview stays responsive.
     const entry = this.streams.get(id) ?? {};
@@ -2169,16 +2257,19 @@ export class HarnessController {
   }
 
   /** Append a reasoning fragment; creates the thinking lane on first text. */
-  private appendThinkingDelta(id: string, text: string): void {
+  private appendThinkingDelta(id: string, text: string, parentId?: string): void {
     let item = this.items.find(
       (i): i is Extract<TranscriptItem, { kind: 'thinking' }> => i.kind === 'thinking' && i.id === id,
     );
     if (!item) {
-      item = { id, kind: 'thinking', text: '', streaming: true, startedAt: Date.now() };
-      this.items.push(item);
-      this.post({ type: 'item', item: { ...item } });
+      item = { id, kind: 'thinking', text: '', streaming: true, startedAt: Date.now(),
+        ...(parentId ? { source: 'subagent' as const, parentToolCallId: parentId } : {}) };
+      if (parentId) this.addSubagentItem(item);
+      else { this.items.push(item); this.post({ type: 'item', item: { ...item } }); }
     }
-    item.text += text;
+    if (parentId) {
+      if (!item.text.endsWith(SUBAGENT_TRUNCATED)) item.text = capSubagentText(item.text + text.slice(0, MAX_SUBAGENT_TEXT + 1));
+    } else item.text += text;
 
     const entry = this.streams.get(id) ?? {};
     if (!entry.timer) {
@@ -2191,7 +2282,7 @@ export class HarnessController {
   }
 
   /** Close the thinking lane: keep the text, record how long it ran. */
-  private finishThinking(id: string, text: string, durationMs: number): void {
+  private finishThinking(id: string, text: string, durationMs: number, parentId?: string): void {
     const entry = this.streams.get(id);
     if (entry?.timer) clearTimeout(entry.timer);
     this.streams.delete(id);
@@ -2199,15 +2290,18 @@ export class HarnessController {
     const item = this.items.find(
       (i): i is Extract<TranscriptItem, { kind: 'thinking' }> => i.kind === 'thinking' && i.id === id,
     );
-    if (!item) return;
-    item.text = text || item.text;
+    if (!item) {
+      if (parentId && text) this.addSubagentItem({ id, kind: 'thinking', text: capSubagentText(text), streaming: false, durationMs, source: 'subagent', parentToolCallId: parentId });
+      return;
+    }
+    item.text = text ? (item.source === 'subagent' ? capSubagentText(text) : text) : item.text;
     item.streaming = false;
     item.durationMs = durationMs || (item.startedAt ? Date.now() - item.startedAt : 0);
     this.post({ type: 'update', item: { ...item } });
   }
 
   /** Finalise a model turn: reconcile with the authoritative full text. */
-  private finishAssistant(id: string, text: string, final: boolean): void {
+  private finishAssistant(id: string, text: string, final: boolean, parentId?: string): void {
     const entry = this.streams.get(id);
     if (entry?.timer) clearTimeout(entry.timer);
     this.streams.delete(id);
@@ -2218,10 +2312,11 @@ export class HarnessController {
 
     if (!item) {
       if (!text) return;
-      this.push({ id: id || this.id(), kind: 'assistant', text, final });
+      if (parentId) this.addSubagentItem({ id, kind: 'assistant', text: capSubagentText(text), final, source: 'subagent', parentToolCallId: parentId });
+      else this.push({ id: id || this.id(), kind: 'assistant', text, final });
       return;
     }
-    item.text = text || item.text;
+    item.text = text ? (parentId ? capSubagentText(text) : text) : item.text;
     item.final = final;
     item.streaming = false;
     this.post({ type: 'update', item: { ...item } });
@@ -2351,8 +2446,22 @@ export class HarnessController {
   }
 
   private trimItems(): void {
-    if (this.items.length <= MAX_ITEMS) return;
-    this.items = this.items.slice(this.items.length - MAX_ITEMS);
+    let regular = 0;
+    let transient = 0;
+    const keep: TranscriptItem[] = [];
+    for (let i = this.items.length - 1; i >= 0; i--) {
+      const item = this.items[i];
+      const ephemeral = this.subagentItemIds.has(item.id);
+      if ((ephemeral ? ++transient <= MAX_SUBAGENT_ITEMS : ++regular <= MAX_ITEMS)) keep.push(item);
+      else if (ephemeral) {
+        this.subagentItemIds.delete(item.id);
+        const stream = this.streams.get(item.id);
+        if (stream?.timer) clearTimeout(stream.timer);
+        this.streams.delete(item.id);
+        this.post({ type: 'remove-item', id: item.id });
+      }
+    }
+    this.items = keep.reverse();
   }
 
   private id(): string {

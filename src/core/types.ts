@@ -472,11 +472,21 @@ export type CompactionTraceEvent =
   | { kind: 'complete'; request: number; text: string; reasoning?: string; finishReason?: string; streamComplete?: boolean; usage?: Usage; toolCalls?: ToolCall[] }
   | { kind: 'failed'; request: number; cancelled: boolean };
 
+export type SubagentDisplayEvent =
+  | { type: 'assistant-delta'; id: string; text: string }
+  | { type: 'assistant'; id: string; text: string; final: boolean; streamed: boolean }
+  | { type: 'thinking-delta'; id: string; text: string }
+  | { type: 'thinking'; id: string; text: string; durationMs: number }
+  | { type: 'tool-start'; id: string; name: string; args: string }
+  | { type: 'tool-end'; id: string; name: string; ok: boolean; summary: string; detail: string; durationMs: number; relPath?: string }
+  | { type: 'notice'; message: string; level: 'info' | 'warn' | 'error' };
+
 export type HarnessEvent =
   | { type: 'status'; status: 'idle' | 'thinking' | 'executing' | 'approval' }
   | { type: 'compaction-progress'; progress: CompactionProgress | null }
   | { type: 'compaction-trace'; trace: CompactionTraceEvent; source?: 'main' | 'subagent' }
-  | { type: 'subagent-progress'; step?: number; tool?: string }
+  | { type: 'subagent-progress'; step?: number; tool?: string; detail?: string }
+  | { type: 'subagent-event'; id: string; delegation: number; event: SubagentDisplayEvent }
   | { type: 'step'; index: number; maxSteps: number }
   | { type: 'assistant-delta'; id: string; text: string }
   | { type: 'assistant'; id: string; text: string; final: boolean; streamed: boolean }

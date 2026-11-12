@@ -579,3 +579,33 @@ test('Copilot picker leaves settings unchanged when no models are available or s
     vscodeStub.window.showWarningMessage = oldWarn;
   }
 });
+
+test('subagent streams and tools are attributed, isolated, bounded, and omitted from archives', () => {
+  const { controller, messages } = makeController();
+  const c = controller as any;
+  const emit = (delegation: number, event: any) => c.handleEvent({ type: 'subagent-event', id: 'task:delegate', delegation, event });
+  c.handleEvent({ type: 'subagent-progress', step: 2 });
+  const before = { ...c.activity };
+  emit(1, { type: 'assistant-delta', id: 'same', text: 'private child text' });
+  emit(1, { type: 'thinking-delta', id: 'same', text: 'private thought' });
+  emit(1, { type: 'tool-start', id: 'same', name: 'read_file', args: '{"path":"secret"}' });
+  emit(1, { type: 'tool-end', id: 'same', name: 'read_file', ok: false, summary: 'failed', detail: 'secret output', durationMs: 12 });
+  emit(2, { type: 'tool-start', id: 'same', name: 'read_file', args: '{}' });
+  emit(2, { type: 'assistant', id: 'same', text: 'x'.repeat(60000), final: true, streamed: false });
+  assert.deepEqual(c.activity, before, 'child events must not replace parent activity');
+  const items = c.items.filter((i: any) => i.source === 'subagent');
+  assert.equal(items.filter((i: any) => i.kind === 'tool').length, 2);
+  assert.notEqual(items.filter((i: any) => i.kind === 'tool')[0].id, items.filter((i: any) => i.kind === 'tool')[1].id);
+  assert.ok(items.every((i: any) => i.parentToolCallId === 'task:delegate'));
+  assert.equal(items.find((i: any) => i.kind === 'tool').status, 'failed');
+  assert.ok(items.some((i: any) => i.text?.includes('[subagent display truncated]')));
+  assert.ok(!JSON.stringify(c.currentChatArchive()).includes('private child text'));
+  assert.ok(!JSON.stringify(c.currentChatArchive()).includes('secret output'));
+  c.handleEvent({ type: 'tool-end', id: 'task:delegate', name: 'delegate_task', ok: false, summary: 'cancelled', detail: '', durationMs: 10 });
+  assert.ok(items.filter((i: any) => i.kind === 'tool').every((i: any) => i.status === 'failed'));
+  assert.ok(items.filter((i: any) => i.kind === 'assistant' || i.kind === 'thinking').every((i: any) => !i.streaming));
+  for (let n = 0; n < 150; n++) emit(3, { type: 'notice', level: 'info', message: `n${n}` });
+  assert.equal(c.items.filter((i: any) => i.source === 'subagent').length, 120);
+  assert.ok(messages.some(m => m.type === 'remove-item'));
+  assert.ok(!JSON.stringify(c.currentChatArchive()).includes('"source":"subagent"'));
+});

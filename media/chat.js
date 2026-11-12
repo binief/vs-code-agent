@@ -919,10 +919,11 @@
   }
 
   function renderAssistant(item) {
-    const node = el('div', 'msg assistant' + (item.streaming ? ' streaming' : ''));
+    const node = el('div', 'msg assistant' + (item.streaming ? ' streaming' : '') + (item.source === 'subagent' ? ' subagent-item' : ''));
     node.dataset.id = item.id;
     node.setAttribute('role', 'article');
-    node.setAttribute('aria-label', 'Assistant');
+    node.setAttribute('aria-label', item.source === 'subagent' ? 'Subagent response' : 'Assistant');
+    if (item.source === 'subagent') node.appendChild(el('div', 'subagent-label', 'Subagent · temporary'));
 
     const body = el('div', 'msg-body prose');
     body.innerHTML = renderMarkdown(item.text);
@@ -943,7 +944,7 @@
    * does not crowd out the actual results.
    */
   function renderThinking(item) {
-    const node = el('div', 'thinking' + (item.streaming ? ' open' : ''));
+    const node = el('div', 'thinking' + (item.streaming ? ' open' : '') + (item.source === 'subagent' ? ' subagent-item' : ''));
     node.dataset.id = item.id;
     if (item.open) {
       node.classList.add('open');
@@ -952,7 +953,7 @@
 
     const head = el('div', 'thinking-head');
     head.appendChild(icon('spark', 'thinking-icon'));
-    head.appendChild(el('span', 'thinking-label', item.streaming ? 'Thinking' : 'Thought'));
+    head.appendChild(el('span', 'thinking-label', (item.source === 'subagent' ? 'Subagent · ' : '') + (item.streaming ? 'Thinking' : 'Thought')));
     const preview = el('span', 'thinking-preview');
     preview.textContent = item.streaming ? '' : oneLine(item.text);
     head.appendChild(preview);
@@ -974,16 +975,16 @@
 
   function renderNotice(item) {
     const level = item.level === 'info' ? '' : ' ' + item.level;
-    const node = el('div', 'msg notice' + level);
+    const node = el('div', 'msg notice' + level + (item.source === 'subagent' ? ' subagent-item' : ''));
     node.dataset.id = item.id;
     node.appendChild(icon(item.level === 'error' || item.level === 'warn' ? 'warn' : 'info'));
-    node.appendChild(el('div', 'notice-text', item.message));
+    node.appendChild(el('div', 'notice-text', (item.source === 'subagent' ? 'Subagent · ' : '') + item.message));
     return node;
   }
 
   function renderTool(item) {
     const status = item.status || 'running';
-    const node = el('div', 'tool ' + status);
+    const node = el('div', 'tool ' + status + (item.source === 'subagent' ? ' subagent-item' : ''));
     node.dataset.id = item.id;
     // A running tool stays open so its output is visible; a failure stays open
     // because the user needs to read it. Success collapses to one line.
@@ -999,6 +1000,7 @@
     head.setAttribute('role', 'button');
     head.setAttribute('tabindex', '0');
     head.appendChild(icon(toolIconName(item.name), 'tool-icon'));
+    if (item.source === 'subagent') head.appendChild(el('span', 'subagent-label', 'Subagent'));
     head.appendChild(el('span', 'tool-name', item.name));
     const arg = primaryArg(item);
     if (arg) {
@@ -1409,7 +1411,7 @@
         const preview = node.querySelector('.thinking-preview');
         if (preview) preview.textContent = oneLine(merged.text);
         const label = node.querySelector('.thinking-label');
-        if (label) label.textContent = 'Thought';
+        if (label) label.textContent = (merged.source === 'subagent' ? 'Subagent · ' : '') + 'Thought';
         const head = node.querySelector('.thinking-head');
         if (head && merged.durationMs && !head.querySelector('.thinking-time')) {
           head.appendChild(el('span', 'thinking-time', formatMs(merged.durationMs)));
@@ -2170,6 +2172,14 @@
       case 'update':
         updateItem(message.item);
         break;
+      case 'remove-item': {
+        const node = elements.get(message.id);
+        if (node) node.remove();
+        elements.delete(message.id);
+        items.delete(message.id);
+        toggleEmpty();
+        break;
+      }
       case 'state':
         applyState(message.state);
         break;
