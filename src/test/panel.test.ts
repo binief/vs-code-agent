@@ -719,3 +719,22 @@ test('settings describe automatic subagent attempts and warning fallback', () =>
   assert.match(modalText, /warning appears and the main agent continues/);
   h.close();
 });
+
+test('subagent response, thought, notices and tool cards stay labeled through streaming updates', () => {
+  const { doc, send } = mount();
+  const source = { source: 'subagent', parentToolCallId: 'delegate' };
+  send({ type: 'item', item: { ...source, id: 'a', kind: 'assistant', text: 'working', streaming: true, final: false } });
+  send({ type: 'update', item: { ...source, id: 'a', kind: 'assistant', text: 'done', streaming: false, final: true } });
+  send({ type: 'item', item: { ...source, id: 't', kind: 'thinking', text: 'considering', streaming: true } });
+  send({ type: 'update', item: { ...source, id: 't', kind: 'thinking', text: 'considered', streaming: false, durationMs: 8 } });
+  send({ type: 'item', item: { ...source, id: 'tool', kind: 'tool', toolCallId: 'tool', name: 'read_file', args: '{"path":"x"}', status: 'running' } });
+  send({ type: 'update', item: { ...source, id: 'tool', kind: 'tool', toolCallId: 'tool', name: 'read_file', args: '{"path":"x"}', status: 'failed', summary: 'failed', detail: 'no file' } });
+  send({ type: 'item', item: { ...source, id: 'n', kind: 'notice', level: 'warn', message: 'child warning' } });
+  assert.match(doc.querySelector('[data-id="a"]').textContent, /Subagent.*temporary/);
+  assert.match(doc.querySelector('[data-id="t"] .thinking-label').textContent, /Subagent.*Thought/);
+  assert.match(doc.querySelector('[data-id="tool"]').textContent, /Subagent/);
+  assert.match(doc.querySelector('[data-id="tool"]').textContent, /no file/);
+  assert.match(doc.querySelector('[data-id="n"]').textContent, /Subagent.*child warning/);
+  send({ type: 'remove-item', id: 'tool' });
+  assert.equal(doc.querySelector('[data-id="tool"]'), null);
+});

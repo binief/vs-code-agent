@@ -196,7 +196,7 @@
         <button type="button" id="feature-copilot">Select GitHub Copilot model…</button>
         <p>Uses your VS Code Copilot sign-in. VS Code may request consent. Model availability and usage limits depend on your account.</p>
         <label class="check-row"><input type="checkbox" id="feature-subagents" /><span>Run a read-only subagent for every task</span></label>
-        <p>Before each task, the harness starts a subagent if selected agent files allow <code>subagent</code> (or <code>delegate_task</code>) and read/search tools. If it cannot run or fails, a warning appears and the main agent continues. Each extra model call can increase time and token usage. The activity strip and tool card show its progress.</p>
+        <p>Before each task, the harness starts a subagent if selected agent files allow <code>subagent</code> (or <code>delegate_task</code>) and read/search tools. If it cannot run or fails, a warning appears and the main agent continues. Each extra model call can increase time and token usage. Subagent responses, thinking and tool cards appear in the chat temporarily; they are not saved or exported.</p>
         <label class="check-row"><input type="checkbox" id="feature-local-fallback" /><span>Enable local fallback compaction</span></label>
         <p>When LLM compaction fails, use local excerpts instead. This is lossy: older details may be omitted. Original messages remain in the session and saved chats when saving is enabled. Stop never triggers fallback.</p>
         <button type="button" id="feature-compact-local">Compact locally now…</button>

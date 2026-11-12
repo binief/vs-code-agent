@@ -351,3 +351,67 @@ test('in-flight automatic child preserves a provider-safe conversation snapshot'
     assert.ok(session.conversationSnapshot.some(m => m.role === 'tool' && m.content.includes('Child findings.')));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('automatic and requested children forward streams and tools without leaking their transcript to the parent', async () => {
+  const dir = workspace('read, subagent');
+  try {
+    let childRuns = 0;
+    let mainTurns = 0;
+    const events: HarnessEvent[] = [];
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      if (isChild(req)) {
+        const toolResults = req.messages.filter(m => m.role === 'tool');
+        if (!toolResults.length) {
+          childRuns++;
+          req.onThinking?.('PRIVATE THINKING');
+          req.onDelta?.('PRIVATE INTERMEDIATE');
+          return { text: 'PRIVATE INTERMEDIATE', toolCalls: [{ id: 'same-tool', name: 'read_file', arguments: '{"path":"secret.txt"}' },
+            { id: 'denied', name: 'write_file', arguments: '{}' }] };
+        }
+        req.onDelta?.('Public findings');
+        return { text: 'Public findings', toolCalls: [] };
+      }
+      assert.ok(!JSON.stringify(req.messages).includes('PRIVATE INTERMEDIATE'));
+      assert.ok(!JSON.stringify(req.messages).includes('PRIVATE THINKING'));
+      assert.ok(!req.messages.some(m => m.role === 'tool' && m.name === 'read_file'));
+      return ++mainTurns === 1 ? { text: '', toolCalls: [delegation()] } : { text: 'Parent answer', toolCalls: [] };
+    } };
+    const session = new HarnessSession({ host: new Host(dir), config: { ...config(true), stream: true, showThinking: true }, provider });
+    await session.runTask('Inspect', e => events.push(e));
+    assert.equal(childRuns, 2);
+    const child = events.filter(e => e.type === 'subagent-event');
+    assert.equal(new Set(child.map(e => e.delegation)).size, 2);
+    assert.ok(child.some(e => e.event.type === 'assistant-delta' && e.event.text.includes('PRIVATE')));
+    assert.ok(child.some(e => e.event.type === 'thinking-delta' && e.event.text.includes('PRIVATE')));
+    assert.equal(child.filter(e => e.event.type === 'tool-start' && e.event.name === 'read_file').length, 2);
+    assert.ok(child.some(e => e.event.type === 'tool-end' && e.event.name === 'read_file' && e.event.ok && e.event.detail.includes('Evidence')));
+    assert.ok(child.some(e => e.event.type === 'tool-end' && e.event.name === 'write_file' && !e.event.ok));
+    assert.ok(!JSON.stringify(session.transcript).includes('PRIVATE INTERMEDIATE'));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('cancelling a child after it streams prevents the parent model call', async () => {
+  const dir = workspace('read, subagent');
+  try {
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    let calls = 0;
+    const events: HarnessEvent[] = [];
+    const provider: Provider = { id: 'test', label: 'test', async chat(req) {
+      calls++;
+      assert.ok(isChild(req));
+      req.onDelta?.('partial child response');
+      entered();
+      await new Promise<void>(resolve => req.signal?.addEventListener('abort', () => resolve(), { once: true }));
+      throw new Error('cancelled');
+    } };
+    const session = new HarnessSession({ host: new Host(dir), config: { ...config(true), stream: true }, provider });
+    const run = session.runTask('Inspect', e => events.push(e));
+    await started;
+    session.cancel();
+    assert.equal((await run).outcome, 'cancelled');
+    assert.equal(calls, 1);
+    assert.ok(events.some(e => e.type === 'subagent-event' && e.event.type === 'assistant-delta' && e.event.text === 'partial child response'));
+    assert.ok(!JSON.stringify(session.conversationSnapshot).includes('partial child response'));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

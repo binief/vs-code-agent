@@ -624,11 +624,16 @@ kbd {
   object-fit: contain;
 }
 
+/* Child activity is visually distinct and never part of the saved chat transcript. */
+.subagent-item { border-left: 2px solid var(--vscode-textLink-foreground, var(--accent)); padding-left: 8px; margin-left: 6px; }
+.subagent-label { color: var(--vscode-textLink-foreground, var(--accent)); font-size: 10px; font-weight: 600; }
+
 /* The assistant's answer flows like a document: no bubble, real typography. */
 .msg.assistant {
   padding: 0 2px 2px;
   color: var(--vscode-foreground);
 }
+.msg.assistant.subagent-item { padding-left: 8px; }
 
 .msg.assistant.streaming .caret {
   display: inline-block;

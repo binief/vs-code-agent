@@ -306,10 +306,12 @@ or attached images; it is told when images were omitted. Only permitted built-in
 commands, use MCP, open files in the editor, or delegate again. Its file access follows the existing
 workspace and outside-workspace settings.
 
-Only the child’s final findings and any warnings are sent back to the main conversation; the child’s
-intermediate transcript is not saved in the chat. The activity strip shows **Subagent working**, and
-the `delegate_task` tool card and notices show its task and outcome. Child model usage is included in
-the session total. Cancellation of the main task also cancels the child, subject to the provider
+Only the child’s final findings and any warnings are sent back to the main model. During a task,
+the panel shows clearly labeled subagent responses, thinking (when provided and enabled), tool calls,
+results, and notices alongside the `delegate_task` card and activity strip. These child details are
+**temporary**: they are not saved or exported and disappear when the chat is reloaded. The panel keeps
+the most recent 120 child items, truncating unusually long details; the final handoff remains in the
+main chat. Child model usage is included in the session total. Cancellation of the main task also cancels the child, subject to the provider
 honoring cancellation. These findings are unverified and may omit or misstate details; the main agent
 should inspect evidence when necessary. An extra model call on every task can increase time and cost;
 it does not shrink existing main history. The offline mock planner can receive an automatic task but
