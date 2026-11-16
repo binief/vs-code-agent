@@ -3,6 +3,7 @@ import {
   buildChatmlSystemPrompt,
   ChatmlStreamParser,
   assistantMessageToText,
+  extractThinking,
   parseChatmlText,
   stripMarkers,
   toolResultToText,
@@ -170,14 +171,16 @@ export class OpenAiCompatibleProvider implements Provider {
 
     if (textMode) {
       const parsed = parseChatmlText(rawText);
-      const displayText = stripMarkers(parsed.text);
+      const extracted = extractThinking(parsed.text);
+      const displayText = stripMarkers(extracted.text);
       if (displayText && req.onDelta) req.onDelta(displayText);
+      if (extracted.thinking && req.onThinking) req.onThinking(extracted.thinking, true);
       return {
-        text: parsed.text,
+        text: extracted.text,
         toolCalls: parsed.toolCalls,
         finishReason: choice?.finish_reason ?? undefined,
         usage: normalizeUsage(json.usage),
-        thinking: thinking || undefined,
+        thinking: thinking || extracted.thinking || undefined,
       };
     }
 
@@ -402,7 +405,11 @@ async function readChatmlStream(
     const piece = normalizeContent(delta.content);
     if (!piece) return;
 
-    const { text: displayed, toolCalls } = parser.feed(piece);
+    const { text: displayed, toolCalls, thinking: thinkPiece } = parser.feed(piece);
+    if (thinkPiece) {
+      thinking += thinkPiece;
+      onThinking?.(thinkPiece);
+    }
     if (displayed) {
       text += displayed;
       onDelta(displayed);
@@ -432,6 +439,10 @@ async function readChatmlStream(
     if (flushed.text) {
       text += flushed.text;
       onDelta(flushed.text);
+    }
+    if (flushed.thinking) {
+      thinking += flushed.thinking;
+      onThinking?.(flushed.thinking);
     }
   } finally {
     try {

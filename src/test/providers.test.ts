@@ -7,6 +7,7 @@ import { toAnthropicMessages, toOpenAiMessages } from '../core/providers';
 import {
   assistantMessageToText,
   buildChatmlSystemPrompt,
+  extractThinking,
   parseChatmlText,
   parseToolCallBlock,
   serializeToolCall,
@@ -493,6 +494,62 @@ test('OpenAI text mode streaming parses split markers', async () => {
   }
 });
 
+test('OpenAI text mode streaming routes thinking blocks to thinking lane', async () => {
+  const encoder = new TextEncoder();
+  const events = [
+    `data: ${JSON.stringify({ choices: [{ delta: { content: 'I will ' } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: { content: '<|thinking|>' } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: { content: 'planning' } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: { content: '<|/thinking|> done.' } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ finish_reason: 'stop' }] })}\n\n`,
+    'data: [DONE]\n\n',
+  ];
+  const payload = encoder.encode(events.join(''));
+  const chunks: Uint8Array[] = [];
+  for (let i = 0; i < payload.length; i += 5) chunks.push(payload.slice(i, i + 5));
+
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  });
+  const res = new Response(body, {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  });
+
+  const stub = (async () => res) as unknown as typeof fetch;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = stub;
+  try {
+    const provider = new OpenAiCompatibleProvider({
+      apiKey: 'test-key',
+      baseUrl: 'https://example.test/v1',
+      textToolMode: true,
+    });
+    const deltas: string[] = [];
+    const thoughts: string[] = [];
+    const response = await provider.chat({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'read a.ts' }],
+      tools: [{ name: 'read_file', description: 'read', parameters: { type: 'object' } }],
+      onDelta: (text) => deltas.push(text),
+      onThinking: (text) => thoughts.push(text),
+    });
+    // Thinking is routed to the thinking lane, not visible text.
+    assert.equal(response.text, 'I will  done.');
+    assert.equal(response.thinking, 'planning');
+    // Raw thinking markers never appear in deltas.
+    assert.ok(!deltas.some((d) => d.includes('<|thinking|>')));
+    assert.ok(!deltas.some((d) => d.includes('<|/thinking|>')));
+    assert.equal(deltas.join(''), 'I will  done.');
+    assert.equal(thoughts.join(''), 'planning');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('OpenAI text mode no-tools requests remain normal (e.g. compaction)', async () => {
   let sentBody: string | undefined;
   const stub = (async (_input: any, init?: any) => {
@@ -523,4 +580,50 @@ test('OpenAI text mode no-tools requests remain normal (e.g. compaction)', async
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+/* ------------------------------------------------ extractThinking */
+
+test('extractThinking extracts thinking blocks and returns clean text', () => {
+  const { text, thinking } = extractThinking(
+    'Here is my answer.<|thinking|>I need to think about this.<|/thinking|>Done.',
+  );
+  assert.equal(text, 'Here is my answer.Done.');
+  assert.equal(thinking, 'I need to think about this.');
+});
+
+test('extractThinking handles multiple thinking blocks', () => {
+  const { text, thinking } = extractThinking(
+    '<|thinking|>first thought<|/thinking|>middle<|thinking|>second thought<|/thinking|>end',
+  );
+  assert.equal(text, 'middleend');
+  assert.equal(thinking, 'first thoughtsecond thought');
+});
+
+test('extractThinking returns empty for no thinking blocks', () => {
+  const { text, thinking } = extractThinking('Just plain text.');
+  assert.equal(text, 'Just plain text.');
+  assert.equal(thinking, '');
+});
+
+test('extractThinking handles empty input', () => {
+  const { text, thinking } = extractThinking('');
+  assert.equal(text, '');
+  assert.equal(thinking, '');
+});
+
+test('extractThinking leaves incomplete thinking blocks in place', () => {
+  const { text, thinking } = extractThinking(
+    'Hello <|thinking|>incomplete thought',
+  );
+  assert.equal(text, 'Hello <|thinking|>incomplete thought');
+  assert.equal(thinking, '');
+});
+
+test('extractThinking strips thinking markers but keeps text between blocks', () => {
+  const { text, thinking } = extractThinking(
+    'A<|thinking|>think<|/thinking|>B<|thinking|>think2<|/thinking|>C',
+  );
+  assert.equal(text, 'ABC');
+  assert.equal(thinking, 'thinkthink2');
 });

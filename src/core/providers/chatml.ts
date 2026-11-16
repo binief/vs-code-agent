@@ -27,6 +27,8 @@ export const CHATML_TOOL_CALL_START = '<|tool_call|>';
 export const CHATML_TOOL_CALL_END = '<|/tool_call|>';
 export const CHATML_TOOL_RESULT_START = '<|tool_result|>';
 export const CHATML_TOOL_RESULT_END = '<|/tool_result|>';
+export const CHATML_THINKING_START = '<|thinking|>';
+export const CHATML_THINKING_END = '<|/thinking|>';
 
 /** All markers that must be stripped from user-facing assistant text. */
 const ALL_MARKERS = [
@@ -34,6 +36,8 @@ const ALL_MARKERS = [
   CHATML_TOOL_CALL_END,
   CHATML_TOOL_RESULT_START,
   CHATML_TOOL_RESULT_END,
+  CHATML_THINKING_START,
+  CHATML_THINKING_END,
 ];
 
 /** Build the system prompt for text mode: original system text plus a tool
@@ -135,6 +139,39 @@ export function stripMarkers(text: string): string {
   return out;
 }
 
+/** Extract all complete `…` blocks from text.
+ * Returns the text with thinking blocks removed, plus the concatenated
+ * thinking content. Incomplete blocks (start seen, no end yet) are left
+ * in the returned text so a later chunk can complete them.
+ */
+export function extractThinking(text: string): { text: string; thinking: string } {
+  const thinking: string[] = [];
+  let clean = '';
+  let remaining = text;
+
+  for (;;) {
+    const startIdx = remaining.indexOf(CHATML_THINKING_START);
+    if (startIdx === -1) {
+      clean += remaining;
+      break;
+    }
+    clean += remaining.slice(0, startIdx);
+
+    const afterStart = startIdx + CHATML_THINKING_START.length;
+    const endIdx = remaining.indexOf(CHATML_THINKING_END, afterStart);
+    if (endIdx === -1) {
+      // Incomplete block: leave it in place so a later chunk can complete it.
+      clean += remaining.slice(startIdx);
+      break;
+    }
+
+    thinking.push(remaining.slice(afterStart, endIdx));
+    remaining = remaining.slice(endIdx + CHATML_THINKING_END.length);
+  }
+
+  return { text: clean, thinking: thinking.join('') };
+}
+
 /** --------------------------------------------------------------- streaming */
 
 /** Incremental parser for the ChatML tool-call text protocol over SSE deltas.
@@ -146,26 +183,43 @@ export function stripMarkers(text: string): string {
  * are never emitted as text. Incomplete blocks (start marker seen, no end
  * marker yet) are buffered and not emitted until completed or flushed.
  */
+export interface ChatmlFeedResult {
+  /** Plain text safe to display (markers stripped, thinking removed). */
+  text: string;
+  /** Newly completed tool calls. */
+  toolCalls: ToolCall[];
+  /** Newly completed thinking content. */
+  thinking: string;
+}
+
 export class ChatmlStreamParser {
   private buffer = '';
   private pendingText = '';
+  private pendingThinking = '';
   private readonly toolCalls: ToolCall[] = [];
 
-  /** Feed a fragment of model output. Returns text safe to display and any
-   * newly completed tool calls. */
-  feed(fragment: string): { text: string; toolCalls: ToolCall[] } {
+  /** Feed a fragment of model output. Returns text safe to display, any
+   * newly completed tool calls, and any newly completed thinking content.
+   * `…` blocks are routed to `thinking` and stripped from `text`.
+   */
+  feed(fragment: string): ChatmlFeedResult {
     this.buffer += fragment;
     const emitted: ToolCall[] = [];
     let text = '';
+    let thinking = '';
 
     for (;;) {
-      const startIdx = this.buffer.indexOf(CHATML_TOOL_CALL_START);
+      // Find the earliest of any start marker.
+      const toolStart = this.buffer.indexOf(CHATML_TOOL_CALL_START);
+      const thinkStart = this.buffer.indexOf(CHATML_THINKING_START);
+      const startIdx = toolStart === -1 ? thinkStart :
+        thinkStart === -1 ? toolStart :
+        Math.min(toolStart, thinkStart);
+
       if (startIdx === -1) {
         // No complete start marker. Find the longest suffix that is a prefix
         // of any protocol marker and keep it in the buffer. Emit everything
-        // before it as safe plain text. But if the text we'd emit starts with
-        // '<' and could itself be the beginning of a marker, keep it too — it
-        // may be a partial marker from a previous feed that wasn't completed.
+        // before it as safe plain text.
         let bestPartial = '';
         for (const marker of ALL_MARKERS) {
           const partial = longestPrefixSuffix(this.buffer, marker);
@@ -184,9 +238,11 @@ export class ChatmlStreamParser {
         break;
       }
 
+      const isThinking = this.buffer.startsWith(CHATML_THINKING_START, startIdx);
+      const startMarker = isThinking ? CHATML_THINKING_START : CHATML_TOOL_CALL_START;
+
       // Everything before the start marker is plain text, unless it looks
-      // like a dead partial marker (e.g. a duplicated fragment that wasn't
-      // completed). Discard such leading partial-marker text.
+      // like a dead partial marker. Discard such leading partial-marker text.
       let preText = this.buffer.slice(0, startIdx);
       if (preText.startsWith('<') &&
           ALL_MARKERS.some((m) => m.startsWith(preText))) {
@@ -194,40 +250,51 @@ export class ChatmlStreamParser {
       }
       text += preText;
 
-      const afterStart = startIdx + CHATML_TOOL_CALL_START.length;
+      const afterStart = startIdx + startMarker.length;
       const rest = this.buffer.slice(afterStart);
 
-      const endIdx = rest.indexOf(CHATML_TOOL_CALL_END);
+      const endMarker = isThinking ? CHATML_THINKING_END : CHATML_TOOL_CALL_END;
+      const endIdx = rest.indexOf(endMarker);
       if (endIdx === -1) {
-        // End marker not (yet) present. Do not parse an incomplete block as a
-        // tool call — wait for more data. Retain a possible partial end
-        // marker suffix; buffer everything from the start marker onwards.
-        const partial = longestPrefixSuffix(rest, CHATML_TOOL_CALL_END);
-        this.buffer = CHATML_TOOL_CALL_START + rest.slice(0, rest.length - partial.length) + partial;
+        // End marker not (yet) present. Do not parse an incomplete block.
+        // Retain a possible partial end marker suffix; buffer everything from
+        // the start marker onwards.
+        const partial = longestPrefixSuffix(rest, endMarker);
+        this.buffer = startMarker + rest.slice(0, rest.length - partial.length) + partial;
         break;
       }
 
       // Complete block found.
       const block = rest.slice(0, endIdx);
-      const call = parseToolCallBlock(block);
-      if (call) {
-        this.toolCalls.push(call);
-        emitted.push(call);
+      if (isThinking) {
+        thinking += block;
+      } else {
+        const call = parseToolCallBlock(block);
+        if (call) {
+          this.toolCalls.push(call);
+          emitted.push(call);
+        }
       }
 
-      this.buffer = this.buffer.slice(startIdx + CHATML_TOOL_CALL_START.length + block.length + CHATML_TOOL_CALL_END.length);
+      this.buffer = this.buffer.slice(startIdx + startMarker.length + block.length + endMarker.length);
     }
 
     this.pendingText += text;
-    return { text: this.flushPendingText(), toolCalls: emitted };
+    this.pendingThinking += thinking;
+    return {
+      text: this.flushPendingText(),
+      toolCalls: emitted,
+      thinking: this.flushPendingThinking(),
+    };
   }
 
-  /** Flush any buffered plain text (incomplete tool-call blocks are retained).
+  /** Flush any buffered plain text (incomplete blocks are retained).
    * Collected tool calls are preserved and remain available via `collected`. */
-  flush(): { text: string } {
+  flush(): { text: string; thinking: string } {
     const text = this.buffer;
+    const thinking = '';
     this.buffer = '';
-    return { text: this.stripMarkers(text) };
+    return { text: this.stripMarkers(text), thinking };
   }
 
   /** All tool calls collected so far (complete blocks only). */
@@ -238,6 +305,12 @@ export class ChatmlStreamParser {
   private flushPendingText(): string {
     const t = this.pendingText;
     this.pendingText = '';
+    return t;
+  }
+
+  private flushPendingThinking(): string {
+    const t = this.pendingThinking;
+    this.pendingThinking = '';
     return t;
   }
 
