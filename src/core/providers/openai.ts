@@ -1,11 +1,20 @@
 import { toDataUrl } from '../images';
 import {
+  buildChatmlSystemPrompt,
+  ChatmlStreamParser,
+  assistantMessageToText,
+  parseChatmlText,
+  stripMarkers,
+  toolResultToText,
+} from './chatml';
+import {
   DEFAULT_CONFIG,
   type ChatMessage,
   type ChatRequest,
   type Provider,
   type ProviderResponse,
   type ToolCall,
+  type ToolSpec,
   type Usage,
 } from '../types';
 import { httpError, parseRetryAfter } from './errors';
@@ -15,6 +24,8 @@ export interface OpenAiProviderOptions {
   baseUrl?: string;
   /** Extra headers (e.g. OpenRouter's HTTP-Referer, or a gateway auth header). */
   headers?: Record<string, string>;
+  /** Use ChatML text-based tool protocol instead of structured `tools`. */
+  textToolMode?: boolean;
 }
 
 interface OpenAiToolCallPayload {
@@ -84,15 +95,24 @@ export class OpenAiCompatibleProvider implements Provider {
   async chat(req: ChatRequest): Promise<ProviderResponse> {
     const streaming = Boolean(req.onDelta);
 
+    const textMode = Boolean(this.opts.textToolMode);
+
+    // In text mode we never send structured `tools`: llama.cpp without
+    // `--jinja` rejects them. Tool definitions are carried in the system
+    // prompt instead, and calls/results are encoded as text.
+    const messages = textMode
+      ? toChatmlMessages(req.messages, req.tools)
+      : toOpenAiMessages(req.messages);
+
     const body: Record<string, unknown> = {
       model: req.model,
-      messages: toOpenAiMessages(req.messages),
+      messages,
       temperature: req.temperature,
       stream: streaming,
     };
     if (NEW_STYLE_TOKEN_LIMIT.test(req.model)) body.max_completion_tokens = req.maxTokens;
     else body.max_tokens = req.maxTokens;
-    if (req.tools.length > 0) {
+    if (!textMode && req.tools.length > 0) {
       body.tools = req.tools.map((t) => ({
         type: 'function',
         function: { name: t.name, description: t.description, parameters: t.parameters },
@@ -119,10 +139,18 @@ export class OpenAiCompatibleProvider implements Provider {
 
     const contentType = res.headers.get('content-type') ?? '';
     if (streaming && res.body && /text\/event-stream/i.test(contentType)) {
+      if (textMode) {
+        return readChatmlStream(
+          res.body,
+          req.onDelta!,
+          req.signal,
+          req.onThinking,
+        );
+      }
       return readOpenAiStream(res.body, req.onDelta!, req.signal, req.onThinking);
     }
 
-    // Non-streaming fallback (or an endpoint that ignored `stream: true`).
+    // Non-streaming fallback (or an endpoint that ignored `stream`).
     const raw = await res.text();
     let json: OpenAiResponse;
     try {
@@ -134,15 +162,29 @@ export class OpenAiCompatibleProvider implements Provider {
 
     const choice = json.choices?.[0];
     const message = choice?.message ?? {};
-    const text = normalizeContent(message.content);
+    const rawText = normalizeContent(message.content);
     const thinking = reasoningOf(message);
 
     // An endpoint that ignored `stream` still has to feed the UI something.
     if (thinking && req.onThinking) req.onThinking(thinking, true);
-    if (text && req.onDelta) req.onDelta(text);
+
+    if (textMode) {
+      const parsed = parseChatmlText(rawText);
+      const displayText = stripMarkers(parsed.text);
+      if (displayText && req.onDelta) req.onDelta(displayText);
+      return {
+        text: parsed.text,
+        toolCalls: parsed.toolCalls,
+        finishReason: choice?.finish_reason ?? undefined,
+        usage: normalizeUsage(json.usage),
+        thinking: thinking || undefined,
+      };
+    }
+
+    if (rawText && req.onDelta) req.onDelta(rawText);
 
     return {
-      text,
+      text: rawText,
       toolCalls: collectToolCalls(message.tool_calls),
       finishReason: choice?.finish_reason ?? undefined,
       usage: normalizeUsage(json.usage),
@@ -264,6 +306,146 @@ export async function readOpenAiStream(
         arguments: part.args || '{}',
       }))
       .filter((call) => Boolean(call.name)),
+    finishReason,
+    streamComplete,
+    usage,
+    thinking: thinking || undefined,
+  };
+}
+
+/* ---------------------------------------------------------------- ChatML text mode */
+
+/**
+ * Serialize messages for ChatML text mode: structured `tool_calls` on
+ * assistant messages become inline protocol blocks, and `tool` result
+ * messages become user-turn text blocks. The system message is augmented
+ * with the tool catalogue and protocol instructions.
+ */
+function toChatmlMessages(messages: ChatMessage[], tools: ToolSpec[]): unknown[] {
+  const out: unknown[] = [];
+  let systemAugmented = false;
+  for (const m of messages) {
+    if (m.role === 'system' && !systemAugmented) {
+      out.push({ role: 'system', content: buildChatmlSystemPrompt(m.content, tools) });
+      systemAugmented = true;
+      continue;
+    }
+    if (m.role === 'assistant') {
+      const entry: Record<string, unknown> = { role: 'assistant', content: assistantMessageToText(m) };
+      out.push(entry);
+      continue;
+    }
+    if (m.role === 'tool') {
+      // Tool results are sent back as user-turn text so a non-Jinja endpoint
+      // can ingest them without a dedicated `tool` role.
+      const content = toolResultToText(m.toolCallId ?? '', m.name ?? '', m.content || '', true);
+      out.push({ role: 'user', content });
+      continue;
+    }
+    out.push({ role: m.role, content: m.content });
+  }
+  return out;
+}
+
+/**
+ * Parse a ChatML text-mode SSE stream. Model output is scanned for
+ * `<|tool_call|>…<|/tool_call|>` blocks; anything outside blocks is assistant
+ * text delivered through `onDelta` with protocol markers stripped.
+ */
+async function readChatmlStream(
+  body: ReadableStream<Uint8Array>,
+  onDelta: (text: string) => void,
+  signal?: AbortSignal,
+  onThinking?: (text: string) => void,
+): Promise<ProviderResponse> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const parser = new ChatmlStreamParser();
+  let text = '';
+  let thinking = '';
+  let finishReason: string | undefined;
+  let streamComplete = false;
+  let usage: Usage | undefined;
+  let errorMessage: string | undefined;
+
+  const handleData = (payload: string): void => {
+    const data = payload.trim();
+    if (!data) return;
+    if (data === '[DONE]') { streamComplete = true; return; }
+    let json: OpenAiResponse & { error?: { message?: string } };
+    try {
+      json = JSON.parse(data) as OpenAiResponse;
+    } catch {
+      return;
+    }
+    if (json.error?.message) {
+      errorMessage = json.error.message;
+      return;
+    }
+    if (json.usage) usage = normalizeUsage(json.usage);
+
+    const choice = json.choices?.[0];
+    if (!choice) return;
+    if (choice.finish_reason) {
+      finishReason = choice.finish_reason;
+      streamComplete = true;
+    }
+
+    const delta = choice.delta ?? choice.message ?? {};
+
+    const reason = reasoningOf(delta);
+    if (reason) {
+      thinking += reason;
+      onThinking?.(reason);
+    }
+
+    const piece = normalizeContent(delta.content);
+    if (!piece) return;
+
+    const { text: displayed, toolCalls } = parser.feed(piece);
+    if (displayed) {
+      text += displayed;
+      onDelta(displayed);
+    }
+  };
+
+  try {
+    let sseBuffer = '';
+    for (;;) {
+      if (signal?.aborted) break;
+      const { done, value } = await reader.read();
+      if (done) break;
+      sseBuffer += decoder.decode(value, { stream: true });
+      let newline = sseBuffer.indexOf('\n');
+      while (newline !== -1) {
+        const line = sseBuffer.slice(0, newline).replace(/\r$/, '');
+        sseBuffer = sseBuffer.slice(newline + 1);
+        if (line.startsWith('data:')) handleData(line.slice(5));
+        newline = sseBuffer.indexOf('\n');
+      }
+      // Flush a trailing `data:` line that arrived without a newline.
+      if (sseBuffer.startsWith('data:')) handleData(sseBuffer.slice(5));
+    }
+    // Flush any remaining buffered text (incomplete tool-call blocks stay in
+    // the parser and are not emitted as text).
+    const flushed = parser.flush();
+    if (flushed.text) {
+      text += flushed.text;
+      onDelta(flushed.text);
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      /* stream already closed */
+    }
+  }
+
+  if (errorMessage) throw new Error(`Provider error: ${errorMessage}`);
+
+  return {
+    text,
+    toolCalls: parser.collected,
     finishReason,
     streamComplete,
     usage,

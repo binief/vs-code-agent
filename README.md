@@ -68,6 +68,15 @@ backend exposes a reasoning stream it renders in its own **thinking lane** above
 
    Environment fallbacks: `HARNESS_API_KEY`, then `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`.
 
+   **llama.cpp without `--jinja`** — llama.cpp servers started without `--jinja`
+   reject the structured `tools` parameter. Enable
+   `codingHarness.textToolMode` to use a text-based ChatML protocol instead:
+   tool definitions, calls and results are encoded as text the model can read
+   and emit. This mode adds prompt tokens and is model-dependent; use it only
+   when the endpoint cannot accept structured `tools`. Start llama.cpp with
+   separate arguments, e.g. `--chat-template chatml` (not a single combined
+   string) and `--no-jinja` if you previously passed `--jinja`.
+
 3. **Write `agent.md`** (or `AGENTS.md`) in the workspace root. This is where the instructions live:
 
    ```markdown
@@ -945,6 +954,11 @@ in `createProvider()` (`src/core/providers/index.ts`). `mock.ts` is a compact re
 - Approval prompts appear in the panel when it is visible, otherwise as a modal dialog.
 - **Images need a vision model.** Attachments are sent to the configured backend as-is; a text-only
   model (or the mock planner) will ignore them, and the panel warns when the mock is selected.
+- **Text tool mode (`codingHarness.textToolMode`) is opt-in and model-dependent.** It is for
+  llama.cpp servers without `--jinja`, which reject structured `tools`. Tool definitions, calls and
+  results are translated into a text protocol; the model must learn to emit it correctly. This adds
+  prompt tokens, and malformed or truncated calls are never executed. Structured mode (default) is
+  recommended whenever the endpoint supports `tools`.
 
 ## License
 

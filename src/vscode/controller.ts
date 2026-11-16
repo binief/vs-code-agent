@@ -840,6 +840,7 @@ export class HarnessController {
       lineEndings: c.get('lineEndings'),
       stream: c.get('stream'),
       showThinking: c.get('showThinking'),
+      textToolMode: c.get('textToolMode'),
       subagentsEnabled: c.get<boolean>('subagents.enabled') === true,
       agentFiles: {
         enabled: Boolean(agentEnabled),

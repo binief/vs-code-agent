@@ -25,7 +25,7 @@ export function createProvider(opts: CreateProviderOptions): Provider {
       throw new Error('GitHub Copilot requires the VS Code extension host; it is not available in the standalone harness.');
     case 'openai':
     default:
-      return new OpenAiCompatibleProvider({ apiKey, baseUrl: config.baseUrl, headers: opts.extraHeaders });
+      return new OpenAiCompatibleProvider({ apiKey, baseUrl: config.baseUrl, headers: opts.extraHeaders, textToolMode: config.textToolMode });
   }
 }
 

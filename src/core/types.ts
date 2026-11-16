@@ -301,6 +301,12 @@ export interface HarnessConfig {
   stream: boolean;
   /** Show the model's reasoning stream, when the backend provides one. */
   showThinking: boolean;
+  /** Opt-in: use a text-based ChatML tool protocol instead of structured `tools`.
+   * For llama.cpp servers started without `--jinja`, which reject nonempty
+   * `tools` in `/chat/completions`. Tool definitions, calls and results are
+   * translated into an explicit model-readable text protocol. Adds prompt
+   * tokens and is model-dependent; structured mode is the default. */
+  textToolMode: boolean;
   /** Allow explicitly permitted, read-only delegated investigations. */
   subagentsEnabled: boolean;
   /** Instructions loaded from agent.md/AGENTS.md files. */
@@ -328,6 +334,7 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   lineEndings: 'auto',
   stream: true,
   showThinking: true,
+  textToolMode: false,
   subagentsEnabled: false,
   agentFiles: {
     enabled: true,

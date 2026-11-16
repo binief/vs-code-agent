@@ -314,6 +314,11 @@
           "default": true,
           "markdownDescription": "Show the model's reasoning stream in its own lane when the backend provides one (DeepSeek `reasoning_content`, OpenRouter `reasoning`, OpenAI-compatible reasoning models, Anthropic extended thinking). The reasoning is displayed only — it is never sent back to the model as conversation content."
         },
+        "codingHarness.textToolMode": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Opt-in: use a text-based ChatML tool protocol instead of structured `tools`. For llama.cpp servers started without `--jinja`, which reject `tools` in `/chat/completions`. Tool definitions, calls and results are translated into text the model can read and emit. Adds prompt tokens and is model-dependent — structured mode (default) is recommended whenever the endpoint supports `tools`. Requires `codingHarness.provider` = `openai`."
+        },
         "codingHarness.subagents.enabled": {
           "type": "boolean",
           "default": false,
