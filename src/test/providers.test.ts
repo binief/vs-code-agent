@@ -2,9 +2,20 @@ import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { test } from 'node:test';
+import { OpenAiCompatibleProvider } from '../core/providers/openai';
 import { toAnthropicMessages, toOpenAiMessages } from '../core/providers';
+import {
+  assistantMessageToText,
+  buildChatmlSystemPrompt,
+  parseChatmlText,
+  parseToolCallBlock,
+  serializeToolCall,
+  serializeToolResult,
+  stripMarkers,
+  toolResultToText,
+} from '../core/providers/chatml';
 import { MockPlannerProvider, parseIntent, scaffold } from '../core/providers/mock';
-import type { ChatMessage } from '../core/types';
+import type { ChatMessage, ToolSpec } from '../core/types';
 
 const conversation: ChatMessage[] = [
   { role: 'system', content: 'You are the harness.' },
@@ -178,5 +189,338 @@ test('scaffold output for python is syntactically valid python', async () => {
     assert.equal(result.status, 0, `py_compile failed: ${result.stderr?.toString()}`);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* -------------------------------------------------------- ChatML text protocol */
+
+const chatmlTools: ToolSpec[] = [
+  {
+    name: 'read_file',
+    description: 'Read a file’s contents.',
+    parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+  },
+  {
+    name: 'search_text',
+    description: 'Search text across files.',
+    parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+  },
+];
+
+test('serializeToolCall produces the text protocol block', () => {
+  const out = serializeToolCall({ id: 'call_1', name: 'read_file', arguments: '{"path":"app.ts"}' });
+  assert.equal(out, '<|tool_call|>read_file|call_1|{"path":"app.ts"}<|/tool_call|>');
+});
+
+test('serializeToolResult produces ok and error blocks', () => {
+  const ok = serializeToolResult('call_1', 'read_file', true, 'export const a = 1;');
+  assert.equal(ok, '<|tool_result|>call_1|ok\nexport const a = 1;\n<|/tool_result|>');
+  const err = serializeToolResult('call_2', 'read_file', false, 'File not found');
+  assert.equal(err, '<|tool_result|>call_2|error\nFile not found\n<|/tool_result|>');
+});
+
+test('parseToolCallBlock extracts name, id and arguments', () => {
+  const call = parseToolCallBlock('read_file|call_1|{"path":"app.ts"}');
+  assert.ok(call);
+  assert.equal(call!.name, 'read_file');
+  assert.equal(call!.id, 'call_1');
+  assert.equal(call!.arguments, '{"path":"app.ts"}');
+});
+
+test('parseToolCallBlock rejects malformed blocks', () => {
+  assert.equal(parseToolCallBlock(''), null);
+  assert.equal(parseToolCallBlock('no_pipes'), null);
+  assert.equal(parseToolCallBlock('name|'), null);
+  assert.equal(parseToolCallBlock('name||{}'), null);
+});
+
+test('parseChatmlText extracts tool calls and returns clean text', () => {
+  const { text, toolCalls } = parseChatmlText(
+    'I will read the file.<|tool_call|>read_file|call_1|{"path":"app.ts"}<|/tool_call|>Done.',
+  );
+  assert.equal(text, 'I will read the file.Done.');
+  assert.equal(toolCalls.length, 1);
+  assert.equal(toolCalls[0].name, 'read_file');
+  assert.equal(toolCalls[0].id, 'call_1');
+  assert.equal(toolCalls[0].arguments, '{"path":"app.ts"}');
+});
+
+test('parseChatmlText skips malformed tool-call blocks', () => {
+  const { text, toolCalls } = parseChatmlText(
+    'Hello <|tool_call|>broken<|/tool_call|> world',
+  );
+  assert.equal(text, 'Hello  world');
+  assert.equal(toolCalls.length, 0);
+});
+
+test('parseChatmlText handles multiple tool calls', () => {
+  const { text, toolCalls } = parseChatmlText(
+    '<|tool_call|>read_file|call_1|{"path":"a.ts"}<|/tool_call|><|tool_call|>search_text|call_2|{"query":"foo"}<|/tool_call|>',
+  );
+  assert.equal(text, '');
+  assert.equal(toolCalls.length, 2);
+  assert.equal(toolCalls[0].name, 'read_file');
+  assert.equal(toolCalls[1].name, 'search_text');
+});
+
+test('stripMarkers removes all protocol markers', () => {
+  assert.equal(
+    stripMarkers('Hello <|tool_call|>x|y|{}<|/tool_call|> world <|tool_result|>y|ok\nhi\n<|/tool_result|>'),
+    'Hello x|y|{} world y|ok\nhi\n',
+  );
+});
+
+test('buildChatmlSystemPrompt augments with tools and protocol', () => {
+  const out = buildChatmlSystemPrompt('You are helpful.', chatmlTools);
+  assert.ok(out.includes('You are helpful.'));
+  assert.ok(out.includes('<|tool_call|>tool_name|call_id|{"arg": "value"}<|/tool_call|>'));
+  assert.ok(out.includes('read_file'));
+  assert.ok(out.includes('search_text'));
+  assert.ok(out.includes('Do not output protocol markers in your final answer to the user.'));
+});
+
+test('assistantMessageToText serializes tool calls as protocol blocks', () => {
+  const out = assistantMessageToText({
+    content: 'Reading the file now.',
+    toolCalls: [{ id: 'call_1', name: 'read_file', arguments: '{"path":"app.ts"}' }],
+  });
+  assert.ok(out.includes('Reading the file now.'));
+  assert.ok(out.includes('<|tool_call|>read_file|call_1|{"path":"app.ts"}<|/tool_call|>'));
+});
+
+test('toolResultToText produces a result block', () => {
+  const out = toolResultToText('call_1', 'read_file', 'export const a = 1;', true);
+  assert.equal(out, '<|tool_result|>call_1|ok\nexport const a = 1;\n<|/tool_result|>');
+});
+
+/* --------------------------------------------- OpenAI provider text tool mode */
+
+/** Build a stub fetch that returns a non-streaming JSON response. */
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+test('OpenAI text mode omits structured tools from the request body', async () => {
+  let sentBody: string | undefined;
+  const stub = (async (_input: any, init?: any) => {
+    sentBody = init?.body as string;
+    return jsonResponse({
+      choices: [{ message: { content: 'Hello!' }, finish_reason: 'stop' }],
+    });
+  }) as unknown as typeof fetch;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = stub;
+  try {
+    const provider = new OpenAiCompatibleProvider({
+      apiKey: 'test-key',
+      baseUrl: 'https://example.test/v1',
+      textToolMode: true,
+    });
+    await provider.chat({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: 'hi' },
+      ],
+      tools: [{ name: 'read_file', description: 'read', parameters: { type: 'object' } }],
+    });
+    assert.ok(sentBody);
+    const parsed = JSON.parse(sentBody!);
+    assert.equal(parsed.tools, undefined);
+    assert.equal(parsed.tool_choice, undefined);
+    assert.equal(parsed.parallel_tool_calls, undefined);
+    // The system message must have been augmented with tool definitions.
+    const sysMsg = parsed.messages.find((m: any) => m.role === 'system');
+    assert.ok(sysMsg);
+    assert.ok(sysMsg.content.includes('<|tool_call|>'));
+    assert.ok(sysMsg.content.includes('read_file'));
+    assert.ok(sysMsg.content.includes('You are a helpful assistant.'));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('OpenAI text mode parses tool calls from non-streaming response', async () => {
+  const stub = (async () => {
+    return jsonResponse({
+      choices: [{
+        message: {
+          content: 'Reading it.<|tool_call|>read_file|call_1|{"path":"app.ts"}<|/tool_call|>',
+        },
+        finish_reason: 'tool_calls',
+      }],
+    });
+  }) as unknown as typeof fetch;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = stub;
+  try {
+    const provider = new OpenAiCompatibleProvider({
+      apiKey: 'test-key',
+      baseUrl: 'https://example.test/v1',
+      textToolMode: true,
+    });
+    const response = await provider.chat({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'read app.ts' }],
+      tools: [{ name: 'read_file', description: 'read', parameters: { type: 'object' } }],
+    });
+    assert.equal(response.toolCalls.length, 1);
+    assert.equal(response.toolCalls[0].name, 'read_file');
+    assert.equal(response.toolCalls[0].id, 'call_1');
+    assert.equal(response.toolCalls[0].arguments, '{"path":"app.ts"}');
+    // Markers stripped from user-facing text.
+    assert.equal(response.text, 'Reading it.');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('OpenAI text mode strips markers from user-facing text', async () => {
+  const stub = (async () => {
+    return jsonResponse({
+      choices: [{
+        message: {
+          content: 'Here is the file.<|tool_call|>read_file|call_1|{"path":"app.ts"}<|/tool_call|>',
+        },
+        finish_reason: 'stop',
+      }],
+    });
+  }) as unknown as typeof fetch;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = stub;
+  try {
+    const provider = new OpenAiCompatibleProvider({
+      apiKey: 'test-key',
+      baseUrl: 'https://example.test/v1',
+      textToolMode: true,
+    });
+    const response = await provider.chat({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'hi' }],
+      tools: [{ name: 'read_file', description: 'read', parameters: { type: 'object' } }],
+    });
+    assert.equal(response.text, 'Here is the file.');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('OpenAI text mode ignores malformed tool calls (never executes them)', async () => {
+  const stub = (async () => {
+    return jsonResponse({
+      choices: [{
+        message: {
+          content: 'I tried <|tool_call|>broken<|/tool_call|> but it failed.',
+        },
+        finish_reason: 'stop',
+      }],
+    });
+  }) as unknown as typeof fetch;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = stub;
+  try {
+    const provider = new OpenAiCompatibleProvider({
+      apiKey: 'test-key',
+      baseUrl: 'https://example.test/v1',
+      textToolMode: true,
+    });
+    const response = await provider.chat({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'do something' }],
+      tools: [{ name: 'read_file', description: 'read', parameters: { type: 'object' } }],
+    });
+    assert.equal(response.toolCalls.length, 0);
+    // Malformed block text remains as plain text (not leaked as markers).
+    assert.ok(response.text.includes('I tried'));
+    assert.ok(response.text.includes('but it failed'));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('OpenAI text mode streaming parses split markers', async () => {
+  const encoder = new TextEncoder();
+  const events = [
+    `data: ${JSON.stringify({ choices: [{ delta: { content: 'I will ' } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: { content: '<|tool_c' } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: { content: 'all|>read_file|call_1|{\"path\":\"a.ts\"}' } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ delta: { content: '<|/tool_call|> done.' } }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ finish_reason: 'stop' }] })}\n\n`,
+    'data: [DONE]\n\n',
+  ];
+  const payload = encoder.encode(events.join(''));
+  const chunks: Uint8Array[] = [];
+  for (let i = 0; i < payload.length; i += 5) chunks.push(payload.slice(i, i + 5));
+
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  });
+  const res = new Response(body, {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  });
+
+  const stub = (async () => res) as unknown as typeof fetch;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = stub;
+  try {
+    const provider = new OpenAiCompatibleProvider({
+      apiKey: 'test-key',
+      baseUrl: 'https://example.test/v1',
+      textToolMode: true,
+    });
+    const deltas: string[] = [];
+    const response = await provider.chat({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'read a.ts' }],
+      tools: [{ name: 'read_file', description: 'read', parameters: { type: 'object' } }],
+      onDelta: (text) => deltas.push(text),
+    });
+    assert.equal(response.toolCalls.length, 1);
+    assert.equal(response.toolCalls[0].name, 'read_file');
+    assert.equal(response.toolCalls[0].id, 'call_1');
+    // Raw markers never appear in deltas.
+    assert.ok(!deltas.some((d) => d.includes('<|tool_call|>')));
+    assert.ok(!deltas.some((d) => d.includes('<|/tool_call|>')));
+    assert.equal(deltas.join(''), 'I will  done.');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('OpenAI text mode no-tools requests remain normal (e.g. compaction)', async () => {
+  let sentBody: string | undefined;
+  const stub = (async (_input: any, init?: any) => {
+    sentBody = init?.body as string;
+    return jsonResponse({
+      choices: [{ message: { content: 'Summary.' }, finish_reason: 'stop' }],
+    });
+  }) as unknown as typeof fetch;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = stub;
+  try {
+    const provider = new OpenAiCompatibleProvider({
+      apiKey: 'test-key',
+      baseUrl: 'https://example.test/v1',
+      textToolMode: true,
+    });
+    await provider.chat({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'summarize' }],
+      tools: [],
+    });
+    assert.ok(sentBody);
+    const parsed = JSON.parse(sentBody!);
+    assert.equal(parsed.tools, undefined);
+    // No system message augmentation when there are no tools.
+    const sysMsg = parsed.messages.find((m: any) => m.role === 'system');
+    assert.ok(!sysMsg || !sysMsg.content.includes('<|tool_call|>'));
+  } finally {
+    globalThis.fetch = realFetch;
   }
 });

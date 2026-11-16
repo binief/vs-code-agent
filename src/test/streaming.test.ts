@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { after, test } from 'node:test';
 import { HarnessSession } from '../core/agent';
 import { AnthropicProvider } from '../core/providers/anthropic';
+import { ChatmlStreamParser, parseChatmlText } from '../core/providers/chatml';
 import { MockPlannerProvider } from '../core/providers/mock';
 import { OpenAiCompatibleProvider } from '../core/providers/openai';
 import {
@@ -675,4 +676,78 @@ test('compaction rejects incomplete summary streams and keeps the original histo
     assert.match(result.summary, /without a completion marker/);
     assert.strictEqual(newHistory, history);
   }
+});
+
+/* --------------------------------------------------- ChatML streaming parser */
+
+test('ChatmlStreamParser reassembles split start markers', () => {
+  const parser = new ChatmlStreamParser();
+  // '<|tool_call|>' split across two feeds: '<|tool_c' + 'all|>'
+  const first = parser.feed('<|tool_c');
+  assert.equal(first.text, '');
+  assert.equal(first.toolCalls.length, 0);
+  const second = parser.feed('all|>read_file|call_1|{"path":"a.ts"}<|/tool_call|>rest');
+  assert.equal(second.text, 'rest');
+  assert.equal(second.toolCalls.length, 1);
+  assert.equal(second.toolCalls[0].name, 'read_file');
+  assert.equal(second.toolCalls[0].id, 'call_1');
+  assert.equal(second.toolCalls[0].arguments, '{"path":"a.ts"}');
+});
+
+test('ChatmlStreamParser emits text outside tool calls as it arrives', () => {
+  const parser = new ChatmlStreamParser();
+  const first = parser.feed('Hello ');
+  assert.equal(first.text, 'Hello ');
+  const second = parser.feed('<|tool_call|>read_file|call_1|{"path":"a.ts"}<|/tool_call|> world');
+  assert.equal(second.text, ' world');
+  assert.equal(second.toolCalls.length, 1);
+  assert.equal(second.toolCalls[0].name, 'read_file');
+});
+
+test('ChatmlStreamParser buffers incomplete end marker across chunks', () => {
+  const parser = new ChatmlStreamParser();
+  const first = parser.feed('<|tool_call|>read_file|call_1|{"path":"a.ts"}<|/tool_cal');
+  assert.equal(first.text, '');
+  assert.equal(first.toolCalls.length, 0);
+  const second = parser.feed('l|>more text');
+  assert.equal(second.text, 'more text');
+  assert.equal(second.toolCalls.length, 1);
+  assert.equal(second.toolCalls[0].name, 'read_file');
+});
+
+test('ChatmlStreamParser handles multiple tool calls in one fragment', () => {
+  const parser = new ChatmlStreamParser();
+  const result = parser.feed(
+    'A<|tool_call|>read_file|call_1|{"path":"a.ts"}<|/tool_call|>B<|tool_call|>search_text|call_2|{"query":"x"}<|/tool_call|>C',
+  );
+  assert.equal(result.text, 'ABC');
+  assert.equal(result.toolCalls.length, 2);
+  assert.equal(result.toolCalls[0].name, 'read_file');
+  assert.equal(result.toolCalls[1].name, 'search_text');
+});
+
+test('ChatmlStreamParser flush returns buffered text with markers stripped', () => {
+  const parser = new ChatmlStreamParser();
+  const first = parser.feed('Hello <|tool_call|>read_file|call_1|{"path":"a.ts"}');
+  // 'Hello ' was emitted during feed; the incomplete block is retained.
+  assert.equal(first.text, 'Hello ');
+  assert.equal(first.toolCalls.length, 0);
+  const flushed = parser.flush();
+  // The buffer contained an incomplete block; markers are stripped but no
+  // tool call is produced because it never had an end marker.
+  assert.equal(flushed.text, 'read_file|call_1|{"path":"a.ts"}');
+  // Collected tool calls are preserved by flush.
+  assert.equal(parser.collected.length, 0);
+});
+
+test('parseChatmlText handles empty input', () => {
+  const result = parseChatmlText('');
+  assert.equal(result.text, '');
+  assert.equal(result.toolCalls.length, 0);
+});
+
+test('parseChatmlText handles no tool calls', () => {
+  const result = parseChatmlText('Just plain text.');
+  assert.equal(result.text, 'Just plain text.');
+  assert.equal(result.toolCalls.length, 0);
 });
