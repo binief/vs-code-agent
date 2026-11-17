@@ -1,6 +1,6 @@
 ---
 description: Tool instructions for the Coding Harness agent
-tools: [read, search, edit, execute, task_list]
+tools: [read, search, edit, execute]
 ---
 
 # Agent instructions — available tools
