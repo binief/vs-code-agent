@@ -270,7 +270,7 @@ Review the code and report findings without modifying files.
 The list is enforced both when presenting tools to the model and when executing its calls. Available
 groups are `read` (`list_files`, `read_file`, `get_diagnostics`, `open_file`), `search` (`list_files`,
 `search_text`), `edit` (`create_file`, `write_file`, `replace_in_file`, `delete_file`), `execute`
-(`run_command`), `mcp` (all registered `mcp_` tools), and `subagent` (`delegate_task`, when enabled). You may instead name exact registered tools.
+(`run_command`), `mcp` (all registered `mcp_` tools), and `subagent` (`delegate_task`, when enabled). You may instead name exact registered tools, for example `task_list` for the per-task task list.
 `tools: []`, no selected files, or no selected file with a `tools` declaration permits no tools.
 In the panel, choosing “Use every discovered file” selects all discovered files.
 
@@ -380,6 +380,7 @@ when compacting history.
 | `run_command` | Shell command in the workspace, with timeout and exit-code capture | per `commandPolicy` |
 | `get_diagnostics` | Current errors/warnings from the editor's language servers | never |
 | `open_file` | Reveal a file/line in the editor | never |
+| `task_list` | Add, update, list and remove items in a task list for long-running work; shown in the panel strip and saved in the chat JSON | never |
 
 `read_file` returns budget-aware pages rather than silently clipping a long line. When a result says
 `next_line` and `next_column`, call `read_file` again with those values as `start_line` and

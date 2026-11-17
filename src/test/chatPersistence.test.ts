@@ -259,6 +259,52 @@ test('export/import round-trips a complete chat, confirms replacement and surviv
   assert.ok(!followUp?.some((m) => m.content === 'Do not replace me without confirmation'));
 });
 
+test('task list is saved in the chat archive and restored after reopen', async () => {
+  const file = path.join(root, 'task-chat.json');
+  const archive = {
+    format: 'coding-harness-chat',
+    version: 1,
+    savedAt: new Date().toISOString(),
+    inProgress: false,
+    items: [{ id: 'u', kind: 'user', text: 'Plan the work' }],
+    history: [{ role: 'user', content: 'Plan the work' }],
+    taskList: [
+      { id: 'task-1', title: 'Write the parser', status: 'in-progress' },
+      { id: 'task-2', title: 'Add tests', status: 'pending' },
+      { id: 'task-3', title: 'Ship it', status: 'done' },
+    ],
+    usage: {},
+  };
+  await fs.promises.writeFile(file, JSON.stringify(archive));
+
+  const target = makeController('task-persist');
+  dialogs.open = [uri(file)];
+  dialogs.confirm = 'Replace Chat';
+  await target.controller.importChat();
+  assert.deepEqual(target.controller.getTaskListItems(), [
+    { id: 'task-1', title: 'Write the parser', status: 'in-progress' },
+    { id: 'task-2', title: 'Add tests', status: 'pending' },
+    { id: 'task-3', title: 'Ship it', status: 'done' },
+  ]);
+  assert.ok(target.messages.some((message) => message.type === 'chat-replaced' && message.taskList));
+
+  // Reopen from storage: the saved archive must carry the task list.
+  const reopened = makeController('task-persist');
+  await reopened.controller.whenReady();
+  assert.deepEqual(reopened.controller.getTaskListItems(), [
+    { id: 'task-1', title: 'Write the parser', status: 'in-progress' },
+    { id: 'task-2', title: 'Add tests', status: 'pending' },
+    { id: 'task-3', title: 'Ship it', status: 'done' },
+  ]);
+
+  // An explicit reset clears it.
+  await reopened.controller.reset();
+  assert.deepEqual(reopened.controller.getTaskListItems(), []);
+  const cleared = makeController('task-persist');
+  await cleared.controller.whenReady();
+  assert.deepEqual(cleared.controller.getTaskListItems(), [], 'reset does not revive the task list');
+});
+
 test('invalid imports and cancelled pickers leave the current chat untouched', async () => {
   respond = toolProvider([]);
   const target = makeController('bad-import');
@@ -352,6 +398,9 @@ test('archive validation rejects malformed histories, duplicate IDs and unsafe i
   assert.throws(() => parseChatArchive(JSON.stringify({ ...base, items: [base.items[0], base.items[0]] })), /unique/);
   assert.throws(() => parseChatArchive(JSON.stringify({ ...base, history: [...base.history, { role: 'tool', content: 'x', toolCallId: 'missing' }] })), /unpaired/);
   assert.throws(() => parseChatArchive(JSON.stringify({ ...base, items: [{ ...base.items[0], images: [{ mediaType: 'image/png', dataUrl: 'https://evil.test/x' }] }] })), /image/);
+  assert.throws(() => parseChatArchive(JSON.stringify({ ...base, taskList: [{ id: 'task-1', title: 'x', status: 'archived' }] })), /status/);
+  assert.throws(() => parseChatArchive(JSON.stringify({ ...base, taskList: 'not-an-array' })), /taskList must be an array/);
+  assert.doesNotThrow(() => parseChatArchive(JSON.stringify({ ...base, taskList: [{ id: 'task-1', title: 'x', status: 'done' }] })));
 });
 
 test('the extension clipboard bridge acknowledges success and reports failures', async () => {

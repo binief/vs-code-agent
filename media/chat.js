@@ -60,6 +60,8 @@
   const compactText = document.getElementById('compact-text');
   const btnCompactBanner = document.getElementById('btn-compact-banner');
   const btnCompactDismiss = document.getElementById('btn-compact-dismiss');
+  const taskStrip = document.getElementById('task-strip');
+  const taskStripItems = document.getElementById('task-strip-items');
   const attachments = document.getElementById('attachments');
   const btnAttach = document.getElementById('btn-attach');
   const fileInput = document.getElementById('file-input');
@@ -602,6 +604,32 @@
     if (!activity || !activity.status || activity.status === 'idle') return;
     const seconds = Math.max(0, Math.round((Date.now() - (activity.startedAt || Date.now())) / 1000));
     activityElapsed.textContent = seconds >= 1 ? seconds + 's' : '';
+  }
+
+  /** Render the current per-task task list into the panel strip. */
+  function renderTaskStrip(items) {
+    if (!taskStrip || !taskStripItems) return;
+    taskStripItems.textContent = '';
+    if (!items || items.length === 0) {
+      taskStrip.hidden = true;
+      return;
+    }
+    const marks = { done: 'done', 'in-progress': 'in-progress', pending: 'pending' };
+    for (const item of items) {
+      const li = document.createElement('li');
+      li.className = 'task-item';
+      li.dataset.id = item.id;
+      const mark = document.createElement('span');
+      mark.className = 'task-mark ' + (marks[item.status] || 'pending');
+      mark.textContent = (item.status === 'done' ? '[x]' : item.status === 'in-progress' ? '[•]' : '[ ]') + ' ';
+      const title = document.createElement('span');
+      title.className = 'task-title';
+      title.textContent = item.title;
+      li.appendChild(mark);
+      li.appendChild(title);
+      taskStripItems.appendChild(li);
+    }
+    taskStrip.hidden = false;
   }
 
   function setTraceText(node, value) {
@@ -2159,6 +2187,7 @@
         applyState(message.state);
         applyActivity(message.activity);
         applyCompactionTrace(message.compactionTrace);
+        renderTaskStrip(message.taskList ?? []);
         if (message.usage) {
           cumulativeUsage = message.usage;
           updateTokenChips();
@@ -2185,6 +2214,9 @@
         break;
       case 'status':
         setStatus(message.status, message.step, message.maxSteps);
+        break;
+      case 'task-list':
+        renderTaskStrip(message.items);
         break;
       case 'activity':
         applyActivity(message.activity);
@@ -2326,6 +2358,7 @@
         contextPercent = 0;
         contextBreakdown = null;
         updateTokenChips();
+        renderTaskStrip([]);
         stickToBottom = true;
         break;
       case 'copy-result':

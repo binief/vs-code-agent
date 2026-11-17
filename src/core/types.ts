@@ -27,6 +27,9 @@ export interface ToolCall {
   arguments: string;
 }
 
+/** One item in the per-task task list maintained by the `task_list` tool. */
+export type TaskItem = import('./taskList').TaskItem;
+
 /**
  * An image the user attached to a message (pasted or dropped into the panel).
  * Stored as base64 because that is what both the OpenAI and Anthropic wire
@@ -510,6 +513,7 @@ export type HarnessEvent =
       durationMs: number;
       relPath?: string;
     }
+  | { type: 'task-list'; items: TaskItem[] }
   | { type: 'approval'; id: string; phase: 'request'; request: ApprovalRequest }
   | { type: 'approval'; id: string; phase: 'resolved'; request: ApprovalRequest; decision: ApprovalDecision }
   | { type: 'usage'; step: number; usage: Usage; durationMs?: number; tokensPerSecond?: number; contextTokens?: number; contextWindow?: number; contextPercent?: number; cumulative?: Usage }
@@ -561,6 +565,8 @@ export interface ToolContext {
   signal?: AbortSignal;
   /** Approximate per-result budget for tools that can page output. */
   outputTokenBudget?: number;
+  /** Transient task list for this task run (per-task, in-memory). */
+  taskList?: import('./taskList').TaskListStore;
   /**
    * Ask the user to authorise the action a tool is *about* to perform.
    * Supplied by the agent loop, which also emits the matching UI events.
