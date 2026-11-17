@@ -751,3 +751,60 @@ test('parseChatmlText handles no tool calls', () => {
   assert.equal(result.text, 'Just plain text.');
   assert.equal(result.toolCalls.length, 0);
 });
+
+/* --------------------------------------------- ChatML thinking blocks */
+
+test('ChatmlStreamParser routes thinking blocks to thinking output', () => {
+  const parser = new ChatmlStreamParser();
+  const result = parser.feed(
+    'Hello <|thinking|>I am thinking<|/thinking|> world',
+  );
+  assert.equal(result.text, 'Hello  world');
+  assert.equal(result.thinking, 'I am thinking');
+  assert.equal(result.toolCalls.length, 0);
+});
+
+test('ChatmlStreamParser handles split thinking start marker', () => {
+  const parser = new ChatmlStreamParser();
+  const first = parser.feed('<|think');
+  assert.equal(first.text, '');
+  assert.equal(first.thinking, '');
+  assert.equal(first.toolCalls.length, 0);
+  const second = parser.feed('ing|>thoughts<|/thinking|>done');
+  assert.equal(second.text, 'done');
+  assert.equal(second.thinking, 'thoughts');
+  assert.equal(second.toolCalls.length, 0);
+});
+
+test('ChatmlStreamParser handles split thinking end marker', () => {
+  const parser = new ChatmlStreamParser();
+  const first = parser.feed('<|thinking|>thinking<|/thin');
+  assert.equal(first.text, '');
+  assert.equal(first.thinking, '');
+  assert.equal(first.toolCalls.length, 0);
+  const second = parser.feed('king|>more text');
+  assert.equal(second.text, 'more text');
+  assert.equal(second.thinking, 'thinking');
+  assert.equal(second.toolCalls.length, 0);
+});
+
+test('ChatmlStreamParser handles interleaved thinking and tool calls', () => {
+  const parser = new ChatmlStreamParser();
+  const result = parser.feed(
+    '<|thinking|>plan<|/thinking|><|tool_call|>read_file|call_1|{"path":"a.ts"}<|/tool_call|>done',
+  );
+  assert.equal(result.text, 'done');
+  assert.equal(result.thinking, 'plan');
+  assert.equal(result.toolCalls.length, 1);
+  assert.equal(result.toolCalls[0].name, 'read_file');
+});
+
+test('ChatmlStreamParser flush returns thinking from incomplete block', () => {
+  const parser = new ChatmlStreamParser();
+  const first = parser.feed('<|thinking|>incomplete');
+  assert.equal(first.text, '');
+  assert.equal(first.thinking, '');
+  const flushed = parser.flush();
+  // Incomplete thinking block is retained; no thinking emitted yet.
+  assert.equal(flushed.thinking, '');
+});
