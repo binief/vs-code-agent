@@ -1,47 +1,53 @@
 ---
-tools: [read, search, edit, execute]
+description: Tool instructions for the Coding Harness agent
+tools: [read, search, edit, execute, task_list]
 ---
-# Coding Harness — project instructions
 
-Instructions for working on this repository. The extension is a tool harness only: it has no
-built-in prompt, so this file is what tells the agent how to work here.
+# Agent instructions — available tools
 
-## Project
+Copy this file into your workspace as `agent.md` (or place it under `.agents/`) to tell the Coding Harness agent which tools it may use and how to use them.
 
-- TypeScript, compiled with `tsc` to `out/`. No bundler.
-- `src/core` must stay free of `vscode` imports so the agent loop remains testable without the editor.
-- `src/vscode` is the editor layer; `media/` holds the webview assets (plain JS/CSS).
+The `tools:` front-matter above is an **opt-in allowlist**. Only tools named here — directly or via a group — are presented to the model and allowed to run. `tools: []`, no selected files, or no selected file declaring tools permits no tools.
 
-## Commands
+## Available tools
 
-- `npm run compile` — type-check and emit `out/`.
-- `npm test` — compile, then run every `out/test/*.test.js` suite with `node --test`.
-- `npm run package` — build `coding-harness.vsix` with `vsce`.
+| Tool | What it does | Approval |
+| --- | --- | --- |
+| `list_files` | List files/dirs, glob filters, skips `node_modules`, `dist`, `.git`, … | never |
+| `read_file` | Line-numbered reads (slices, size/binary guards, directory listing) | never |
+| `search_text` | Text/JavaScript-regex search with `path:line:` results | never |
+| `create_file` | Create a new file; fails if the path already exists | per `editPolicy` |
+| `write_file` | Overwrite or append a whole file; preserves line endings | per `editPolicy` |
+| `replace_in_file` | Exact-snippet replacement; preserves file style | per `editPolicy` |
+| `delete_file` | Remove one file | always |
+| `run_command` | Shell command in the workspace, with timeout and exit-code capture | per `commandPolicy` |
+| `get_diagnostics` | Current errors/warnings from language servers | never |
+| `open_file` | Reveal a file/line in the editor | never |
+| `task_list` | Add/update/list/remove items in a per-task task list (shown in the panel strip, saved in the chat JSON) | never |
 
-Run `npm test` after changing core logic, tools, the prompt builder or the webview HTML.
+## Tool groups
 
-## Conventions
+Use a group in `tools:` instead of naming tools one-by-one:
+- `read` — `list_files`, `read_file`, `get_diagnostics`, `open_file`
+- `search` — `list_files`, `search_text`
+- `edit` — `create_file`, `write_file`, `replace_in_file`, `delete_file`
+- `execute` — `run_command`
+- `mcp` — all registered `mcp_<server>_<tool>` tools
+- `subagent` — `delegate_task` (read-only subagent, when enabled)
 
-- Match the surrounding code style (2-space indentation, single quotes, semicolons).
-- Keep core modules dependency-free; do not add runtime dependencies without a strong reason.
-- Update the relevant `src/test/*.test.ts` suite with behaviour changes, and keep `manifest.test.ts`
-  passing: every contributed command/setting must exist in the manifest and be used by the extension.
-- The system message must contain context only. Do not add behavioural instructions to
-  `src/core/prompt.ts`; instructions belong in agent files.
+Mix groups and exact names as needed, e.g. `tools: [read, search, task_list]`.
 
-## Grounding — prevent hallucinations
+## Grounding rules
 
-This is the single most important rule for this harness (and the reason “thinking” sometimes hallucinates):
+- **Never invent facts you can verify with a tool.** Call `list_files`/`read_file`/`search_text` before referencing files, paths, or symbols.
+- **Read before you write.** Always `read_file` an existing file before editing; copy `old_text` verbatim from the tool output.
+- **List before you create.** Confirm a file does not exist before `create_file`.
+- **Verify after edits.** Run `get_diagnostics` or `run_command` (`npm test`, `tsc`, …) before claiming success; report actual output.
+- **`task_list` for long-running work.** Use `add`/`update`/`remove`/`list` to track what's done, in-progress, or pending. The list is per-task, shown in the panel strip, and saved in the chat JSON.
 
-- **Never invent facts you can verify with a tool.** If you need a file’s content, a directory listing, a symbol location, a diagnostic, or command output — call the tool and quote it. Do not guess file names, APIs, or line numbers from training data.
-- **Read before you write.** Always `read_file` an existing file before `write_file`/`replace_in_file`. Copy `old_text` verbatim from the tool result — never invent it. If `replace_in_file` fails with “snippet not found”, re-read and copy again.
-- **List before you create.** Run `list_files` (or `search_text`) to confirm a file does not exist before `create_file`. Do not hallucinate a project layout; the `Workspace` section of the system message is stale the moment you write.
-- **Quote tool output, don’t paraphrase it into existence.** When you summarize, use numbers/paths that came from `list_files`/`search_text`/`read_file`/`run_command`/`get_diagnostics`. If you haven’t called a tool, say “I haven’t verified this yet” instead of stating it as fact.
-- **Thinking is display-only.** The thinking lane streams a draft, not a verified plan. Treat anything in thinking as ungrounded until a tool confirms it. The panel never sends thinking back to the model — only `assistant` text + tool results go into history — so a hallucination in thinking only becomes dangerous if you copy it into the answer or a tool argument without verification.
-- **After edits, verify.** Run `get_diagnostics` or `run_command` (tests/build) and report what they actually returned. Do not claim “tests pass” or “no errors” without calling them.
-- **If context is truncated or compacted, re-read.** Compaction replaces old turns with a summary. Do not assume details from a compacted summary are current — re-list/re-read the files you need for the next step.
+## Policies
 
-### When you must answer without tools (e.g. general knowledge)
-
-- Say so explicitly (“from training data, not verified in this workspace”).
-- Keep it short, and offer to verify with a tool (“want me to search/read X to confirm?”).
+- `create_file`/`write_file`/`replace_in_file`/`delete_file` are governed by `codingHarness.editPolicy`.
+- `run_command` is governed by `codingHarness.commandPolicy`.
+- `delete_file` always requires approval.
+- `tools: []` or a malformed policy fails closed (no tools).
