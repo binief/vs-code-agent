@@ -32,6 +32,7 @@ import {
   type HarnessConfig,
   type McpServerConfig,
   type HarnessEvent,
+  type TaskItem,
   type TaskOutcome,
   type Usage,
   type WorkspaceContext,
@@ -254,6 +255,8 @@ export class HarnessController {
   /** Restored before the first session is created, then handed to the agent. */
   private restoredHistory: ChatMessage[] = [];
   private restoredOriginalHistory: ChatMessage[] = [];
+  /** Latest task-list items, persisted in the chat archive and shown in the strip. */
+  private taskListItems: TaskItem[] = [];
   private restoredOriginalComplete = true;
   private readonly ready: Promise<void>;
   private chatSaveSettings: ChatSaveSettings;
@@ -348,6 +351,10 @@ export class HarnessController {
 
   getTranscript(): TranscriptItem[] {
     return this.items;
+  }
+
+  getTaskListItems(): TaskItem[] {
+    return [...this.taskListItems];
   }
 
   getState(): UiState {
@@ -530,6 +537,7 @@ export class HarnessController {
       history: this.session ? this.session.conversationSnapshot : this.restoredHistory,
       originalHistory: this.session ? this.session.originalConversationSnapshot : this.restoredOriginalHistory,
       originalHistoryComplete: this.session ? this.session.isOriginalConversationComplete : this.restoredOriginalComplete,
+      taskList: this.taskListItems,
       usage: this.session ? this.session.usage : this.cumulativeUsage,
     };
   }
@@ -578,6 +586,7 @@ export class HarnessController {
     if (this.session) {
       this.session.reset(); // Checkpoints and live approvals do not belong to the imported chat.
       this.session.restoreConversation(archive.history, this.cumulativeUsage, original, originalComplete);
+      this.session.restoreTaskList(archive.taskList ?? []);
       this.restoredHistory = [];
       this.restoredOriginalHistory = [];
       this.restoredOriginalComplete = true;
@@ -586,6 +595,7 @@ export class HarnessController {
       this.restoredOriginalHistory = [...original];
       this.restoredOriginalComplete = originalComplete;
     }
+    this.taskListItems = archive.taskList ?? [];
     const contextTokens = estimateMessagesTokens(archive.history);
     const contextWindow = this.readConfig().compaction.contextWindowTokens;
     this.state = {
@@ -772,7 +782,7 @@ export class HarnessController {
     this.approvals.forgetAll();
     this.clearCompactionTrace();
     this.applyChatArchive(archive);
-    this.post({ type: 'chat-replaced', items: this.items, state: this.state, activity: this.activity });
+    this.post({ type: 'chat-replaced', items: this.items, state: this.state, activity: this.activity, taskList: this.taskListItems });
     this.scheduleChatSave();
     await this.persistChat();
     void vscode.window.showInformationMessage('Coding Harness chat imported. You can continue the conversation.');
@@ -1268,6 +1278,7 @@ export class HarnessController {
     this.lastTokensPerSecond = 0;
     this.items = [];
     this.subagentItemIds.clear();
+    this.taskListItems = [];
     this.state = {
       ...this.state,
       usage: { ...this.cumulativeUsage },
@@ -2030,6 +2041,10 @@ export class HarnessController {
         }
         break;
       }
+      case 'task-list':
+        this.taskListItems = event.items;
+        this.post({ type: 'task-list', items: event.items });
+        break;
       case 'approval': {
         if (event.phase === 'request') {
           this.push({

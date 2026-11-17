@@ -2000,3 +2000,68 @@ body.dragging .composer-box {
   white-space: pre-line;
 }
 .context-breakdown button { margin-top: 6px; }
+
+/* ---------------------------------------------------------------- task strip */
+
+/* Live, per-task task list rendered in the panel header area. Visible only
+   while a task list has at least one item; cleared between tasks. */
+.task-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 4px 8px 0;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  font-size: 11px;
+}
+
+.task-strip[hidden] { display: none; }
+
+.task-strip-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.task-strip-title {
+  flex: 0 0 auto;
+  color: var(--vscode-foreground);
+  font-weight: 600;
+}
+
+.task-strip-items {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.task-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.task-item .task-mark {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+.task-item .task-mark.done { color: var(--ok); }
+.task-item .task-mark.in-progress { color: var(--accent); }
+.task-item .task-mark.pending { color: var(--muted); }
+
+.task-item .task-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vscode-foreground);
+}

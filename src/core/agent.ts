@@ -5,6 +5,7 @@ import { CompactionCancelled, compactHistory, contextBreakdown, contextBreakdown
 import { isRetryableProviderError, retryDelayMs } from './providers/errors';
 import { buildSystemPrompt, summarizeDiagnostics } from './prompt';
 import { createDefaultTools, ToolRegistry } from './tools';
+import { TaskListStore, type TaskItem } from './taskList';
 import { resolveAgentToolPolicy } from './toolPolicy';
 import { repairToolMessages } from './transcript';
 import {
@@ -108,6 +109,10 @@ export class HarnessSession {
   private lastSystemPrompt = '';
   /** Most recently resolved task policy; undefined means the estimate is provisional. */
   private lastAllowedTools?: ToolSpec[];
+  /** Per-task in-memory task list, exposed to tools via ToolContext.taskList. */
+  private taskList?: TaskListStore;
+  /** Task list restored from a saved chat, seeded into the next task's store. */
+  private pendingTaskList?: TaskItem[];
 
   constructor(private deps: AgentDeps) {
     this.registry = deps.registry ?? deps.tools ?? new ToolRegistry(createDefaultTools());
@@ -167,6 +172,16 @@ export class HarnessSession {
     this.lastSystemPrompt = '';
     this.lastAllowedTools = undefined;
     this.cumulativeUsage = { ...usage };
+  }
+
+  /** Restore task-list items from a saved chat; seeded into the next task's store. */
+  restoreTaskList(items: readonly TaskItem[]): void {
+    this.pendingTaskList = [...items];
+  }
+
+  /** Current task-list items, or empty when no task is running / none stored. */
+  get taskListItems(): TaskItem[] {
+    return this.taskList ? this.taskList.list() : [];
   }
 
   updateConfig(config: HarnessConfig): void {
@@ -263,6 +278,13 @@ export class HarnessSession {
     const signal = this.controller.signal;
     this.lastSystemPrompt = '';
     this.lastAllowedTools = undefined;
+    // Fresh per-task task list; cleared when the task ends.
+    this.taskList = new TaskListStore();
+    // Seed the list from a restored chat so saved task items survive reloads.
+    if (this.pendingTaskList) {
+      this.taskList.restore(this.pendingTaskList);
+      this.pendingTaskList = undefined;
+    }
     const host = this.deps.host;
 
     const images = options.images?.length ? options.images : undefined;
@@ -795,6 +817,7 @@ export class HarnessSession {
     } finally {
       this.busy = false;
       this.controller = undefined;
+      this.taskList = undefined;
       // If a stream was interrupted before the provider returned, preserve
       // the partial prose that the user already saw for the next follow-up.
       if (this.pendingAssistantText) {
@@ -1031,6 +1054,7 @@ export class HarnessSession {
       checkpoints: this.checkpoints,
       signal,
       outputTokenBudget,
+      taskList: this.taskList,
       approval: async (req: ApprovalRequest): Promise<ApprovalDecision> => {
         onEvent({ type: 'approval', id: call.id, phase: 'request', request: req });
         onEvent({ type: 'status', status: 'approval' });
@@ -1048,7 +1072,12 @@ export class HarnessSession {
     };
 
     try {
-      return finish(await tool.run(args, context));
+      const result = await tool.run(args, context);
+      // Broadcast the current task list so the panel strip stays in sync.
+      if (call.name === 'task_list' && result.ok && this.taskList) {
+        onEvent({ type: 'task-list', items: this.taskList.list() });
+      }
+      return finish(result);
     } catch (err) {
       const message = (err as Error).message;
       host.log('error', `tool ${call.name} threw: ${message}`);

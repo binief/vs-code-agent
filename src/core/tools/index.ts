@@ -2,11 +2,13 @@ import { createFileTool, deleteFileTool, listFilesTool, readFileTool, replaceInF
 import { getDiagnosticsTool, openFileTool } from './hostTools';
 import { searchTextTool } from './searchTools';
 import { runCommandTool, runShellCommand } from './shellTool';
+import { taskListTool } from './taskList';
 import type { Tool, ToolSpec } from '../types';
 
 /**
  * The default tool set. Everything the model can do to the workspace goes
  * through one of these, and each one is independently gate-able and testable.
+ * `task_list` is opt-in per project via the agent.md `tools:` list.
  */
 export function createDefaultTools(): Tool[] {
   return [
@@ -20,6 +22,7 @@ export function createDefaultTools(): Tool[] {
     runCommandTool as Tool,
     getDiagnosticsTool as Tool,
     openFileTool as Tool,
+    taskListTool as Tool,
   ];
 }
 

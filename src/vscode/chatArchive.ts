@@ -1,6 +1,6 @@
 import { normalizeImage, parseDataUrl } from '../core/images';
 import { isTranscriptWellFormed } from '../core/transcript';
-import type { ChatMessage, Usage } from '../core/types';
+import type { ChatMessage, TaskItem, Usage } from '../core/types';
 import type { TranscriptItem } from './controller';
 
 /** The same versioned format is used for workspace storage and explicit exports. */
@@ -19,6 +19,8 @@ export interface ChatArchive {
   /** Original uncompacted messages; absent in older archives. */
   originalHistory?: ChatMessage[];
   originalHistoryComplete?: boolean;
+  /** Per-task task list; absent in older archives. */
+  taskList?: TaskItem[];
   usage: Usage;
 }
 
@@ -189,5 +191,18 @@ export function parseChatArchive(text: string): ChatArchive {
   } else if (archive.originalHistoryComplete !== undefined) {
     invalid('originalHistoryComplete requires originalHistory.');
   }
+  if (archive.taskList !== undefined) {
+    if (!Array.isArray(archive.taskList)) invalid('taskList must be an array.');
+    for (const entry of archive.taskList) taskItem(entry);
+  }
   return archive as ChatArchive;
+}
+
+function taskItem(value: unknown): void {
+  const entry = object(value, 'taskList item');
+  string(entry.id, 'taskList item id', true);
+  string(entry.title, 'taskList item title', true);
+  if (!['pending', 'in-progress', 'done'].includes(entry.status)) {
+    invalid('taskList item status must be pending, in-progress or done.');
+  }
 }
