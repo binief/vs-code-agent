@@ -387,6 +387,13 @@ export class HarnessSession {
         if (spec.name === DELEGATE_TOOL.name) return !this.deps.delegated && this.deps.config.subagentsEnabled === true;
         return this.registry.has(spec.name);
       }) };
+      // When task list enforcement is enabled, always make task_list available
+      // regardless of agent.md `tools:` declaration, and instruct the model
+      // to maintain a task list for every long-running task.
+      if (this.deps.config.taskListEnabled && !toolPolicy.tools.some((t) => t.name === 'task_list')) {
+        const taskListSpec = this.registry.get('task_list');
+        if (taskListSpec) toolPolicy.tools.push(taskListSpec);
+      }
       const allowedToolNames = new Set(toolPolicy.tools.map((tool) => tool.name));
       this.lastAllowedTools = toolPolicy.tools;
       if (toolPolicy.restricted) {
@@ -401,7 +408,20 @@ export class HarnessSession {
         agentFiles: selected,
       });
 
-      this.lastSystemPrompt = system;
+      // Prepend a strong system instruction when task list enforcement is on.
+      let finalSystem = system;
+      if (this.deps.config.taskListEnabled) {
+        finalSystem =
+          '# Task list enforcement (required)\\n' +
+          'For every long-running task (more than one step), you MUST maintain a task list using the `task_list` tool:\\n' +
+          '1. Start: Call `task_list` with `action: "add"` to create items for each major step.\\n' +
+          '2. Progress: Call `task_list` with `action: "update"` to set `status: "in-progress"` when you begin an item, and `status: "done"` when complete.\\n' +
+          '3. Review: Call `task_list` with `action: "list"` before finishing to confirm nothing is pending.\\n' +
+          'Never claim a task is complete unless all its items are marked `done` in the task list.\\n\\n' +
+          system;
+      }
+
+      this.lastSystemPrompt = finalSystem;
 
       // Enabling subagents requests one automatic read-only investigation for
       // every parent task. Never bypass the agent-file permission ceiling, and

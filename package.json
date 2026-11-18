@@ -324,6 +324,11 @@
           "default": false,
           "markdownDescription": "Start a read-only subagent before every task, if the selected agent files explicitly allow `subagent` or `delegate_task` and read/search tools. On failure or missing permission, warn and continue with the main agent. Subagents use the same provider, have separate context, cannot edit or use MCP, and may increase time and token usage."
         },
+        "codingHarness.taskList.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Always make the `task_list` tool available (regardless of agent.md `tools:` declaration) and instruct the model to maintain a task list for every long-running task. Shown in the panel strip and saved in the chat JSON."
+        },
         "codingHarness.chat.saveEnabled": {
           "type": "boolean",
           "scope": "window",
