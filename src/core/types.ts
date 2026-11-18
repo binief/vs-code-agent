@@ -312,6 +312,10 @@ export interface HarnessConfig {
   textToolMode: boolean;
   /** Allow explicitly permitted, read-only delegated investigations. */
   subagentsEnabled: boolean;
+  /** When true, the `task_list` tool is always available (regardless of agent.md
+   * `tools:` declaration) and the model is instructed to maintain a task list
+   * for every long-running task. Shown in the panel strip and saved in chat JSON. */
+  taskListEnabled: boolean;
   /** Instructions loaded from agent.md/AGENTS.md files. */
   agentFiles: AgentFilesConfig;
   /** Which factual context is included in the system message. */
@@ -339,6 +343,7 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   showThinking: true,
   textToolMode: false,
   subagentsEnabled: false,
+  taskListEnabled: false,
   agentFiles: {
     enabled: true,
     names: ['AGENTS.md', 'agent.md', 'agents.md', 'copilot-instructions.md'],

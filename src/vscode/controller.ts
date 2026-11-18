@@ -852,6 +852,7 @@ export class HarnessController {
       showThinking: c.get('showThinking'),
       textToolMode: c.get('textToolMode'),
       subagentsEnabled: c.get<boolean>('subagents.enabled') === true,
+      taskListEnabled: c.get<boolean>('taskList.enabled') === true,
       agentFiles: {
         enabled: Boolean(agentEnabled),
         names: agentNames,
@@ -1354,16 +1355,16 @@ export class HarnessController {
     }
   }
 
-  getFeatureSettings(): { subagentsEnabled: boolean; localFallback: boolean; hasWorkspace: boolean } {
+  getFeatureSettings(): { subagentsEnabled: boolean; taskListEnabled: boolean; localFallback: boolean; hasWorkspace: boolean } {
     const config = this.readConfig();
-    return { subagentsEnabled: config.subagentsEnabled, localFallback: config.compaction.localFallback === true, hasWorkspace: Boolean(this.workspaceRoot()) };
+    return { subagentsEnabled: config.subagentsEnabled, taskListEnabled: config.taskListEnabled, localFallback: config.compaction.localFallback === true, hasWorkspace: Boolean(this.workspaceRoot()) };
   }
 
-  async saveFeatureSettings(input: { subagentsEnabled?: unknown; localFallback?: unknown; target?: unknown }): Promise<void> {
+  async saveFeatureSettings(input: { subagentsEnabled?: unknown; taskListEnabled?: unknown; localFallback?: unknown; target?: unknown }): Promise<void> {
     await this.whenReady();
     const fail = (error: string) => this.post({ type: 'feature-settings-saved', ok: false, error, settings: this.getFeatureSettings() });
     if (this.isBusy) return fail('Stop or finish the current task before changing settings.');
-    if (typeof input.subagentsEnabled !== 'boolean' || typeof input.localFallback !== 'boolean' ||
+    if (typeof input.subagentsEnabled !== 'boolean' || typeof input.taskListEnabled !== 'boolean' || typeof input.localFallback !== 'boolean' ||
         (input.target !== 'user' && input.target !== 'workspace')) return fail('Invalid settings.');
     if (input.target === 'workspace' && !this.workspaceRoot()) return fail('Saving workspace settings needs an open folder.');
     const target = input.target === 'workspace' ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
@@ -1374,13 +1375,14 @@ export class HarnessController {
       // These settings both have boolean defaults in the extension manifest.
       // A saved value alone does not mean VS Code registered its schema. Check
       // both before writing either so a stale registry cannot cause a partial save.
-      const keys = ['subagents.enabled', 'compaction.localFallback'];
+      const keys = ['subagents.enabled', 'taskList.enabled', 'compaction.localFallback'];
       const missing = keys.filter((key) => typeof settings.inspect<boolean>(key)?.defaultValue !== 'boolean');
       if (missing.length) {
         return fail(`VS Code has not registered ${missing.map((key) => `codingHarness.${key}`).join(', ')}. No settings were changed. ${reloadAdvice}`);
       }
       attempted = true;
       await settings.update('subagents.enabled', input.subagentsEnabled, target);
+      await settings.update('taskList.enabled', input.taskListEnabled, target);
       await settings.update('compaction.localFallback', input.localFallback, target);
       await this.refreshState();
       this.post({ type: 'feature-settings-saved', ok: true, settings: this.getFeatureSettings() });

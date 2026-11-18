@@ -1602,6 +1602,7 @@
   /* ------------------------------------------------------- quick settings */
   const featureModal = document.getElementById('feature-modal');
   const featureSubagents = document.getElementById('feature-subagents');
+  const featureTaskList = document.getElementById('feature-task-list');
   const featureLocal = document.getElementById('feature-local-fallback');
   const featureTarget = document.getElementById('feature-target');
   const featureStatus = document.getElementById('feature-status');
@@ -1616,17 +1617,20 @@
     featureStatus.textContent = 'Loading…';
     featureSave.disabled = true;
     featureSubagents.disabled = true;
+    featureTaskList.disabled = true;
     featureLocal.disabled = true;
     featureCompactLocal.disabled = true;
     vscode.postMessage({ type: 'get-feature-settings' });
   }
   function renderFeatureSettings(data) {
     featureSubagents.checked = Boolean(data.subagentsEnabled);
+    featureTaskList.checked = Boolean(data.taskListEnabled);
     featureLocal.checked = Boolean(data.localFallback);
     effectiveLocalFallback = Boolean(data.localFallback);
     featureTarget.querySelector('option[value="workspace"]').disabled = !data.hasWorkspace;
     if (!data.hasWorkspace) featureTarget.value = 'user';
     featureSubagents.disabled = false;
+    featureTaskList.disabled = false;
     featureLocal.disabled = false;
     featureSave.disabled = false;
     featureCompactLocal.disabled = busy || !effectiveLocalFallback;
@@ -1642,7 +1646,11 @@
     vscode.postMessage({ type: 'open-settings' });
   });
   featureSave.addEventListener('click', () => {
-    featureRequested = { subagentsEnabled: featureSubagents.checked, localFallback: featureLocal.checked };
+    featureRequested = {
+      subagentsEnabled: featureSubagents.checked,
+      taskListEnabled: featureTaskList.checked,
+      localFallback: featureLocal.checked,
+    };
     featureStatus.classList.remove('error');
     featureStatus.textContent = 'Saving…';
     featureSave.disabled = true;

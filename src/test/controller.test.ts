@@ -389,20 +389,25 @@ test('quick settings persist and read back both feature toggles', async () => {
   const { controller, messages } = makeController();
   try {
     assert.equal(controller.getFeatureSettings().subagentsEnabled, false);
+    assert.equal(controller.getFeatureSettings().taskListEnabled, false);
     assert.equal(controller.getFeatureSettings().localFallback, false);
-    await controller.saveFeatureSettings({ subagentsEnabled: true, localFallback: true, target: 'workspace' });
+    await controller.saveFeatureSettings({ subagentsEnabled: true, taskListEnabled: true, localFallback: true, target: 'workspace' });
     assert.equal(settings['subagents.enabled'], true);
+    assert.equal(settings['taskList.enabled'], true);
     assert.equal(settings['compaction.localFallback'], true);
     assert.equal(controller.readConfig().subagentsEnabled, true);
+    assert.equal(controller.readConfig().taskListEnabled, true);
     assert.equal(controller.readConfig().compaction.localFallback, true);
     assert.ok(messages.some((m) => m.type === 'feature-settings-saved' && m.ok && m.settings.localFallback));
-    await controller.saveFeatureSettings({ subagentsEnabled: false, localFallback: false, target: 'user' });
+    await controller.saveFeatureSettings({ subagentsEnabled: false, taskListEnabled: false, localFallback: false, target: 'user' });
     assert.equal(controller.readConfig().subagentsEnabled, false);
+    assert.equal(controller.readConfig().taskListEnabled, false);
     assert.equal(controller.readConfig().compaction.localFallback, false);
-    await controller.saveFeatureSettings({ subagentsEnabled: 'true', localFallback: true, target: 'workspace' });
+    await controller.saveFeatureSettings({ subagentsEnabled: 'true', taskListEnabled: true, localFallback: true, target: 'workspace' });
     assert.ok(messages.some((m) => m.type === 'feature-settings-saved' && !m.ok && /Invalid/.test(m.error)));
   } finally {
     delete settings['subagents.enabled'];
+    delete settings['taskList.enabled'];
     delete settings['compaction.localFallback'];
   }
 });
@@ -422,7 +427,7 @@ test('subagent progress is reflected in the live activity strip and clears on co
 test('unregistered feature settings are detected before either value is written', async () => {
   const originalConfig = vscodeStub.workspace.getConfiguration;
   try {
-    for (const missing of ['subagents.enabled', 'compaction.localFallback']) {
+    for (const missing of ['subagents.enabled', 'taskList.enabled', 'compaction.localFallback']) {
       let writes = 0;
       (vscodeStub.workspace as any).getConfiguration = () => ({
         get: (key: string) => settings[key],
@@ -431,7 +436,7 @@ test('unregistered feature settings are detected before either value is written'
         update: async () => { writes++; },
       });
       const { controller, messages } = makeController();
-      await controller.saveFeatureSettings({ subagentsEnabled: true, localFallback: true, target: 'workspace' });
+      await controller.saveFeatureSettings({ subagentsEnabled: true, taskListEnabled: true, localFallback: true, target: 'workspace' });
       assert.equal(writes, 0);
       const result = messages.find((message) => message.type === 'feature-settings-saved');
       assert.equal(result.ok, false);
@@ -456,8 +461,8 @@ test('registry errors during a write report partial success and reload guidance'
       },
     });
     const { controller, messages } = makeController();
-    await controller.saveFeatureSettings({ subagentsEnabled: true, localFallback: true, target: 'user' });
-    assert.deepEqual(written, ['subagents.enabled']);
+    await controller.saveFeatureSettings({ subagentsEnabled: true, taskListEnabled: true, localFallback: true, target: 'user' });
+    assert.deepEqual(written, ['subagents.enabled', 'taskList.enabled']);
     const result = messages.find((message) => message.type === 'feature-settings-saved');
     assert.equal(result.ok, false);
     assert.match(result.error, /Some settings may have changed/);
@@ -466,6 +471,7 @@ test('registry errors during a write report partial success and reload guidance'
     assert.equal(result.settings.localFallback, false);
   } finally {
     delete settings['subagents.enabled'];
+    delete settings['taskList.enabled'];
     vscodeStub.workspace.getConfiguration = originalConfig;
   }
 });
@@ -479,7 +485,7 @@ test('unrelated settings failures keep their actual error rather than suggesting
       update: async () => { throw new Error('settings file is read-only'); },
     });
     const { controller, messages } = makeController();
-    await controller.saveFeatureSettings({ subagentsEnabled: true, localFallback: true, target: 'workspace' });
+    await controller.saveFeatureSettings({ subagentsEnabled: true, taskListEnabled: true, localFallback: true, target: 'workspace' });
     const result = messages.find((message) => message.type === 'feature-settings-saved');
     assert.match(result.error, /read-only/);
     assert.match(result.error, /Some settings may have changed/);
