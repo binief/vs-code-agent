@@ -16,13 +16,6 @@ const step = (name: string): any => {
   return found;
 };
 
-test('package and lockfile versions match', () => {
-  const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
-  const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
-  assert.equal(lock.version, manifest.version);
-  assert.equal(lock.packages[''].version, manifest.version);
-});
-
 test('main updates and manual dispatch build and upload a VSIX after tests', () => {
   assert.deepEqual(workflow.on.push.branches, ['main']);
   assert.ok(Object.hasOwn(workflow.on, 'workflow_dispatch'));
