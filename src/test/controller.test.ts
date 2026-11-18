@@ -385,40 +385,6 @@ test('context preview resolves explicit delegation permission with the setting o
   }
 });
 
-test('quick settings persist and read back both feature toggles', async () => {
-  const { controller, messages } = makeController();
-  try {
-    assert.equal(controller.getFeatureSettings().subagentsEnabled, false);
-    assert.equal(controller.getFeatureSettings().taskListEnabled, false);
-    assert.equal(controller.getFeatureSettings().localFallback, false);
-    assert.equal(controller.getFeatureSettings().contextWindowTokens, 128000);
-    await controller.saveFeatureSettings({ subagentsEnabled: true, taskListEnabled: true, localFallback: true, decompositionEnabled: true, contextWindowTokens: 200000, target: 'workspace' });
-    assert.equal(settings['subagents.enabled'], true);
-    assert.equal(settings['taskList.enabled'], true);
-    assert.equal(settings['compaction.localFallback'], true);
-    assert.equal(settings['decomposition.enabled'], true);
-    assert.equal(settings['compaction.contextWindowTokens'], 200000);
-    assert.equal(controller.readConfig().subagentsEnabled, true);
-    assert.equal(controller.readConfig().taskListEnabled, true);
-    assert.equal(controller.readConfig().compaction.localFallback, true);
-    assert.equal(controller.readConfig().compaction.contextWindowTokens, 200000);
-    assert.ok(messages.some((m) => m.type === 'feature-settings-saved' && m.ok && m.settings.localFallback));
-    await controller.saveFeatureSettings({ subagentsEnabled: false, taskListEnabled: false, localFallback: false, decompositionEnabled: false, contextWindowTokens: 128000, target: 'user' });
-    assert.equal(controller.readConfig().subagentsEnabled, false);
-    assert.equal(controller.readConfig().taskListEnabled, false);
-    assert.equal(controller.readConfig().compaction.localFallback, false);
-    assert.equal(controller.readConfig().compaction.contextWindowTokens, 128000);
-    await controller.saveFeatureSettings({ subagentsEnabled: 'true', taskListEnabled: true, localFallback: true, decompositionEnabled: true, contextWindowTokens: 128000, target: 'workspace' });
-    assert.ok(messages.some((m) => m.type === 'feature-settings-saved' && !m.ok && /Invalid/.test(m.error)));
-  } finally {
-    delete settings['subagents.enabled'];
-    delete settings['taskList.enabled'];
-    delete settings['compaction.localFallback'];
-    delete settings['compaction.contextWindowTokens'];
-    delete settings['decomposition.enabled'];
-  }
-});
-
 test('subagent progress is reflected in the live activity strip and clears on completion', () => {
   const { controller, messages } = makeController();
   (controller as any).handleEvent({ type: 'subagent-progress', step: 2 });
@@ -429,82 +395,6 @@ test('subagent progress is reflected in the live activity strip and clears on co
   (controller as any).handleEvent({ type: 'tool-end', id: 'd', name: 'delegate_task', ok: true, summary: 'subagent finished', detail: '', durationMs: 10 });
   assert.equal(controller.getActivity().status, 'thinking');
   assert.ok(messages.some((message) => message.type === 'activity' && message.activity.status === 'subagent'));
-});
-
-test('unregistered feature settings are detected before either value is written', async () => {
-  const originalConfig = vscodeStub.workspace.getConfiguration;
-  try {
-    for (const missing of ['subagents.enabled', 'taskList.enabled', 'compaction.localFallback', 'decomposition.enabled', 'compaction.contextWindowTokens']) {
-      let writes = 0;
-      (vscodeStub.workspace as any).getConfiguration = () => ({
-        get: (key: string) => settings[key],
-        // A user value alone is not proof that VS Code registered the schema.
-        inspect: (key: string) => key === missing ? { key, workspaceValue: true } : { key, defaultValue: key === 'compaction.contextWindowTokens' ? 128000 : false },
-        update: async () => { writes++; },
-      });
-      const { controller, messages } = makeController();
-      await controller.saveFeatureSettings({ subagentsEnabled: true, taskListEnabled: true, localFallback: true, decompositionEnabled: true, contextWindowTokens: 128000, target: 'workspace' });
-      assert.equal(writes, 0);
-      const result = messages.find((message) => message.type === 'feature-settings-saved');
-      assert.equal(result.ok, false);
-      assert.match(result.error, new RegExp(`codingHarness\\.${missing.replace('.', '\\.')}`));
-      assert.match(result.error, /No settings were changed/);
-      assert.match(result.error, /Developer: Reload Window/);
-    }
-  } finally { vscodeStub.workspace.getConfiguration = originalConfig; }
-});
-
-test('registry errors during a write report partial success and reload guidance', async () => {
-  const originalConfig = vscodeStub.workspace.getConfiguration;
-  try {
-    const written: string[] = [];
-    (vscodeStub.workspace as any).getConfiguration = () => ({
-      get: (key: string) => settings[key],
-      inspect: (key: string) => ({ key, defaultValue: key === 'compaction.contextWindowTokens' ? 128000 : false }),
-      update: async (key: string, value: unknown) => {
-        if (key === 'compaction.localFallback') throw new Error('codingHarness.compaction.localFallback is not a registered configuration');
-        written.push(key);
-        settings[key] = value;
-      },
-    });
-    const { controller, messages } = makeController();
-    await controller.saveFeatureSettings({ subagentsEnabled: true, taskListEnabled: true, localFallback: true, decompositionEnabled: true, contextWindowTokens: 128000, target: 'user' });
-    assert.deepEqual(written, ['subagents.enabled', 'taskList.enabled']);
-    const result = messages.find((message) => message.type === 'feature-settings-saved');
-    assert.equal(result.ok, false);
-    assert.match(result.error, /Some settings may have changed/);
-    assert.match(result.error, /Developer: Reload Window/);
-    assert.equal(result.settings.subagentsEnabled, true);
-    assert.equal(result.settings.localFallback, false);
-    assert.equal(result.settings.contextWindowTokens, 128000);
-  } finally {
-    delete settings['subagents.enabled'];
-    delete settings['taskList.enabled'];
-    delete settings['compaction.contextWindowTokens'];
-    vscodeStub.workspace.getConfiguration = originalConfig;
-  }
-});
-
-test('unrelated settings failures keep their actual error rather than suggesting reload', async () => {
-  const originalConfig = vscodeStub.workspace.getConfiguration;
-  try {
-    (vscodeStub.workspace as any).getConfiguration = () => ({
-      get: (key: string) => settings[key],
-      inspect: (key: string) => ({ key, defaultValue: key === 'compaction.contextWindowTokens' ? 128000 : false }),
-      update: async () => { throw new Error('settings file is read-only'); },
-    });
-    const { controller, messages } = makeController();
-    await controller.saveFeatureSettings({ subagentsEnabled: true, taskListEnabled: true, localFallback: true, decompositionEnabled: true, contextWindowTokens: 128000, target: 'workspace' });
-    const result = messages.find((message) => message.type === 'feature-settings-saved');
-    assert.match(result.error, /read-only/);
-    assert.match(result.error, /Some settings may have changed/);
-    assert.doesNotMatch(result.error, /Reload Window/);
-  } finally {
-    delete settings['subagents.enabled'];
-    delete settings['taskList.enabled'];
-    delete settings['compaction.contextWindowTokens'];
-    vscodeStub.workspace.getConfiguration = originalConfig;
-  }
 });
 
 test('compaction diagnostics are bounded, clearable, and label child requests', () => {

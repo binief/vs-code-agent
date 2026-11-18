@@ -113,19 +113,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'select-copilot-model':
         await this.controller.selectCopilotModel();
         break;
-      case 'get-feature-settings':
-        this.post({ type: 'feature-settings', ...this.controller.getFeatureSettings() });
-        break;
-      case 'save-feature-settings':
-        await this.controller.saveFeatureSettings({
-          subagentsEnabled: message.subagentsEnabled,
-          taskListEnabled: message.taskListEnabled,
-          localFallback: message.localFallback,
-          decompositionEnabled: message.decompositionEnabled,
-          contextWindowTokens: message.contextWindowTokens,
-          target: message.target,
-        });
-        break;
       case 'mcp-reload':
         await this.controller.reloadMcpServers();
         break;

@@ -191,45 +191,6 @@
     </div>
   </footer>
 
-  <div class="modal-backdrop" id="feature-modal" hidden>
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="feature-modal-title">
-      <div class="modal-head">
-        <span class="modal-title" id="feature-modal-title">Coding Harness settings</span>
-        <button type="button" class="icon-btn" id="feature-close" aria-label="Close settings" title="Close">
-          <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
-        </button>
-      </div>
-      <div class="modal-body">
-        <button type="button" id="feature-copilot">Select GitHub Copilot model…</button>
-        <p>Uses your VS Code Copilot sign-in. VS Code may request consent. Model availability and usage limits depend on your account.</p>
-        <label class="check-row"><input type="checkbox" id="feature-subagents" /><span>Run a read-only subagent for every task</span></label>
-        <p>Before each task, the harness starts a subagent if selected agent files allow <code>subagent</code> (or <code>delegate_task</code>) and read/search tools. If it cannot run or fails, a warning appears and the main agent continues. Each extra model call can increase time and token usage. Subagent responses, thinking and tool cards appear in the chat temporarily; they are not saved or exported.</p>
-        <label class="check-row"><input type="checkbox" id="feature-task-list" /><span>Require task list for every task</span></label>
-        <p>Always makes the <code>task_list</code> tool available and instructs the model to add, update and complete task items for long-running work. Shown in the panel strip and saved in the chat JSON.</p>
-        <label class="check-row"><input type="checkbox" id="feature-local-fallback" /><span>Enable local fallback compaction</span></label>
-        <p>When LLM compaction fails, use local excerpts instead. This is lossy: older details may be omitted. Original messages remain in the session and saved chats when saving is enabled. Stop never triggers fallback.</p>
-        <button type="button" id="feature-compact-local">Compact locally now…</button>
-        <p>If an LLM request is stuck, press Stop first. Local compaction does not wait for the model and requires confirmation.</p>
-        <label class="check-row"><input type="checkbox" id="feature-project-decomposition" /><span>Decompose prompt-relevant files into task slices</span></label>
-        <p>Only when the prompt plus fixed context would exceed half the window, files mentioned in or matching the prompt are grouped into <code>task_list</code> slices sized to fit within the context window. No full project scan is performed.</p>
-        <div class="form-row">
-          <label for="feature-context-window">Context window size (tokens)</label>
-          <input type="number" id="feature-context-window" min="1000" step="1024" />
-        </div>
-        <p>Estimated context window size of your model. Used for context utilisation percentage and task slice sizing (e.g., 128000 for gpt-4o, 200000 for Claude).</p>
-        <button type="button" id="feature-all-settings">Open all VS Code settings</button>
-        <div class="modal-status feature-status" id="feature-status" aria-live="polite"></div>
-      </div>
-      <div class="modal-foot">
-        <select id="feature-target" aria-label="Settings scope">
-          <option value="workspace">Workspace settings</option>
-          <option value="user">User settings</option>
-        </select>
-        <button type="button" class="primary" id="feature-save">Save</button>
-      </div>
-    </div>
-  </div>
-
   <div class="modal-backdrop" id="mcp-modal" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mcp-modal-title">
       <div class="modal-head">
