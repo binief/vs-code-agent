@@ -148,7 +148,7 @@ test('runTask attaches images to the user turn and keeps them in history', async
     host: stubHost(fs.realpathSync(path.resolve('.'))),
     config: resolveConfig({ provider: 'mock', stream: false, context: { ...DEFAULT_CONFIG.context, diagnostics: false } }),
     provider,
-    registry: new ToolRegistry([]),
+    registry: new ToolRegistry(),
   });
 
   await session.runTask('what is this?', () => {}, { images: [attachment] });
@@ -165,7 +165,7 @@ test('an image with no prompt text still gets an instruction', async () => {
     host: stubHost(fs.realpathSync(path.resolve('.'))),
     config: resolveConfig({ provider: 'mock', stream: false, context: { ...DEFAULT_CONFIG.context, diagnostics: false } }),
     provider,
-    registry: new ToolRegistry([]),
+    registry: new ToolRegistry(),
   });
 
   await session.runTask('   ', () => {}, { images: [attachment] });
