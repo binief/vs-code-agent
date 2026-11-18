@@ -564,46 +564,7 @@ test('compaction activity shows request, elapsed time, and Stop without exposing
   h.close();
 });
 
-test('settings GUI exposes subagents and local fallback, saves scope, and launches local compaction', () => {
-  const h = mount();
-  h.send({ type: 'init', items: [], state, activity: idle });
-  h.doc.getElementById('btn-settings').click();
-  assert.equal(h.doc.getElementById('feature-modal').hidden, false);
-  assert.ok(h.posted.some((m) => m.type === 'get-feature-settings'));
-  h.send({ type: 'feature-settings', subagentsEnabled: false, taskListEnabled: false, localFallback: false, hasWorkspace: true });
-  assert.equal(h.doc.getElementById('feature-compact-local').disabled, true);
-  const sub = h.doc.getElementById('feature-subagents');
-  const taskList = h.doc.getElementById('feature-task-list');
-  const local = h.doc.getElementById('feature-local-fallback');
-  sub.checked = true;
-  taskList.checked = true;
-  local.checked = true;
-  h.doc.getElementById('feature-save').click();
-  assert.ok(h.posted.some((m) => m.type === 'save-feature-settings' && m.subagentsEnabled === true && m.taskListEnabled === true && m.localFallback === true && m.target === 'workspace'));
-  h.send({ type: 'feature-settings-saved', ok: true, settings: { subagentsEnabled: true, taskListEnabled: true, localFallback: true, hasWorkspace: true } });
-  assert.equal(h.doc.getElementById('feature-status').textContent, 'Saved ✓');
-  assert.equal(h.doc.getElementById('feature-compact-local').disabled, false);
-  h.doc.getElementById('feature-compact-local').click();
-  assert.ok(h.posted.some((m) => m.type === 'compact-local'));
-  assert.equal(h.doc.getElementById('feature-modal').hidden, true);
-  h.close();
-});
 
-test('settings GUI reports scope overrides and exposes the full settings screen', () => {
-  const h = mount();
-  h.send({ type: 'init', items: [], state, activity: idle });
-  h.doc.getElementById('btn-settings').click();
-  h.send({ type: 'feature-settings', subagentsEnabled: false, localFallback: false, hasWorkspace: false });
-  assert.equal(h.doc.getElementById('feature-target').value, 'user');
-  h.doc.getElementById('feature-subagents').checked = true;
-  h.doc.getElementById('feature-save').click();
-  h.send({ type: 'feature-settings-saved', ok: true, settings: { subagentsEnabled: false, localFallback: false, hasWorkspace: false } });
-  assert.match(h.doc.getElementById('feature-status').textContent, /overrides/);
-  assert.equal(h.doc.getElementById('feature-subagents').checked, false);
-  h.doc.getElementById('feature-all-settings').click();
-  assert.ok(h.posted.some((m) => m.type === 'open-settings'));
-  h.close();
-});
 
 test('activity strip identifies active subagent work', () => {
   const h = mount();
@@ -614,22 +575,6 @@ test('activity strip identifies active subagent work', () => {
   h.close();
 });
 
-test('feature settings errors remain readable in the dialog body and allow retry', () => {
-  const h = mount();
-  h.send({ type: 'init', items: [], state, activity: idle });
-  h.doc.getElementById('btn-settings').click();
-  h.send({ type: 'feature-settings', subagentsEnabled: false, localFallback: false, hasWorkspace: true });
-  h.doc.getElementById('feature-subagents').checked = true;
-  h.doc.getElementById('feature-save').click();
-  h.send({ type: 'feature-settings-saved', ok: false, error: 'VS Code has not registered codingHarness.subagents.enabled. No settings were changed. Run Developer: Reload Window.', settings: { subagentsEnabled: false, localFallback: false, hasWorkspace: true } });
-  const status = h.doc.getElementById('feature-status');
-  assert.ok(status.closest('.modal-body'));
-  assert.match(status.textContent, /Developer: Reload Window/);
-  assert.equal(status.classList.contains('error'), true);
-  assert.equal(h.doc.getElementById('feature-save').disabled, false);
-  assert.equal(h.doc.getElementById('feature-subagents').checked, true, 'unsaved edits remain visible');
-  h.close();
-});
 
 test('compaction inspector shows live requests and responses without treating text as HTML', () => {
   const h = mount();
@@ -688,18 +633,6 @@ test('compaction inspector preserves a selected request across retries and defer
   h.close();
 });
 
-test('Copilot selection is accessible in settings and does not claim an API key is missing', () => {
-  const h = mount();
-  h.send({ type: 'init', items: [], state: { ...state, provider: 'copilot', model: 'chosen-id', keyPresent: false }, activity: idle });
-  const chip = h.doc.getElementById('chip-provider');
-  assert.match(chip.textContent, /copilot.*chosen-id/);
-  assert.match(chip.title, /VS Code sign-in/);
-  assert.equal(chip.classList.contains('warn'), false);
-  h.doc.getElementById('btn-settings').click();
-  h.doc.getElementById('feature-copilot').click();
-  assert.ok(h.posted.some((message) => message.type === 'select-copilot-model'));
-  h.close();
-});
 
 test('Copilot compaction details do not claim unsupported output limits or finish reasons', () => {
   const h = mount();
@@ -713,14 +646,6 @@ test('Copilot compaction details do not claim unsupported output limits or finis
   h.close();
 });
 
-test('settings describe automatic subagent attempts and warning fallback', () => {
-  const h = mount();
-  h.doc.getElementById('btn-settings').click();
-  const modalText = h.doc.getElementById('feature-modal').textContent;
-  assert.match(modalText, /Run a read-only subagent for every task/);
-  assert.match(modalText, /warning appears and the main agent continues/);
-  h.close();
-});
 
 test('subagent response, thought, notices and tool cards stay labeled through streaming updates', () => {
   const { doc, send } = mount();

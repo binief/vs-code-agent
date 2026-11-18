@@ -1363,62 +1363,6 @@ export class HarnessController {
     }
   }
 
-  getFeatureSettings(): { subagentsEnabled: boolean; taskListEnabled: boolean; localFallback: boolean; contextWindowTokens: number; hasWorkspace: boolean } {
-    const config = this.readConfig();
-    return {
-      subagentsEnabled: config.subagentsEnabled,
-      taskListEnabled: config.taskListEnabled,
-      localFallback: config.compaction.localFallback === true,
-      contextWindowTokens: config.compaction.contextWindowTokens,
-      hasWorkspace: Boolean(this.workspaceRoot()),
-    };
-  }
-
-  async saveFeatureSettings(input: { subagentsEnabled?: unknown; taskListEnabled?: unknown; localFallback?: unknown; decompositionEnabled?: unknown; contextWindowTokens?: unknown; target?: unknown }): Promise<void> {
-    await this.whenReady();
-    const fail = (error: string) => this.post({ type: 'feature-settings-saved', ok: false, error, settings: this.getFeatureSettings() });
-    if (this.isBusy) return fail('Stop or finish the current task before changing settings.');
-    if (typeof input.subagentsEnabled !== 'boolean' || typeof input.taskListEnabled !== 'boolean' || typeof input.localFallback !== 'boolean' ||
-        typeof input.decompositionEnabled !== 'boolean' || typeof input.contextWindowTokens !== 'number' ||
-        (input.target !== 'user' && input.target !== 'workspace')) return fail('Invalid settings.');
-    if (input.contextWindowTokens < 1000) return fail('Context window must be at least 1000 tokens.');
-    if (input.target === 'workspace' && !this.workspaceRoot()) return fail('Saving workspace settings needs an open folder.');
-    const target = input.target === 'workspace' ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
-    let attempted = false;
-    const reloadAdvice = 'Stop or finish any running task, then run Developer: Reload Window and try again. If it persists, reinstall Coding Harness in the active extension host and reload.';
-    try {
-      const settings = vscode.workspace.getConfiguration('codingHarness');
-      // Boolean settings vs number setting: check each with its expected type.
-      const boolKeys = ['subagents.enabled', 'taskList.enabled', 'compaction.localFallback', 'decomposition.enabled'];
-      const numKeys = ['compaction.contextWindowTokens'];
-      const missingBool = boolKeys.filter((key) => {
-        const insp = settings.inspect<boolean>(key);
-        return typeof insp?.defaultValue !== 'boolean';
-      });
-      const missingNum = numKeys.filter((key) => {
-        const insp = settings.inspect<number>(key);
-        return typeof insp?.defaultValue !== 'number';
-      });
-      const missing = [...missingBool, ...missingNum];
-      if (missing.length) {
-        return fail(`VS Code has not registered ${missing.map((key) => `codingHarness.${key}`).join(', ')}. No settings were changed. ${reloadAdvice}`);
-      }
-      attempted = true;
-      await settings.update('subagents.enabled', input.subagentsEnabled, target);
-      await settings.update('taskList.enabled', input.taskListEnabled, target);
-      await settings.update('compaction.localFallback', input.localFallback, target);
-      await settings.update('decomposition.enabled', input.decompositionEnabled, target);
-      await settings.update('compaction.contextWindowTokens', input.contextWindowTokens, target);
-      await this.refreshState();
-      this.post({ type: 'feature-settings-saved', ok: true, settings: this.getFeatureSettings() });
-    } catch (err) {
-      const message = (err as Error).message;
-      const state = attempted ? 'Some settings may have changed.' : 'No settings were changed.';
-      const guidance = /not a registered configuration/i.test(message) ? ` ${reloadAdvice}` : '';
-      fail(`Could not save all settings: ${message}. ${state}${guidance}`);
-    }
-  }
-
   async reloadMcpServers(): Promise<void> {
     await this.whenReady();
     if (this.isBusy) {
