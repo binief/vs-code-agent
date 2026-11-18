@@ -274,11 +274,11 @@ groups are `read` (`list_files`, `read_file`, `get_diagnostics`, `open_file`), `
 `tools: []`, no selected files, or no selected file with a `tools` declaration permits no tools.
 In the panel, choosing “Use every discovered file” selects all discovered files.
 
-When several selected files declare `tools`, their permissions intersect, even when their instruction
-scope is narrower: the policy applies to the whole task. A file without a declaration does not grant
-or further restrict tools. Agent files are reloaded for each task. Unknown or malformed metadata,
-truncated selected files, missing pins, and skipped files in default all-files mode stop the task rather
-than silently grant access.
+When several selected files declare `tools`, their permissions are combined (union): any tool named
+in *any* selected file is available for the whole task. A file without a declaration neither grants
+nor restricts tools — it is neutral. Agent files are reloaded for each task. Unknown or malformed
+metadata, truncated selected files, missing pins, and skipped files in default all-files mode stop
+the task rather than silently grant access.
 
 **Important:** This is a tool-name allowlist, not a sandbox. `execute` can run shell commands that
 modify files, and MCP servers may have arbitrary side effects, even when `edit` is absent. Existing

@@ -308,7 +308,7 @@ test('automatic child omits images and cancellation prevents the parent model ca
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('automatic delegation obeys intersected tool policies and keeps recovery snapshots valid', async () => {
+test('automatic delegation follows combined tool policies and keeps recovery snapshots valid', async () => {
   const dir = workspace('read, subagent');
   try {
     fs.mkdirSync(path.join(dir, '.agents'));
@@ -319,10 +319,12 @@ test('automatic delegation obeys intersected tool policies and keeps recovery sn
     const session = new HarnessSession({ host: new Host(dir), config: config(true), provider });
     const result = await session.runTask('Inspect', e => events.push(e));
     assert.equal(result.outcome, 'complete');
-    assert.equal(calls.length, 1);
-    assert.equal(isChild(calls[0]), false);
-    assert.ok(events.some(e => e.type === 'notice' && e.level === 'warn' && e.message.includes('do not permit delegation')));
-    assert.ok(!calls[0].tools.some(t => t.name === 'delegate_task'));
+    // Union: agent.md grants read + subagent (delegate_task); restricted.md only adds read (already present)
+    assert.equal(calls.length, 2);
+    assert.equal(isChild(calls[0]), true);
+    assert.equal(isChild(calls[1]), false);
+    assert.ok(!events.some(e => e.type === 'notice' && e.level === 'warn' && e.message.includes('do not permit delegation')));
+    assert.ok(calls[1].tools.some(t => t.name === 'delegate_task'));
     assert.ok(isTranscriptWellFormed(session.conversationSnapshot));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
