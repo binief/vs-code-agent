@@ -641,9 +641,15 @@ export class HarnessSession {
       // When task list enforcement is enabled, always make task_list available
       // regardless of agent.md `tools:` declaration, and instruct the model
       // to maintain a task list for every long-running task.
-      if (this.deps.config.taskListEnabled && !toolPolicy.tools.some((t) => t.name === 'task_list')) {
-        const taskListSpec = this.registry.get('task_list');
-        if (taskListSpec) toolPolicy.tools.push(taskListSpec);
+      if (this.deps.config.taskListEnabled) {
+        if (!toolPolicy.tools.some((t) => t.name === 'task_list')) {
+          const taskListSpec = this.registry.get('task_list');
+          if (taskListSpec) toolPolicy.tools.push(taskListSpec);
+        }
+        if (!toolPolicy.tools.some((t) => t.name === 'task_decompose')) {
+          const taskDecomposeSpec = this.registry.get('task_decompose');
+          if (taskDecomposeSpec) toolPolicy.tools.push(taskDecomposeSpec);
+        }
       }
       const allowedToolNames = new Set(toolPolicy.tools.map((tool) => tool.name));
       this.lastAllowedTools = toolPolicy.tools;
@@ -664,8 +670,8 @@ export class HarnessSession {
       if (this.deps.config.taskListEnabled) {
         finalSystem =
           '# Task list enforcement (required)\\n' +
-          'For every long-running task (more than one step), you MUST maintain a task list using the `task_list` tool:\\n' +
-          '1. Start: Call `task_list` with `action: "add"` to create items for each major step.\\n' +
+          'For every long-running task (more than one step), you MUST maintain a task list:\\n' +
+          '1. Create: Call `task_decompose` with a prompt describing the work, or call `task_list` with `action: "add"` to add items manually.\\n' +
           '2. Progress: Call `task_list` with `action: "update"` to set `status: "in-progress"` when you begin an item, and `status: "done"` when complete.\\n' +
           '3. Review: Call `task_list` with `action: "list"` before finishing to confirm nothing is pending.\\n' +
           'Never claim a task is complete unless all its items are marked `done` in the task list.\\n\\n' +
@@ -1383,7 +1389,7 @@ export class HarnessSession {
     try {
       const result = await tool.run(args, context);
       // Broadcast the current task list so the panel strip stays in sync.
-      if (call.name === 'task_list' && result.ok && this.taskList) {
+      if ((call.name === 'task_list' || call.name === 'task_decompose') && result.ok && this.taskList) {
         onEvent({ type: 'task-list', items: this.taskList.list() });
       }
       return finish(result);
