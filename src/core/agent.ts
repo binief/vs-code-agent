@@ -261,12 +261,18 @@ export class HarnessSession {
     const sliceBudget = Math.floor(contextWindow * 0.6);
     if (sliceBudget < 1000) return; // too small to be useful
 
+    const signal = this.controller?.signal;
+    if (signal?.aborted) return;
+
     const result = walk({
       root,
       maxDepth: 12,
       maxEntries: 500,
       maxFileBytes: 256 * 1024,
+      signal,
     });
+
+    if (signal?.aborted) return;
 
     // Filter to likely source files (skip data, binary, lock files, etc.).
     const sourceExts = new Set([
@@ -439,6 +445,14 @@ export class HarnessSession {
 
   cancel(): void {
     this.controller?.abort();
+    // Resolve any pending task-list approval with 'reject' so the waiting
+    // runTask can observe cancellation and exit cleanly instead of hanging
+    // on waitForTaskListApproval() forever.
+    const resolve = this.taskListApprovalResolve;
+    if (resolve) {
+      this.taskListApprovalResolve = undefined;
+      resolve('reject');
+    }
   }
 
   /** Undo every file change made since the current/last `runTask` started. */

@@ -1264,6 +1264,10 @@ export class HarnessController {
     } else {
       return;
     }
+    // Reject any pending approvals (file writes, command runs) so the
+    // waiting tool calls fail fast instead of hanging until the user
+    // clicks Apply/Reject on a cancelled task.
+    this.approvals.cancelAll();
     this.pushNotice('info', 'Cancelling the current task…');
   }
 
