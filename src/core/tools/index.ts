@@ -3,6 +3,7 @@ import { getDiagnosticsTool, openFileTool } from './hostTools';
 import { searchTextTool } from './searchTools';
 import { runCommandTool, runShellCommand } from './shellTool';
 import { taskListTool } from './taskList';
+import { taskDecomposeTool } from './taskDecompose';
 import type { Tool, ToolSpec } from '../types';
 
 /**
@@ -23,6 +24,7 @@ export function createDefaultTools(): Tool[] {
     getDiagnosticsTool as Tool,
     openFileTool as Tool,
     taskListTool as Tool,
+    taskDecomposeTool as Tool,
   ];
 }
 
@@ -74,4 +76,5 @@ export { createFileTool, deleteFileTool, listFilesTool, readFileTool, replaceInF
 export { getDiagnosticsTool, openFileTool };
 export { searchTextTool };
 export { runCommandTool, runShellCommand };
+export { taskDecomposeTool };
 export { McpManager, McpClient } from './mcp';

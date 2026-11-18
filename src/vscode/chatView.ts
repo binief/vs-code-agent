@@ -49,6 +49,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     void this.view?.webview.postMessage(message);
   }
 
+  /** Dispatch a slash command from the chat panel to the controller. */
+  private async handleCommand(name: string, args: any): Promise<void> {
+    await this.controller.whenReady();
+    switch (name) {
+      case 'create_tasks':
+        await this.controller.createTasks(String(args?.prompt ?? ''));
+        break;
+      case 'edit_task':
+        await this.controller.editTask(String(args?.id ?? ''), args);
+        break;
+      case 'start_implementation':
+        await this.controller.startImplementation();
+        break;
+      case 'refresh_tasklist':
+        this.controller.refreshTasklist();
+        break;
+      default:
+        this.log.debug(`unknown slash command: ${name}`);
+    }
+  }
+
   /** Reveal the panel (used by commands that need the user's attention). */
   async reveal(): Promise<void> {
     try {
@@ -162,6 +183,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         break;
       case 'open-settings':
         await vscode.commands.executeCommand('workbench.action.openSettings', 'codingHarness');
+        break;
+      case 'command':
+        await this.handleCommand(message.name, message.args);
         break;
       case 'copy':
         try {

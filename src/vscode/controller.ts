@@ -1256,6 +1256,94 @@ export class HarnessController {
     }
   }
 
+  /* --------------------------------------------------------------- slash commands */
+
+  /** Create task list items from a prompt (slash command /create_tasks). */
+  async createTasks(prompt: string): Promise<void> {
+    await this.whenReady();
+    if (!this.session) {
+      void vscode.window.showWarningMessage('Coding Harness session is not ready. Start a task first.');
+      return;
+    }
+    const trimmed = prompt.trim();
+    if (!trimmed) {
+      void vscode.window.showWarningMessage('Provide a prompt after /create_tasks.');
+      return;
+    }
+    const config = this.readConfig();
+    if (!config.taskListEnabled) {
+      void vscode.window.showWarningMessage('Enable codingHarness.taskList.enabled in settings to use /create_tasks.');
+      return;
+    }
+    this.setStatus('thinking', true);
+    try {
+      await this.session.decomposeProject(trimmed);
+    } finally {
+      this.setStatus('idle', false);
+    }
+  }
+
+  /** Edit a task list item (slash command /edit_task <id> status=done|title=...). */
+  async editTask(id: string, updates: { title?: string; status?: string }): Promise<void> {
+    await this.whenReady();
+    if (!id) {
+      void vscode.window.showWarningMessage('Usage: /edit_task <id> status=done|title=...');
+      return;
+    }
+    const patch: { title?: string; status?: 'pending' | 'in-progress' | 'done' } = {};
+    if (updates.title !== undefined) patch.title = updates.title;
+    if (updates.status !== undefined) {
+      if (!['pending', 'in-progress', 'done'].includes(updates.status)) {
+        void vscode.window.showWarningMessage('status must be pending, in-progress, or done.');
+        return;
+      }
+      patch.status = updates.status as 'pending' | 'in-progress' | 'done';
+    }
+    if (Object.keys(patch).length === 0) {
+      void vscode.window.showWarningMessage('Nothing to update. Use status=done or title=...');
+      return;
+    }
+    const store = this.session?.taskListStore;
+    if (!store) {
+      void vscode.window.showWarningMessage('No task list available.');
+      return;
+    }
+    const updated = store.update(id, patch);
+    if (!updated) {
+      void vscode.window.showWarningMessage(`Unknown task item id "${id}".`);
+      return;
+    }
+    this.taskListItems = store.list();
+    this.post({ type: 'task-list', items: this.taskListItems });
+  }
+
+  /** Start implementing pending task list items (slash command /start_implementation). */
+  async startImplementation(): Promise<void> {
+    await this.whenReady();
+    if (!this.session) {
+      void vscode.window.showWarningMessage('Coding Harness session is not ready.');
+      return;
+    }
+    const config = this.readConfig();
+    if (!config.taskListEnabled) {
+      void vscode.window.showWarningMessage('Enable codingHarness.taskList.enabled in settings to use /start_implementation.');
+      return;
+    }
+    const pending = this.taskListItems.filter((i) => i.status !== 'done');
+    if (pending.length === 0) {
+      void vscode.window.showInformationMessage('No pending task items. Use /create_tasks to create some first.');
+      return;
+    }
+    // Start a normal runTask so the model works through the pending items.
+    const prompt = `Work through the pending task list items. Start with the first pending item, mark it in-progress, implement it, then mark it done. Repeat until all items are done.\n\nPending items:\n${pending.map((i) => `- ${i.id}: ${i.title}`).join('\n')}`;
+    await this.run(prompt);
+  }
+
+  /** Re-emit the current task list to the panel (slash command /refresh_tasklist). */
+  refreshTasklist(): void {
+    this.post({ type: 'task-list', items: this.taskListItems });
+  }
+
   cancel(): void {
     if (this.session?.isRunning) {
       this.session.cancel();

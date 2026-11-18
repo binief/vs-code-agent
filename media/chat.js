@@ -1573,8 +1573,54 @@
     }
   });
 
+  function parseSlashCommand(value) {
+    // Strip the leading '/' and split into command + rest.
+    const body = value.slice(1);
+    const space = body.indexOf(' ');
+    const name = space === -1 ? body : body.slice(0, space);
+    const rest = space === -1 ? '' : body.slice(space + 1).trim();
+    const args = {};
+
+    if (name === 'create_tasks') {
+      args.prompt = rest;
+    } else if (name === 'edit_task') {
+      const [id, ...kvPairs] = rest.split(/\s+/);
+      if (!id) return null;
+      args.id = id;
+      for (const kv of kvPairs) {
+        const eq = kv.indexOf('=');
+        if (eq === -1) continue;
+        const k = kv.slice(0, eq);
+        const v = kv.slice(eq + 1);
+        if (k === 'status') args.status = v;
+        else if (k === 'title') args.title = v;
+      }
+    } else if (name === 'start_implementation' || name === 'refresh_tasklist') {
+      // no args needed
+    } else {
+      return null; // unknown command — fall through to normal submit
+    }
+    return { name, args };
+  }
+
   function submit(text) {
     const value = (text !== undefined ? text : input.value).trim();
+    // Slash commands: /create_tasks, /edit_task, /start_implementation, /refresh_tasklist
+    if (value.startsWith('/')) {
+      const parsed = parseSlashCommand(value);
+      if (parsed) {
+        vscode.postMessage({ type: 'command', ...parsed });
+        clearAttachments();
+        if (text === undefined) {
+          input.value = '';
+          input.style.height = 'auto';
+        }
+        stickToBottom = true;
+        autoScroll(true);
+        return;
+      }
+      // Unknown slash command: fall through to normal submit.
+    }
     // An image on its own is a valid prompt ("what is wrong in this screenshot?").
     if ((!value && pending.length === 0) || busy) return;
     const images = pending.map((entry) => ({ name: entry.name, mediaType: entry.mediaType, dataUrl: entry.dataUrl }));
