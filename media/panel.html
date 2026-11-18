@@ -210,8 +210,8 @@
         <p>When LLM compaction fails, use local excerpts instead. This is lossy: older details may be omitted. Original messages remain in the session and saved chats when saving is enabled. Stop never triggers fallback.</p>
         <button type="button" id="feature-compact-local">Compact locally now…</button>
         <p>If an LLM request is stuck, press Stop first. Local compaction does not wait for the model and requires confirmation.</p>
-        <label class="check-row"><input type="checkbox" id="feature-project-decomposition" /><span>Split project into context-sized task slices</span></label>
-        <p>At task start, walk the workspace and group files into <code>task_list</code> items sized to fit within the context window. The model works on one slice at a time without losing context.</p>
+        <label class="check-row"><input type="checkbox" id="feature-project-decomposition" /><span>Decompose prompt-relevant files into task slices</span></label>
+        <p>Only when the prompt plus fixed context would exceed half the window, files mentioned in or matching the prompt are grouped into <code>task_list</code> slices sized to fit within the context window. No full project scan is performed.</p>
         <div class="form-row">
           <label for="feature-context-window">Context window size (tokens)</label>
           <input type="number" id="feature-context-window" min="1000" step="1024" />

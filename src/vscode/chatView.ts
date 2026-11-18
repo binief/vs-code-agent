@@ -121,7 +121,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           subagentsEnabled: message.subagentsEnabled,
           taskListEnabled: message.taskListEnabled,
           localFallback: message.localFallback,
-          projectDecompositionEnabled: message.projectDecompositionEnabled,
+          decompositionEnabled: message.decompositionEnabled,
           contextWindowTokens: message.contextWindowTokens,
           target: message.target,
         });

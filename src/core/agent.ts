@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { agentFilesSummary, discoverAgentFiles, selectAgentFiles, type SelectedAgentFiles } from './agentFiles';
 import { CheckpointStore, type RevertReport } from './checkpoints';
@@ -6,7 +7,7 @@ import { CompactionCancelled, compactHistory, contextBreakdown, contextBreakdown
 import { isRetryableProviderError, retryDelayMs } from './providers/errors';
 import { buildSystemPrompt, summarizeDiagnostics } from './prompt';
 import { createDefaultTools, ToolRegistry } from './tools';
-import { walk } from './tools/walk';
+import { walkFiles } from './tools/walk';
 import { TaskListStore, type TaskItem } from './taskList';
 import { resolveAgentToolPolicy } from './toolPolicy';
 import { repairToolMessages } from './transcript';
@@ -253,6 +254,8 @@ export class HarnessSession {
    * and conversation history).
    */
   async decomposeProject(prompt?: string): Promise<void> {
+    if (!prompt || !prompt.trim()) return;
+
     const host = this.deps.host;
     const root = host.workspaceRoot;
     const contextWindow = this.deps.config.compaction.contextWindowTokens;
@@ -261,14 +264,10 @@ export class HarnessSession {
     const sliceBudget = Math.floor(contextWindow * 0.6);
     if (sliceBudget < 1000) return; // too small to be useful
 
-    const result = walk({
-      root,
-      maxDepth: 12,
-      maxEntries: 500,
-      maxFileBytes: 256 * 1024,
-    });
+    const signal = this.controller?.signal;
+    if (signal?.aborted) return;
 
-    // Filter to likely source files (skip data, binary, lock files, etc.).
+    // Source file extensions considered for decomposition.
     const sourceExts = new Set([
       '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
       '.py', '.go', '.java', '.kt', '.rs', '.rb', '.php', '.cs', '.cpp', '.c', '.h', '.hpp',
@@ -284,53 +283,75 @@ export class HarnessSession {
       'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'poetry.lock',
       'Cargo.lock', 'composer.lock', 'Gemfile.lock', 'Pipfile.lock',
     ]);
-    let files = result.entries
-      .filter((e) => !e.isDirectory)
-      .filter((e) => {
-        const name = e.rel.toLowerCase();
-        if (skipNames.has(name)) return false;
-        const ext = path.extname(name);
-        return sourceExts.has(ext);
-      });
 
-    if (files.length === 0) return;
+    // Collect files relevant to the prompt — no full workspace scan.
+    const relevantFiles = new Set<string>();
 
-    // Prompt-aware relevance: prioritize files mentioned in the prompt or
-    // matching its keywords, so small changes don't trigger whole-project
-    // slicing. When no relevant matches are found, fall back to all files.
-    if (prompt && prompt.trim()) {
-      const mentioned = new Set<string>();
-      const pathRe = /[\w./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|java|kt|rs|rb|php|cs|cpp|c|h|hpp|swift|scala|clj|hs|ml|fs|vb|html|css|scss|sass|less|vue|svelte|json|yaml|yml|toml|ini|cfg|conf|md|mdx|txt|rst|sh|bash|zsh|fish|ps1|bat|cmd|sql|graphql|gql|tf)\b/gi;
-      for (const m of prompt.matchAll(pathRe)) {
-        mentioned.add(m[0].toLowerCase());
-      }
-      const stopWords = new Set([
-        'the','and','for','with','from','that','this','have','has','had','but','not','you','are','was','were','been','will','would','could','should','may','might','must','can','about','into','over','under','after','before','between','through','during','without','within','what','which','when','where','who','whom','whose','why','how','all','any','each','every','some','such','no','nor','only','own','same','so','than','too','very','just','now','then','here','there','also','even','still','much','more','most','less','least','few','many','several','both','either','neither','another','other','others','please','help','need','want','make','take','get','set','put','run','use','see','look','show','tell','ask','say','call','try','work','way','time','year','day','week','month','project','code','file','files','thing','things','stuff','issue','bug','fix','add','remove','change','update','create','delete','build','test','run','start','stop','restart','deploy','config','settings','setup','install','upgrade','merge','rebase','commit','push','pull','clone','fork','branch','tag','release','version','new','old','first','last','next','previous','current','recent','later','soon','today','tomorrow','yesterday'
-      ]);
-      const keywords = prompt
-        .split(/[^\\w]+/)
-        .filter((w) => w.length >= 4 && !stopWords.has(w.toLowerCase()))
-        .map((w) => w.toLowerCase());
-
-      const scored = files.map((e) => {
-        const name = e.rel.toLowerCase();
-        let score = 0;
-        if (mentioned.has(name)) score += 100;
-        if (keywords.some((k) => name.includes(k))) score += 10;
-        return { entry: e, score };
-      });
-
-      const relevant = scored.filter((x) => x.score > 0);
-      if (relevant.length > 0) {
-        files = relevant
-          .sort((a, b) => b.score - a.score || a.entry.rel.localeCompare(b.entry.rel))
-          .map((x) => x.entry);
+    // 1. Files explicitly mentioned by path in the prompt (e.g. "src/foo.ts").
+    const pathRe = /[\w./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|java|kt|rs|rb|php|cs|cpp|c|h|hpp|swift|scala|clj|hs|ml|fs|vb|html|css|scss|sass|less|vue|svelte|json|yaml|yml|toml|ini|cfg|conf|md|mdx|txt|rst|sh|bash|zsh|fish|ps1|bat|cmd|sql|graphql|gql|tf)\b/gi;
+    for (const m of prompt.matchAll(pathRe)) {
+      const file = m[0];
+      try {
+        const abs = path.resolve(root, file);
+        const stat = fs.statSync(abs);
+        if (stat.isFile()) {
+          const ext = path.extname(file.toLowerCase());
+          if (sourceExts.has(ext) && !skipNames.has(file.toLowerCase())) {
+            relevantFiles.add(file);
+          }
+        }
+      } catch {
+        // Mentioned file doesn't exist: skip.
       }
     }
 
-    files.sort((a, b) => a.rel.localeCompare(b.rel));
+    if (signal?.aborted) return;
 
-    if (files.length === 0) return;
+    // 2. Files matching prompt keywords via bounded glob matches.
+    const stopWords = new Set([
+      'the','and','for','with','from','that','this','have','has','had','but','not','you','are','was','were','been','will','would','could','should','may','might','must','can','about','into','over','under','after','before','between','through','during','without','within','what','which','when','where','who','whom','whose','why','how','all','any','each','every','some','such','no','nor','only','own','same','so','than','too','very','just','now','then','here','there','also','even','still','much','more','most','less','least','few','many','several','both','either','neither','another','other','others','please','help','need','want','make','take','get','set','put','run','use','see','look','show','tell','ask','say','call','try','work','way','time','year','day','week','month','project','code','file','files','thing','things','stuff','issue','bug','fix','add','remove','change','update','create','delete','build','test','run','start','stop','restart','deploy','config','settings','setup','install','upgrade','merge','rebase','commit','push','pull','clone','fork','branch','tag','release','version','new','old','first','last','next','previous','current','recent','later','soon','today','tomorrow','yesterday'
+    ]);
+    const keywords = prompt
+      .split(/[^\w]+/)
+      .filter((w) => w.length >= 4 && !stopWords.has(w.toLowerCase()))
+      .map((w) => w.toLowerCase());
+
+    for (const keyword of keywords) {
+      if (signal?.aborted) return;
+      const glob = `**/*${keyword}*`;
+      try {
+        const result = walkFiles({
+          root,
+          glob,
+          maxDepth: 8,
+          maxEntries: 30,
+          maxFileBytes: 256 * 1024,
+          signal,
+        });
+        for (const entry of result.files) {
+          const name = entry.rel.toLowerCase();
+          const ext = path.extname(name);
+          if (sourceExts.has(ext) && !skipNames.has(name)) {
+            relevantFiles.add(entry.rel);
+          }
+        }
+      } catch {
+        // Glob walk failed: continue with other keywords.
+      }
+    }
+
+    if (signal?.aborted) return;
+    if (relevantFiles.size === 0) return;
+
+    // Deterministic ordering.
+    const files = Array.from(relevantFiles)
+      .map((rel) => {
+        const abs = path.resolve(root, rel);
+        let size = 0;
+        try { size = fs.statSync(abs).size; } catch { /* use 0 */ }
+        return { rel, abs, isDirectory: false, size };
+      })
+      .sort((a, b) => a.rel.localeCompare(b.rel));
 
     // Estimate tokens per file: roughly 1 token per 4 characters of content,
     // plus a fixed overhead for file path and framing.
@@ -439,6 +460,14 @@ export class HarnessSession {
 
   cancel(): void {
     this.controller?.abort();
+    // Resolve any pending task-list approval with 'reject' so the waiting
+    // runTask can observe cancellation and exit cleanly instead of hanging
+    // on waitForTaskListApproval() forever.
+    const resolve = this.taskListApprovalResolve;
+    if (resolve) {
+      this.taskListApprovalResolve = undefined;
+      resolve('reject');
+    }
   }
 
   /** Undo every file change made since the current/last `runTask` started. */
@@ -737,7 +766,7 @@ export class HarnessSession {
       // files relevant to the prompt, not the entire project.
       if (
         this.deps.config.taskListEnabled &&
-        this.deps.config.projectDecompositionEnabled &&
+        this.deps.config.decompositionEnabled &&
         this.taskList?.list().length === 0 &&
         this._wouldExceedContext(text, system, selected, toolPolicy.tools)
       ) {

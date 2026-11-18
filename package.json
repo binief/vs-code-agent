@@ -329,10 +329,10 @@
           "default": false,
           "markdownDescription": "Always make the `task_list` tool available (regardless of agent.md `tools:` declaration) and instruct the model to maintain a task list for every long-running task. Shown in the panel strip and saved in the chat JSON."
         },
-        "codingHarness.projectDecomposition.enabled": {
+        "codingHarness.decomposition.enabled": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Automatically split large projects into context-sized task slices. At task start, the harness walks the workspace, estimates file sizes, and groups files into task_list items that fit within the context window so the model works on one slice at a time without losing context."
+          "markdownDescription": "Automatically split prompt-relevant source files into context-sized task slices. Only files mentioned in or matching the user's prompt are included — no full project scan is performed. Each slice becomes a task_list item the model works on one at a time without losing context."
         },
         "codingHarness.chat.saveEnabled": {
           "type": "boolean",

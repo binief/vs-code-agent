@@ -1715,7 +1715,7 @@
     featureSubagents.checked = Boolean(data.subagentsEnabled);
     featureTaskList.checked = Boolean(data.taskListEnabled);
     featureLocal.checked = Boolean(data.localFallback);
-    featureProjectDecomposition.checked = Boolean(data.projectDecompositionEnabled);
+    featureProjectDecomposition.checked = Boolean(data.decompositionEnabled);
     featureContextWindow.value = data.contextWindowTokens ?? 128000;
     effectiveLocalFallback = Boolean(data.localFallback);
     featureTarget.querySelector('option[value="workspace"]').disabled = !data.hasWorkspace;
@@ -1743,7 +1743,7 @@
       subagentsEnabled: featureSubagents.checked,
       taskListEnabled: featureTaskList.checked,
       localFallback: featureLocal.checked,
-      projectDecompositionEnabled: featureProjectDecomposition.checked,
+      decompositionEnabled: featureProjectDecomposition.checked,
       contextWindowTokens: parseInt(featureContextWindow.value, 10) || 128000,
     };
     featureStatus.classList.remove('error');

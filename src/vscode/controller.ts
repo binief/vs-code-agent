@@ -855,7 +855,7 @@ export class HarnessController {
       textToolMode: c.get('textToolMode'),
       subagentsEnabled: c.get<boolean>('subagents.enabled') === true,
       taskListEnabled: c.get<boolean>('taskList.enabled') === true,
-      projectDecompositionEnabled: c.get<boolean>('projectDecomposition.enabled') === true,
+      decompositionEnabled: c.get<boolean>('decomposition.enabled') === true,
       agentFiles: {
         enabled: Boolean(agentEnabled),
         names: agentNames,
@@ -1264,6 +1264,10 @@ export class HarnessController {
     } else {
       return;
     }
+    // Reject any pending approvals (file writes, command runs) so the
+    // waiting tool calls fail fast instead of hanging until the user
+    // clicks Apply/Reject on a cancelled task.
+    this.approvals.cancelAll();
     this.pushNotice('info', 'Cancelling the current task…');
   }
 
@@ -1370,12 +1374,12 @@ export class HarnessController {
     };
   }
 
-  async saveFeatureSettings(input: { subagentsEnabled?: unknown; taskListEnabled?: unknown; localFallback?: unknown; projectDecompositionEnabled?: unknown; contextWindowTokens?: unknown; target?: unknown }): Promise<void> {
+  async saveFeatureSettings(input: { subagentsEnabled?: unknown; taskListEnabled?: unknown; localFallback?: unknown; decompositionEnabled?: unknown; contextWindowTokens?: unknown; target?: unknown }): Promise<void> {
     await this.whenReady();
     const fail = (error: string) => this.post({ type: 'feature-settings-saved', ok: false, error, settings: this.getFeatureSettings() });
     if (this.isBusy) return fail('Stop or finish the current task before changing settings.');
     if (typeof input.subagentsEnabled !== 'boolean' || typeof input.taskListEnabled !== 'boolean' || typeof input.localFallback !== 'boolean' ||
-        typeof input.projectDecompositionEnabled !== 'boolean' || typeof input.contextWindowTokens !== 'number' ||
+        typeof input.decompositionEnabled !== 'boolean' || typeof input.contextWindowTokens !== 'number' ||
         (input.target !== 'user' && input.target !== 'workspace')) return fail('Invalid settings.');
     if (input.contextWindowTokens < 1000) return fail('Context window must be at least 1000 tokens.');
     if (input.target === 'workspace' && !this.workspaceRoot()) return fail('Saving workspace settings needs an open folder.');
@@ -1385,7 +1389,7 @@ export class HarnessController {
     try {
       const settings = vscode.workspace.getConfiguration('codingHarness');
       // Boolean settings vs number setting: check each with its expected type.
-      const boolKeys = ['subagents.enabled', 'taskList.enabled', 'compaction.localFallback', 'projectDecomposition.enabled'];
+      const boolKeys = ['subagents.enabled', 'taskList.enabled', 'compaction.localFallback', 'decomposition.enabled'];
       const numKeys = ['compaction.contextWindowTokens'];
       const missingBool = boolKeys.filter((key) => {
         const insp = settings.inspect<boolean>(key);
@@ -1403,7 +1407,7 @@ export class HarnessController {
       await settings.update('subagents.enabled', input.subagentsEnabled, target);
       await settings.update('taskList.enabled', input.taskListEnabled, target);
       await settings.update('compaction.localFallback', input.localFallback, target);
-      await settings.update('projectDecomposition.enabled', input.projectDecompositionEnabled, target);
+      await settings.update('decomposition.enabled', input.decompositionEnabled, target);
       await settings.update('compaction.contextWindowTokens', input.contextWindowTokens, target);
       await this.refreshState();
       this.post({ type: 'feature-settings-saved', ok: true, settings: this.getFeatureSettings() });
