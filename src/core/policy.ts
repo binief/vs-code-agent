@@ -48,6 +48,10 @@ const SAFE_PATTERNS: RegExp[] = [
   /^\s*node\s+--check\b/,
   /^\s*python3?\s+-m\s+(py_compile|json\.tool|compileall)\b/,
   /^\s*echo\b/,
+  // Infrastructure / process-management commands used to start, wait on, and
+  // inspect long-running services. These are read-only with respect to the
+  // workspace and safe to run under auto-safe even when chained.
+  /^\s*(set\b|start\s+\/b\b|timeout\b|netstat\b|findstr\b|tasklist\b|ping\b|curl\b|wget\b)\b/,
 ];
 
 /** Risky but legitimate commands: always confirmed, even under `auto-safe`. */
@@ -62,6 +66,8 @@ const ELEVATED: Rule[] = [
   { re: /\bmv\b|\brm\b|\btruncate\b/i, reason: 'file move / removal' },
   { re: /\bsudo\b|\bdoas\b/i, reason: 'privilege escalation' },
   { re: /\bcurl\b|\bwget\b/i, reason: 'network access' },
+  // Launching application servers / long-running processes is a side effect.
+  { re: /\b(java|node|python|python3|ruby|php|dotnet)\s+(-jar|\.|\w+\.js|\w+\.py)\b/i, reason: 'starts a long-running application server' },
 ];
 
 /** Shell metacharacters that make a "safe" prefix unsafe. */
@@ -104,6 +110,21 @@ export function evaluateCommand(
       return { decision: 'allow', reason: 'read-only command' };
     }
     return { decision: 'ask', reason: 'read-only command (policy: ask)' };
+  }
+
+  // Compound commands (chained with &&, &, |, ;) where every part matches a
+  // safe pattern are treated as safe infrastructure operations under auto-safe.
+  // E.g. "start /b ... && timeout /t 12 && netstat ... | findstr ..."
+  // Splits on command separators but not on redirection operators like 2>&1.
+  const parts = cmd.split(/(?:^|[^&< >])[;&|](?:[^&< >]|$)/);
+  const allPartsSafe =
+    parts.length > 1 &&
+    parts.every((p) => {
+      const trimmed = p.trim();
+      return trimmed.length > 0 && SAFE_PATTERNS.some((re) => re.test(trimmed));
+    });
+  if (allPartsSafe && (opts.policy === 'auto-safe' || opts.policy === 'auto-all')) {
+    return { decision: 'allow', reason: 'infrastructure command chain' };
   }
 
   switch (opts.policy) {

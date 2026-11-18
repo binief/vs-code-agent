@@ -19,7 +19,7 @@ export interface CommandOutput {
 /** Runs a shell command and captures its output. Exported for tests. */
 export function runShellCommand(
   command: string,
-  opts: { cwd: string; timeoutMs: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv },
+  opts: { cwd: string; timeoutMs: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv; detached?: boolean },
 ): Promise<CommandOutput> {
   return new Promise((resolve) => {
     const started = Date.now();
@@ -32,7 +32,7 @@ export function runShellCommand(
       shell: true,
       env: { ...process.env, ...(opts.env ?? {}), CI: process.env.CI ?? '1' },
       windowsHide: true,
-      detached: process.platform !== 'win32',
+      detached: process.platform !== 'win32' || opts.detached === true,
     });
 
     let stdout = '';
@@ -55,6 +55,19 @@ export function runShellCommand(
         finish(null, 'SIGKILL');
       }
     };
+
+    if (opts.detached === true) {
+      // Detached mode: resolve after a short delay so initial output can be
+      // captured, without waiting for background child processes to exit.
+      setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          opts.signal?.removeEventListener('abort', onAbort);
+          resolve({ exitCode: null, stdout, stderr, timedOut: false, signal: null, durationMs: Date.now() - started });
+        }
+      }, 500);
+      return;
+    }
 
     const timer = setTimeout(() => {
       timedOut = true;
@@ -118,11 +131,18 @@ export const runCommandTool: Tool<{
   cwd?: string;
   timeout_ms?: number;
   purpose?: string;
+  /** When true, resolve as soon as the shell exits without waiting for
+   *  background child processes (e.g. `start /b java -jar ...`) to finish.
+   *  Useful for starting long-running servers. The child keeps running
+   *  detached from the harness. */
+  detached?: boolean;
 }> = {
   name: 'run_command',
   description:
     'Run a shell command in the workspace (POSIX sh, or cmd.exe on Windows) and return stdout/stderr with the exit code. ' +
-    'Execution and approval depend on command policy; dangerous commands may be refused.',
+    'Execution and approval depend on command policy; dangerous commands may be refused. ' +
+    'Use `detached: true` to start a long-running background process (e.g. a dev server) ' +
+    'and return immediately instead of waiting for it to exit.',
   parameters: {
     type: 'object',
     properties: {
@@ -130,6 +150,7 @@ export const runCommandTool: Tool<{
       cwd: { type: 'string', description: 'Working directory, workspace-relative. Defaults to the workspace root.' },
       timeout_ms: { type: 'number', description: 'Timeout in milliseconds. Defaults to the configured value (60s).' },
       purpose: { type: 'string', description: 'One short line telling the user why you are running this.' },
+      detached: { type: 'boolean', description: 'Run in the background and return without waiting for completion.' },
     },
     required: ['command'],
   },
@@ -182,7 +203,7 @@ export const runCommandTool: Tool<{
     if (ctx.signal?.aborted) return fail('Cancelled before running this command.', 'cancelled', { cancelled: true });
     const timeoutMs = Math.max(1000, Math.min(args.timeout_ms ?? ctx.config.commandTimeoutMs, 10 * 60_000));
     ctx.host.log('info', `run_command${verdict.decision === 'allow' ? ' (auto)' : ''}: ${args.command} [cwd=${cwd.rel}]`);
-    const result = await runShellCommand(args.command, { cwd: cwd.abs, timeoutMs, signal: ctx.signal });
+    const result = await runShellCommand(args.command, { cwd: cwd.abs, timeoutMs, signal: ctx.signal, detached: args.detached });
 
     const parts: string[] = [];
     parts.push(`$ ${args.command}${cwd.rel === '.' ? '' : `   (cwd: ${cwd.rel})`}`);
