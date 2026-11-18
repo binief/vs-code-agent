@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
+import * as path from 'node:path';
 import { agentFilesSummary, discoverAgentFiles, selectAgentFiles, type SelectedAgentFiles } from './agentFiles';
 import { CheckpointStore, type RevertReport } from './checkpoints';
 import { CompactionCancelled, compactHistory, contextBreakdown, contextBreakdownTotal, estimateMessagesTokens, estimateRequestTokens, estimateTokens } from './compaction';
 import { isRetryableProviderError, retryDelayMs } from './providers/errors';
 import { buildSystemPrompt, summarizeDiagnostics } from './prompt';
 import { createDefaultTools, ToolRegistry } from './tools';
+import { walk } from './tools/walk';
 import { TaskListStore, type TaskItem } from './taskList';
 import { resolveAgentToolPolicy } from './toolPolicy';
 import { repairToolMessages } from './transcript';
@@ -241,6 +243,178 @@ export class HarnessSession {
       decision,
       items: items ?? this.taskList?.list() ?? [],
     });
+  }
+
+  /**
+   * Walk the workspace and split source files into context-sized task slices.
+   * Each slice becomes a task_list item the model works through in order.
+   * Files are grouped so each slice's estimated token count stays within the
+   * configured context window (reserving room for system prompt, tool schemas,
+   * and conversation history).
+   */
+  async decomposeProject(prompt?: string): Promise<void> {
+    const host = this.deps.host;
+    const root = host.workspaceRoot;
+    const contextWindow = this.deps.config.compaction.contextWindowTokens;
+    // Reserve 60% of the window for slices; the rest is for system prompt,
+    // tool schemas, images, and conversation history.
+    const sliceBudget = Math.floor(contextWindow * 0.6);
+    if (sliceBudget < 1000) return; // too small to be useful
+
+    const result = walk({
+      root,
+      maxDepth: 12,
+      maxEntries: 500,
+      maxFileBytes: 256 * 1024,
+    });
+
+    // Filter to likely source files (skip data, binary, lock files, etc.).
+    const sourceExts = new Set([
+      '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+      '.py', '.go', '.java', '.kt', '.rs', '.rb', '.php', '.cs', '.cpp', '.c', '.h', '.hpp',
+      '.swift', '.scala', '.clj', '.hs', '.ml', '.fs', '.vb',
+      '.html', '.css', '.scss', '.sass', '.less', '.vue', '.svelte',
+      '.json', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
+      '.md', '.mdx', '.txt', '.rst',
+      '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat', '.cmd',
+      '.sql', '.graphql', '.gql',
+      '.dockerfile', '.tf',
+    ]);
+    const skipNames = new Set([
+      'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'poetry.lock',
+      'Cargo.lock', 'composer.lock', 'Gemfile.lock', 'Pipfile.lock',
+    ]);
+    let files = result.entries
+      .filter((e) => !e.isDirectory)
+      .filter((e) => {
+        const name = e.rel.toLowerCase();
+        if (skipNames.has(name)) return false;
+        const ext = path.extname(name);
+        return sourceExts.has(ext);
+      });
+
+    if (files.length === 0) return;
+
+    // Prompt-aware relevance: prioritize files mentioned in the prompt or
+    // matching its keywords, so small changes don't trigger whole-project
+    // slicing. When no relevant matches are found, fall back to all files.
+    if (prompt && prompt.trim()) {
+      const mentioned = new Set<string>();
+      const pathRe = /[\w./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|java|kt|rs|rb|php|cs|cpp|c|h|hpp|swift|scala|clj|hs|ml|fs|vb|html|css|scss|sass|less|vue|svelte|json|yaml|yml|toml|ini|cfg|conf|md|mdx|txt|rst|sh|bash|zsh|fish|ps1|bat|cmd|sql|graphql|gql|tf)\b/gi;
+      for (const m of prompt.matchAll(pathRe)) {
+        mentioned.add(m[0].toLowerCase());
+      }
+      const stopWords = new Set([
+        'the','and','for','with','from','that','this','have','has','had','but','not','you','are','was','were','been','will','would','could','should','may','might','must','can','about','into','over','under','after','before','between','through','during','without','within','what','which','when','where','who','whom','whose','why','how','all','any','each','every','some','such','no','nor','only','own','same','so','than','too','very','just','now','then','here','there','also','even','still','much','more','most','less','least','few','many','several','both','either','neither','another','other','others','please','help','need','want','make','take','get','set','put','run','use','see','look','show','tell','ask','say','call','try','work','way','time','year','day','week','month','project','code','file','files','thing','things','stuff','issue','bug','fix','add','remove','change','update','create','delete','build','test','run','start','stop','restart','deploy','config','settings','setup','install','upgrade','merge','rebase','commit','push','pull','clone','fork','branch','tag','release','version','new','old','first','last','next','previous','current','recent','later','soon','today','tomorrow','yesterday'
+      ]);
+      const keywords = prompt
+        .split(/[^\\w]+/)
+        .filter((w) => w.length >= 4 && !stopWords.has(w.toLowerCase()))
+        .map((w) => w.toLowerCase());
+
+      const scored = files.map((e) => {
+        const name = e.rel.toLowerCase();
+        let score = 0;
+        if (mentioned.has(name)) score += 100;
+        if (keywords.some((k) => name.includes(k))) score += 10;
+        return { entry: e, score };
+      });
+
+      const relevant = scored.filter((x) => x.score > 0);
+      if (relevant.length > 0) {
+        files = relevant
+          .sort((a, b) => b.score - a.score || a.entry.rel.localeCompare(b.entry.rel))
+          .map((x) => x.entry);
+      }
+    }
+
+    files.sort((a, b) => a.rel.localeCompare(b.rel));
+
+    if (files.length === 0) return;
+
+    // Estimate tokens per file: roughly 1 token per 4 characters of content,
+    // plus a fixed overhead for file path and framing.
+    const estimateFileTokens = (entry: { size: number }): number => {
+      return Math.max(20, Math.ceil(entry.size / 4));
+    };
+
+    // Greedily pack files into slices within the slice budget.
+    const slices: { files: string[]; tokens: number }[] = [];
+    let current: { files: string[]; tokens: number } = { files: [], tokens: 0 };
+
+    for (const entry of files) {
+      const fileTokens = estimateFileTokens(entry);
+      // If a single file exceeds the budget, give it its own slice.
+      if (fileTokens > sliceBudget) {
+        if (current.files.length > 0) {
+          slices.push(current);
+          current = { files: [], tokens: 0 };
+        }
+        slices.push({ files: [entry.rel], tokens: fileTokens });
+        continue;
+      }
+      if (current.tokens + fileTokens > sliceBudget && current.files.length > 0) {
+        slices.push(current);
+        current = { files: [], tokens: 0 };
+      }
+      current.files.push(entry.rel);
+      current.tokens += fileTokens;
+    }
+    if (current.files.length > 0) slices.push(current);
+
+    if (slices.length === 0) return;
+
+    // Create task_list items for each slice.
+    for (let i = 0; i < slices.length; i += 1) {
+      const slice = slices[i];
+      const title = `Slice ${i + 1}/${slices.length}: ${slice.files.length} file(s), ~${slice.tokens.toLocaleString()} tokens`;
+      this.taskList?.add(title);
+    }
+
+    // Emit task list for the panel strip.
+    this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
+
+    // Request user approval before starting slice execution.
+    const items = this.taskList?.list() ?? [];
+    if (items.length > 0) {
+      const decision = await this.waitForTaskListApproval(items);
+      if (decision === 'reject') {
+        this.taskList?.clear();
+        this.currentOnEvent?.({ type: 'task-list', items: [] });
+        return;
+      }
+      if (decision === 'edit') {
+        // Items were replaced by respondToTaskListApproval; re-emit.
+        this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
+      }
+      this.taskListApproved = true;
+    }
+  }
+
+  /**
+   * Returns true when the prompt + fixed context (system, agent files, tools,
+   * output reserve) would consume more than half the context window, leaving
+   * too little room for project files. In that case decomposition into slices
+   * is warranted; otherwise a small change can proceed without slicing.
+   */
+  private _wouldExceedContext(
+    prompt: string,
+    system: string,
+    selected: SelectedAgentFiles,
+    tools: readonly ToolSpec[],
+  ): boolean {
+    const window = this.deps.config.compaction.contextWindowTokens;
+    const systemTokens = estimateTokens(system);
+    const promptTokens = estimateTokens(prompt);
+    const agentFileTokens = selected.files.reduce(
+      (sum, f) => sum + estimateTokens(f.content),
+      0,
+    );
+    const toolTokens = tools.length ? estimateTokens(JSON.stringify(tools)) + 16 : 0;
+    const outputReserve = Math.max(0, this.deps.config.maxOutputTokens);
+    const framing = 20;
+    const total = systemTokens + promptTokens + agentFileTokens + toolTokens + outputReserve + framing;
+    return total > window * 0.5;
   }
 
   get agentSelection(): readonly string[] | undefined {
@@ -556,6 +730,19 @@ export class HarnessSession {
         host.log('info', `${result.strategy === 'local' ? 'Local fallback' : 'LLM'} compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens`);
         return true;
       };
+
+      // Project decomposition: split large projects into context-sized task slices.
+      // Only triggers when the prompt + fixed context would exceed half the window,
+      // so small changes don't force whole-project slicing. Slices are based on
+      // files relevant to the prompt, not the entire project.
+      if (
+        this.deps.config.taskListEnabled &&
+        this.deps.config.projectDecompositionEnabled &&
+        this.taskList?.list().length === 0 &&
+        this._wouldExceedContext(text, system, selected, toolPolicy.tools)
+      ) {
+        await this.decomposeProject(text);
+      }
 
       for (let step = 1; ; step++) {
         if (signal.aborted) {

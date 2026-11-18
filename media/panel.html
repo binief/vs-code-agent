@@ -210,6 +210,13 @@
         <p>When LLM compaction fails, use local excerpts instead. This is lossy: older details may be omitted. Original messages remain in the session and saved chats when saving is enabled. Stop never triggers fallback.</p>
         <button type="button" id="feature-compact-local">Compact locally now…</button>
         <p>If an LLM request is stuck, press Stop first. Local compaction does not wait for the model and requires confirmation.</p>
+        <label class="check-row"><input type="checkbox" id="feature-project-decomposition" /><span>Split project into context-sized task slices</span></label>
+        <p>At task start, walk the workspace and group files into <code>task_list</code> items sized to fit within the context window. The model works on one slice at a time without losing context.</p>
+        <div class="form-row">
+          <label for="feature-context-window">Context window size (tokens)</label>
+          <input type="number" id="feature-context-window" min="1000" step="1024" />
+        </div>
+        <p>Estimated context window size of your model. Used for context utilisation percentage and task slice sizing (e.g., 128000 for gpt-4o, 200000 for Claude).</p>
         <button type="button" id="feature-all-settings">Open all VS Code settings</button>
         <div class="modal-status feature-status" id="feature-status" aria-live="polite"></div>
       </div>

@@ -1689,6 +1689,8 @@
   const featureSubagents = document.getElementById('feature-subagents');
   const featureTaskList = document.getElementById('feature-task-list');
   const featureLocal = document.getElementById('feature-local-fallback');
+  const featureProjectDecomposition = document.getElementById('feature-project-decomposition');
+  const featureContextWindow = document.getElementById('feature-context-window');
   const featureTarget = document.getElementById('feature-target');
   const featureStatus = document.getElementById('feature-status');
   const featureSave = document.getElementById('feature-save');
@@ -1704,6 +1706,8 @@
     featureSubagents.disabled = true;
     featureTaskList.disabled = true;
     featureLocal.disabled = true;
+    featureProjectDecomposition.disabled = true;
+    featureContextWindow.disabled = true;
     featureCompactLocal.disabled = true;
     vscode.postMessage({ type: 'get-feature-settings' });
   }
@@ -1711,12 +1715,16 @@
     featureSubagents.checked = Boolean(data.subagentsEnabled);
     featureTaskList.checked = Boolean(data.taskListEnabled);
     featureLocal.checked = Boolean(data.localFallback);
+    featureProjectDecomposition.checked = Boolean(data.projectDecompositionEnabled);
+    featureContextWindow.value = data.contextWindowTokens ?? 128000;
     effectiveLocalFallback = Boolean(data.localFallback);
     featureTarget.querySelector('option[value="workspace"]').disabled = !data.hasWorkspace;
     if (!data.hasWorkspace) featureTarget.value = 'user';
     featureSubagents.disabled = false;
     featureTaskList.disabled = false;
     featureLocal.disabled = false;
+    featureProjectDecomposition.disabled = false;
+    featureContextWindow.disabled = false;
     featureSave.disabled = false;
     featureCompactLocal.disabled = busy || !effectiveLocalFallback;
   }
@@ -1735,6 +1743,8 @@
       subagentsEnabled: featureSubagents.checked,
       taskListEnabled: featureTaskList.checked,
       localFallback: featureLocal.checked,
+      projectDecompositionEnabled: featureProjectDecomposition.checked,
+      contextWindowTokens: parseInt(featureContextWindow.value, 10) || 128000,
     };
     featureStatus.classList.remove('error');
     featureStatus.textContent = 'Saving…';

@@ -316,6 +316,11 @@ export interface HarnessConfig {
    * `tools:` declaration) and the model is instructed to maintain a task list
    * for every long-running task. Shown in the panel strip and saved in chat JSON. */
   taskListEnabled: boolean;
+  /** When true, the harness walks the workspace at task start and splits the
+   * project into context-sized task slices (groups of files) so large
+   * projects can be worked on one slice at a time without losing context.
+   * Each slice becomes a task_list item the model works through in order. */
+  projectDecompositionEnabled: boolean;
   /** Instructions loaded from agent.md/AGENTS.md files. */
   agentFiles: AgentFilesConfig;
   /** Which factual context is included in the system message. */
@@ -344,6 +349,7 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   textToolMode: false,
   subagentsEnabled: false,
   taskListEnabled: false,
+  projectDecompositionEnabled: false,
   agentFiles: {
     enabled: true,
     names: ['AGENTS.md', 'agent.md', 'agents.md', 'copilot-instructions.md'],
