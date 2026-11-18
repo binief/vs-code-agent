@@ -34,7 +34,9 @@ type PendingResolver = (decision: ApprovalDecision) => void;
  * falls back to a modal dialog so a background task can never hang silently.
  */
 export class ApprovalService {
-  private readonly pending = new Map<string, PendingResolver>();
+  private readonly pending = new Map<string, PendingResolver[]>();
+  /** Dedupe: request content hash -> id of the pending approval showing it. */
+  private readonly pendingByKey = new Map<string, string>();
   private counter = 0;
   /** Returns true when the request was actually shown in the webview. */
   private bridge?: (id: string, req: ApprovalRequest) => boolean;
@@ -60,16 +62,38 @@ export class ApprovalService {
     this.autoApprove.clear();
   }
 
+  /** Hash a request's title + detail so duplicate approvals can be detected. */
+  private requestKey(req: ApprovalRequest): string {
+    return `${req.kind}|${req.title}|${req.detail}`;
+  }
+
   async request(req: ApprovalRequest): Promise<ApprovalDecision> {
     if (this.isAutoApproved(req.kind)) {
       this.log.debug(`auto-approved (session): ${req.title}`);
       return 'apply';
     }
 
+    // Deduplicate: if the same request is already pending, wait on the same
+    // pending resolver instead of showing a second dialog for the same command.
+    const key = this.requestKey(req);
+    const existingId = this.pendingByKey.get(key);
+    if (existingId) {
+      this.log.debug(`duplicate approval suppressed: ${req.title}`);
+      return new Promise<ApprovalDecision>((resolve) => {
+        const resolvers = this.pending.get(existingId);
+        if (!resolvers) {
+          resolve('reject');
+          return;
+        }
+        resolvers.push(resolve);
+      });
+    }
+
     const id = `approval-${++this.counter}`;
     if (this.bridge?.(id, req)) {
       return new Promise<ApprovalDecision>((resolve) => {
-        this.pending.set(id, resolve);
+        this.pending.set(id, [resolve]);
+        this.pendingByKey.set(key, id);
       });
     }
     return this.askModally(req);
@@ -77,16 +101,26 @@ export class ApprovalService {
 
   /** Called by the webview when the user clicks Apply / Reject. */
   resolve(id: string, decision: ApprovalDecision): void {
-    const resolver = this.pending.get(id);
-    if (!resolver) return;
+    const resolvers = this.pending.get(id);
+    if (!resolvers) return;
     this.pending.delete(id);
-    resolver(decision);
+    // Also remove from dedupe map
+    for (const [k, v] of this.pendingByKey) {
+      if (v === id) {
+        this.pendingByKey.delete(k);
+        break;
+      }
+    }
+    for (const resolve of resolvers) resolve(decision);
   }
 
   /** Reject everything still waiting (used on deactivate / cancel). */
   cancelAll(): void {
-    for (const [, resolve] of this.pending) resolve('reject');
+    for (const resolvers of this.pending.values()) {
+      for (const resolve of resolvers) resolve('reject');
+    }
     this.pending.clear();
+    this.pendingByKey.clear();
   }
 
   private async askModally(req: ApprovalRequest): Promise<ApprovalDecision> {
