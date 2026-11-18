@@ -51,3 +51,26 @@ Mix groups and exact names as needed, e.g. `tools: [read, search, task_list]`.
 - `run_command` is governed by `codingHarness.commandPolicy`.
 - `delete_file` always requires approval.
 - `tools: []` or a malformed policy fails closed (no tools).
+
+## Task list enforcement (required)
+
+For every long-running task (more than one step), you MUST maintain a task list using the `task_list` tool:
+
+1. **Start**: Call `task_list` with `action: "add"` to create items for each major step.
+2. **Progress**: Call `task_list` with `action: "update"` to set `status: "in-progress"` when you begin an item, and `status: "done"` when complete.
+3. **Review**: Call `task_list` with `action: "list"` before finishing to confirm nothing is pending.
+
+Item shape: `{ action, id?, title?, status? }` where status is `pending`, `in-progress`, or `done`.
+
+Never claim a task is complete unless all its items are marked `done` in the task list.
+
+### Tool contract
+
+| Action | Required fields | Optional fields |
+|--------|----------------|-----------------|
+| `add` | `title` | — |
+| `update` | `id` | `title`, `status` |
+| `remove` | `id` | — |
+| `list` | — | — |
+
+Statuses: `pending`, `in-progress`, `done`.
