@@ -30,13 +30,13 @@ test('YAML front matter supports block and inline lists including an explicit em
   assert.match(parseAgentFrontMatter('---\ntools:\n - read\n').toolPolicyError ?? '', /Unclosed/);
 });
 
-test('tool groups expand and multiple selected policies intersect; unselected files do not grant capabilities', () => {
+test('tool groups expand and multiple selected policies union; unselected files do not grant capabilities', () => {
   const dir = root();
   try {
     write(dir, 'agent.md', '---\ntools:\n  - read\n  - search\n  - edit\n  - execute\n  - mcp\n---\nGeneral agent');
     write(dir, '.agents/reviewer.md', '---\ntools: [read, search]\n---\nReview only');
     const all = resolveAgentToolPolicy(discover(dir), specs);
-    assert.deepEqual(all.tools.map((t) => t.name), ['list_files', 'read_file', 'search_text', 'get_diagnostics', 'open_file']);
+    assert.deepEqual(all.tools.map((t) => t.name), specs.map((t) => t.name));
     const general = resolveAgentToolPolicy(discover(dir, ['agent.md']), specs);
     assert.deepEqual(general.tools.map((t) => t.name), specs.map((t) => t.name));
     const restricted = resolveAgentToolPolicy(discover(dir, ['.agents/reviewer.md']), specs);
@@ -141,7 +141,8 @@ test('undeclared files do not grant tools, while declared files intersect includ
     assert.deepEqual(resolveAgentToolPolicy(discover(dir, []), specs).tools, []);
     assert.deepEqual(resolveAgentToolPolicy(discover(dir, ['agent.md', '.agents/tools.md']), specs).tools.map(t => t.name),
       ['list_files', 'read_file', 'get_diagnostics', 'open_file', 'mcp_fs_write', 'mcp_fs_read']);
-    assert.deepEqual(resolveAgentToolPolicy(discover(dir), specs).tools.map(t => t.name), ['mcp_fs_read']);
+    assert.deepEqual(resolveAgentToolPolicy(discover(dir), specs).tools.map(t => t.name),
+      ['list_files', 'read_file', 'get_diagnostics', 'open_file', 'mcp_fs_write', 'mcp_fs_read']);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

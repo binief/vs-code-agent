@@ -11,9 +11,11 @@ const GROUPS: Record<string, readonly string[]> = {
 };
 
 /**
- * Selected files with `tools` narrow the registry by intersection. Missing
- * metadata does not grant any capabilities. Never interpret prose as a
- * security policy; malformed, unknown or incomplete metadata fails closed.
+ * Selected files with `tools` grant capabilities by union: tools declared in
+ * *any* selected agent file are combined. Files without a `tools:` declaration
+ * are neutral — they neither grant nor restrict. Missing metadata does not
+ * grant any capabilities. Never interpret prose as a security policy;
+ * malformed, unknown or incomplete metadata fails closed.
  */
 export function resolveAgentToolPolicy(selected: SelectedAgentFiles, available: readonly ToolSpec[]): {
   tools: ToolSpec[];
@@ -24,28 +26,26 @@ export function resolveAgentToolPolicy(selected: SelectedAgentFiles, available: 
     throw new Error(`Some discovered agent files could not be loaded: ${selected.skipped.map((file) => file.path).join(', ')}. Tool permissions cannot be determined safely.`);
   }
   const names = new Set(available.map((tool) => tool.name));
-  let allowed = new Set(names);
   let declared = false;
+  const granted = new Set<string>();
   for (const file of selected.files) {
     if (file.truncated) throw new Error(`Agent file "${file.displayPath}" is truncated; tool permissions cannot be determined safely.`);
     if (file.toolPolicyError) throw new Error(`Invalid tool policy in "${file.displayPath}": ${file.toolPolicyError}`);
     if (file.tools === undefined) continue;
     declared = true;
-    const current = new Set<string>();
     for (const entry of file.tools) {
       if (entry === 'mcp') {
-        for (const name of names) if (name.startsWith('mcp_')) current.add(name);
+        for (const name of names) if (name.startsWith('mcp_')) granted.add(name);
       } else if (Object.prototype.hasOwnProperty.call(GROUPS, entry)) {
         for (const name of GROUPS[entry]) {
-          if (names.has(name)) current.add(name);
+          if (names.has(name)) granted.add(name);
         }
       } else if (names.has(entry)) {
-        current.add(entry);
+        granted.add(entry);
       } else {
         throw new Error(`Unknown tool or group "${entry}" in "${file.displayPath}".`);
       }
     }
-    allowed = new Set([...allowed].filter((name) => current.has(name)));
   }
-  return { tools: declared ? available.filter((tool) => allowed.has(tool.name)) : [], restricted: true };
+  return { tools: declared ? available.filter((tool) => granted.has(tool.name)) : [], restricted: true };
 }
