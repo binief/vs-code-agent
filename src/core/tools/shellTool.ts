@@ -49,15 +49,27 @@ export function runShellCommand(
     child.stdout?.on('data', append('out'));
     child.stderr?.on('data', append('err'));
 
+    /** Force-resolve the promise if the child does not exit after being killed. */
+    const forceFinish = () => {
+      if (!settled) {
+        finish(null, 'SIGKILL');
+      }
+    };
+
     const timer = setTimeout(() => {
       timedOut = true;
       killTree(child);
+      setTimeout(forceFinish, 2000);
     }, Math.max(500, opts.timeoutMs));
 
     const onAbort = () => {
       killTree(child);
+      setTimeout(forceFinish, 2000);
     };
     opts.signal?.addEventListener('abort', onAbort, { once: true });
+    // Guard against a race where the signal aborts between the pre-spawn
+    // aborted check and the listener registration above.
+    if (opts.signal?.aborted) onAbort();
 
     const finish = (exitCode: number | null, signal: NodeJS.Signals | null) => {
       if (settled) return;
@@ -84,6 +96,9 @@ function killTree(child: ReturnType<typeof spawn>): void {
   if (child.pid === undefined) return;
   try {
     if (process.platform === 'win32') {
+      // Terminate the shell process immediately, then clean up its process
+      // tree (e.g. a Java process started via `start /b`) with taskkill /T.
+      child.kill();
       spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
     } else {
       process.kill(-child.pid, 'SIGKILL');
