@@ -144,6 +144,7 @@ export interface UiState {
   contextWindow?: number;
   contextPercent?: number;
   contextBreakdown?: import('../core/types').ContextBreakdown | null;
+  serverSideCompactionCount?: number;
   /** MCP */
   mcpEnabled?: boolean;
   mcpServers?: number;
@@ -303,6 +304,7 @@ export class HarnessController {
     contextTokens: 0,
     contextWindow: 128000,
     contextPercent: 0,
+    serverSideCompactionCount: 0,
     mcpEnabled: false,
     mcpServers: 0,
     mcpToolCount: 0,
@@ -1237,6 +1239,7 @@ export class HarnessController {
         contextBreakdown: result.contextBreakdown,
         contextPercent: this.state.contextWindow && result.contextTokens !== undefined
           ? result.contextTokens / this.state.contextWindow * 100 : 0,
+        serverSideCompactionCount: result.serverSideCompactionCount ?? this.state.serverSideCompactionCount,
       };
       this.log.info(`task finished: ${result.outcome} in ${result.steps} step(s), ${result.toolCalls} tool call(s), ${result.usage.totalTokens || 0} tokens`);
     } catch (err) {
@@ -2085,6 +2088,7 @@ export class HarnessController {
             contextTokens: event.contextTokens ?? this.state.contextTokens,
             contextWindow: event.contextWindow ?? this.state.contextWindow,
             contextPercent: event.contextPercent ?? this.state.contextPercent,
+            serverSideCompactionCount: event.serverSideCompactionCount ?? this.state.serverSideCompactionCount,
           };
           this.post({ type: 'state', state: this.state });
         }
@@ -2097,6 +2101,7 @@ export class HarnessController {
           contextTokens: event.contextTokens,
           contextWindow: event.contextWindow,
           contextPercent: event.contextPercent,
+          serverSideCompactionCount: event.serverSideCompactionCount ?? this.state.serverSideCompactionCount,
           cumulative: event.cumulative || this.cumulativeUsage,
         });
         break;
@@ -2108,9 +2113,10 @@ export class HarnessController {
           contextWindow: event.contextWindow,
           contextPercent: event.contextPercent,
           contextBreakdown: event.breakdown,
+          serverSideCompactionCount: event.serverSideCompactionCount ?? this.state.serverSideCompactionCount,
         };
         this.post({ type: 'state', state: this.state });
-        this.post({ type: 'context', contextTokens: event.contextTokens, contextWindow: event.contextWindow, contextPercent: event.contextPercent, breakdown: event.breakdown });
+        this.post({ type: 'context', contextTokens: event.contextTokens, contextWindow: event.contextWindow, contextPercent: event.contextPercent, breakdown: event.breakdown, serverSideCompactionCount: event.serverSideCompactionCount });
         break;
       }
       case 'agent-files': {

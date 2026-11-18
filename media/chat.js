@@ -84,6 +84,20 @@
   let contextTokens = 0;
   let contextPercent = 0;
   let contextBreakdown = null;
+  let serverSideCompactionCount = 0;
+
+  /** Format a token count with k/M suffix for readability. */
+  function formatTokens(n) {
+    if (n >= 1000000) {
+      const m = (n / 1000000).toFixed(1);
+      return m.endsWith('.0') ? m.slice(0, -2) + 'M' : m + 'M';
+    }
+    if (n >= 1000) {
+      const k = (n / 1000).toFixed(1);
+      return k.endsWith('.0') ? k.slice(0, -2) + 'k' : k + 'k';
+    }
+    return String(Math.round(n));
+  }
   let codeSeq = 0;
 
   /* Images staged for the next message: { id, name, mediaType, dataUrl, bytes }. */
@@ -401,11 +415,14 @@
     }
     if (chipContext) {
       const pct = contextPercent || 0;
-      chipContext.textContent = 'ctx ~' + Math.round(pct) + '%';
+      chipContext.textContent = 'ctx ' + formatTokens(contextTokens) + ' (' + Math.round(pct) + '%)';
       chipContext.title = 'Estimated context: ' + contextTokens + ' / ' + contextWindow + ' tokens (~' + Math.round(pct) + '%). Click for a breakdown.';
       if (contextBreakdownText) {
         const b = contextBreakdown;
         contextBreakdownText.textContent = b ? 'Estimated tokens: system ' + b.system + ' · conversation ' + b.conversation + ' · images ' + b.images + ' · tool schemas ' + b.tools + ' · framing ' + b.framing + '\n' + (b.source === 'provider' ? 'Provider input adjustment ' : 'Calibration adjustment ') + b.adjustment + ' · reserved output ' + b.outputReserve + '\nTotal ' + contextTokens + ' / ' + contextWindow + '. Components are estimates; provider accounting may differ.' + (b.policyKnown ? '' : ' Tool policy is not yet resolved; schema estimate may include unavailable tools.') + (b.policyKnown ? ' The tool policy is from the most recent task and may change.' : '') : 'Context breakdown is available after the first request.';
+        if (serverSideCompactionCount > 0) {
+          contextBreakdownText.textContent += '\nServer-side compaction: ' + serverSideCompactionCount + ' time(s) the provider rejected context as too large this task.';
+        }
       }
       chipContext.classList.toggle('warn', pct >= 75 && pct < 90);
       chipContext.classList.toggle('error', pct >= 90);
@@ -548,6 +565,7 @@
     if (typeof state.contextTokens === 'number') contextTokens = state.contextTokens;
     if (typeof state.contextPercent === 'number') contextPercent = state.contextPercent;
     else if (contextWindow && contextTokens) contextPercent = (contextTokens / contextWindow) * 100;
+    if (typeof state.serverSideCompactionCount === 'number') serverSideCompactionCount = state.serverSideCompactionCount;
 
     if (chipMcp) {
       const configured = state.mcpConfigured || 0;
@@ -2278,6 +2296,7 @@
         if (typeof message.contextWindow === 'number') contextWindow = message.contextWindow;
         if (typeof message.contextPercent === 'number') contextPercent = message.contextPercent;
         else if (contextWindow && contextTokens) contextPercent = (contextTokens / contextWindow) * 100;
+        if (typeof message.serverSideCompactionCount === 'number') serverSideCompactionCount = message.serverSideCompactionCount;
         updateTokenChips();
         break;
       case 'mcp-status':
