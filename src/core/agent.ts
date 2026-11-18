@@ -113,6 +113,8 @@ export class HarnessSession {
   private taskList?: TaskListStore;
   /** Task list restored from a saved chat, seeded into the next task's store. */
   private pendingTaskList?: TaskItem[];
+  /** How many times the provider rejected context as too large this task (server-side compaction). */
+  private serverSideCompactionCount = 0;
 
   constructor(private deps: AgentDeps) {
     this.registry = deps.registry ?? deps.tools ?? new ToolRegistry(createDefaultTools());
@@ -285,6 +287,8 @@ export class HarnessSession {
       this.taskList.restore(this.pendingTaskList);
       this.pendingTaskList = undefined;
     }
+    // Reset server-side compaction counter for this task.
+    this.serverSideCompactionCount = 0;
     const host = this.deps.host;
 
     const images = options.images?.length ? options.images : undefined;
@@ -560,7 +564,7 @@ export class HarnessSession {
         }
         let contextTokens = context.tokens;
         let contextPercent = context.percent;
-        onEvent({ type: 'context', contextTokens, contextWindow, contextPercent, breakdown: contextBreakdown(messages, toolsForStep, outputReserve, this.inputCalibration) });
+        onEvent({ type: 'context', contextTokens, contextWindow, contextPercent, breakdown: contextBreakdown(messages, toolsForStep, outputReserve, this.inputCalibration), serverSideCompactionCount: this.serverSideCompactionCount });
 
         let text = '';
         let calls: ToolCall[] = [];
@@ -679,7 +683,7 @@ export class HarnessSession {
               this.inputCalibration = Math.max(this.inputCalibration, reportedInput / context.input);
               contextTokens = reportedInput + outputReserve;
               contextPercent = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
-              onEvent({ type: 'context', contextTokens, contextWindow, contextPercent, breakdown: contextBreakdown(messages, toolsForStep, outputReserve, this.inputCalibration, reportedInput) });
+              onEvent({ type: 'context', contextTokens, contextWindow, contextPercent, breakdown: contextBreakdown(messages, toolsForStep, outputReserve, this.inputCalibration, reportedInput), serverSideCompactionCount: this.serverSideCompactionCount });
             }
             // Compute tokens per second
             const outputTokens = response.usage.outputTokens ?? estimateTokens(text);
@@ -741,7 +745,8 @@ export class HarnessSession {
           if (!contextOverflowRetried && !attemptText && this.deps.config.compaction.enabled &&
               /context.{0,30}(?:length|window|exceed|limit)|maximum.{0,30}(?:context|tokens)|too many tokens|token limit exceeded|(?:input|prompt).{0,30}too (?:long|large)/i.test(providerMessage)) {
             contextOverflowRetried = true;
-            onEvent({ type: 'notice', message: 'Provider rejected the context as too large; attempting LLM compaction and one retry.', level: 'warn' });
+            this.serverSideCompactionCount++;
+            onEvent({ type: 'notice', message: 'Provider rejected the context as too large (server-side compaction); attempting LLM compaction and one retry.', level: 'warn' });
             if (await compactTask(toolsForStep, true)) { step--; continue; }
           }
           errorText = providerMessage;
@@ -871,7 +876,7 @@ export class HarnessSession {
       tokensPerSecond: lastTokensPerSecond,
     });
     const contextUsage = this.getContextUsage();
-    onEvent({ type: 'context', contextTokens: contextUsage.tokens, contextWindow: contextUsage.window, contextPercent: contextUsage.percent, breakdown: contextUsage.breakdown });
+    onEvent({ type: 'context', contextTokens: contextUsage.tokens, contextWindow: contextUsage.window, contextPercent: contextUsage.percent, breakdown: contextUsage.breakdown, serverSideCompactionCount: this.serverSideCompactionCount });
     return {
       outcome,
       summary,
@@ -882,6 +887,7 @@ export class HarnessSession {
       tokensPerSecond: lastTokensPerSecond,
       contextTokens: contextUsage.tokens,
       contextBreakdown: contextUsage.breakdown,
+      serverSideCompactionCount: this.serverSideCompactionCount,
     };
   }
 

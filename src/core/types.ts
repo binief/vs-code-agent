@@ -521,8 +521,8 @@ export type HarnessEvent =
   | { type: 'task-list'; items: TaskItem[] }
   | { type: 'approval'; id: string; phase: 'request'; request: ApprovalRequest }
   | { type: 'approval'; id: string; phase: 'resolved'; request: ApprovalRequest; decision: ApprovalDecision }
-  | { type: 'usage'; step: number; usage: Usage; durationMs?: number; tokensPerSecond?: number; contextTokens?: number; contextWindow?: number; contextPercent?: number; cumulative?: Usage }
-  | { type: 'context'; contextTokens: number; contextWindow: number; contextPercent: number; breakdown?: ContextBreakdown }
+  | { type: 'usage'; step: number; usage: Usage; durationMs?: number; tokensPerSecond?: number; contextTokens?: number; contextWindow?: number; contextPercent?: number; serverSideCompactionCount?: number; cumulative?: Usage }
+  | { type: 'context'; contextTokens: number; contextWindow: number; contextPercent: number; breakdown?: ContextBreakdown; serverSideCompactionCount?: number }
   | {
       type: 'agent-files';
       enabled: boolean;
@@ -548,6 +548,7 @@ export interface TaskResult {
   tokensPerSecond?: number;
   contextTokens?: number;
   contextBreakdown?: ContextBreakdown;
+  serverSideCompactionCount?: number;
 }
 
 /* ---------------------------------------------------------------- tools */
