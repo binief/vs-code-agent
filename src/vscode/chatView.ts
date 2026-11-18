@@ -156,6 +156,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.controller.respondToApproval(String(message.id ?? ''), decision, remember);
         break;
       }
+      case 'task-list-approval-response': {
+        this.controller.respondToTaskListApproval(message.decision, message.items);
+        break;
+      }
       case 'open-diff':
         await this.controller.openApprovalDiff(String(message.id ?? ''));
         break;

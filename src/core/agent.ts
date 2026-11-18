@@ -115,6 +115,12 @@ export class HarnessSession {
   private pendingTaskList?: TaskItem[];
   /** How many times the provider rejected context as too large this task (server-side compaction). */
   private serverSideCompactionCount = 0;
+  /** Whether the task list has been approved by the user this task run. */
+  private taskListApproved = false;
+  /** Resolver for the pending task-list approval promise. */
+  private taskListApprovalResolve?: (decision: 'approve' | 'reject' | 'edit') => void;
+  /** The onEvent callback active during the current runTask call. */
+  private currentOnEvent?: (event: HarnessEvent) => void;
 
   constructor(private deps: AgentDeps) {
     this.registry = deps.registry ?? deps.tools ?? new ToolRegistry(createDefaultTools());
@@ -200,6 +206,41 @@ export class HarnessSession {
   setAgentSelection(selection: readonly string[] | null | undefined): void {
     this.deps.agentSelection = selection ?? undefined;
     this.lastAllowedTools = undefined;
+  }
+
+  /**
+   * Emits a task-list approval request and waits for the user to approve,
+   * reject, or edit the proposed task list.
+   */
+  async waitForTaskListApproval(items: TaskItem[]): Promise<'approve' | 'reject' | 'edit'> {
+    this.currentOnEvent?.({ type: 'task-list-approval', action: 'request', items });
+    return new Promise<'approve' | 'reject' | 'edit'>((resolve) => {
+      this.taskListApprovalResolve = resolve;
+    });
+  }
+
+  /**
+   * Called by the controller when the user responds to a task-list approval
+   * request. Resolves the pending promise so runTask can continue.
+   */
+  respondToTaskListApproval(
+    decision: 'approve' | 'reject' | 'edit',
+    items?: TaskItem[],
+  ): void {
+    const resolve = this.taskListApprovalResolve;
+    if (!resolve) return;
+    this.taskListApprovalResolve = undefined;
+    if (items) {
+      this.taskList = new TaskListStore();
+      this.taskList.restore(items);
+    }
+    resolve(decision);
+    this.currentOnEvent?.({
+      type: 'task-list-approval',
+      action: 'resolved',
+      decision,
+      items: items ?? this.taskList?.list() ?? [],
+    });
   }
 
   get agentSelection(): readonly string[] | undefined {
@@ -289,6 +330,9 @@ export class HarnessSession {
     }
     // Reset server-side compaction counter for this task.
     this.serverSideCompactionCount = 0;
+    // Reset task list approval state for this task run.
+    this.taskListApproved = false;
+    this.currentOnEvent = onEvent;
     const host = this.deps.host;
 
     const images = options.images?.length ? options.images : undefined;
@@ -517,6 +561,27 @@ export class HarnessSession {
         if (signal.aborted) {
           outcome = 'cancelled';
           break;
+        }
+        // Task list approval gate: after initial analysis, ask the user to
+        // approve the proposed task list before executing tasks.
+        if (
+          this.deps.config.taskListEnabled &&
+          !this.taskListApproved &&
+          this.taskList?.list().length > 0
+        ) {
+          const decision = await this.waitForTaskListApproval(
+            this.taskList.list(),
+          );
+          if (decision === 'reject') {
+            outcome = 'cancelled';
+            break;
+          }
+          if (decision === 'edit') {
+            // Items were updated by respondToTaskListApproval; re-enter
+            // the checkpoint so the user can re-approve.
+            continue;
+          }
+          this.taskListApproved = true;
         }
         steps = step;
         onEvent({ type: 'step', index: step, maxSteps: 0 });
@@ -843,6 +908,8 @@ export class HarnessSession {
       this.busy = false;
       this.controller = undefined;
       this.taskList = undefined;
+      this.currentOnEvent = undefined;
+      this.taskListApproved = false;
       // If a stream was interrupted before the provider returned, preserve
       // the partial prose that the user already saw for the next follow-up.
       if (this.pendingAssistantText) {

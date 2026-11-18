@@ -1950,6 +1950,14 @@ export class HarnessController {
     this.patchApproval(id, decision);
   }
 
+  /** Called by the webview when the user responds to a task-list approval request. */
+  respondToTaskListApproval(
+    decision: 'approve' | 'reject' | 'edit',
+    items?: TaskItem[],
+  ): void {
+    this.session?.respondToTaskListApproval(decision, items);
+  }
+
   /* -------------------------------------------------------------- events */
 
   private handleEvent(event: HarnessEvent): void {
@@ -2049,6 +2057,14 @@ export class HarnessController {
       case 'task-list':
         this.taskListItems = event.items;
         this.post({ type: 'task-list', items: event.items });
+        break;
+      case 'task-list-approval':
+        this.post({
+          type: 'task-list-approval',
+          action: event.action,
+          items: event.items,
+          ...(event.action === 'resolved' ? { decision: event.decision } : {}),
+        });
         break;
       case 'approval': {
         if (event.phase === 'request') {

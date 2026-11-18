@@ -519,6 +519,17 @@ export type HarnessEvent =
       relPath?: string;
     }
   | { type: 'task-list'; items: TaskItem[] }
+  | {
+      type: 'task-list-approval';
+      action: 'request';
+      items: TaskItem[];
+    }
+  | {
+      type: 'task-list-approval';
+      action: 'resolved';
+      decision: 'approve' | 'reject' | 'edit';
+      items?: TaskItem[];
+    }
   | { type: 'approval'; id: string; phase: 'request'; request: ApprovalRequest }
   | { type: 'approval'; id: string; phase: 'resolved'; request: ApprovalRequest; decision: ApprovalDecision }
   | { type: 'usage'; step: number; usage: Usage; durationMs?: number; tokensPerSecond?: number; contextTokens?: number; contextWindow?: number; contextPercent?: number; serverSideCompactionCount?: number; cumulative?: Usage }

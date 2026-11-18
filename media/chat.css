@@ -2065,3 +2065,140 @@ body.dragging .composer-box {
   white-space: nowrap;
   color: var(--vscode-foreground);
 }
+
+/* ------------------------------------------------------------- task-list approval modal */
+.modal {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+}
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(2px);
+}
+.modal-card {
+  position: relative;
+  width: min(560px, 92vw);
+  max-height: 80vh;
+  overflow: auto;
+  background: var(--vscode-editor-background);
+  border: 1px solid var(--vscode-dropdown-border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  color: var(--vscode-foreground);
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--vscode-dropdown-border);
+}
+.modal-title {
+  font-weight: 600;
+  font-size: 15px;
+}
+.modal-close {
+  cursor: pointer;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+}
+.modal-close:hover {
+  background: var(--surface-2);
+}
+.modal-body {
+  padding: 16px 18px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.modal-body p {
+  margin: 0 0 12px 0;
+}
+.task-list-approval-items {
+  margin: 8px 0 12px 0;
+  padding-left: 20px;
+}
+.task-list-approval-items li {
+  margin: 6px 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.task-mark {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.task-mark.done { color: var(--ok); }
+.task-mark.in-progress { color: var(--accent); }
+.task-mark.pending { color: var(--muted); }
+.task-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-list-approval-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--vscode-dropdown-border);
+  background: var(--surface-2);
+}
+.modal-btn {
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+}
+.modal-btn.secondary {
+  background: var(--surface-2);
+  color: var(--vscode-foreground);
+}
+.modal-btn.primary {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+}
+.modal-btn.primary:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+.modal-btn.danger {
+  background: transparent;
+  color: var(--vscode-errorForeground);
+  border: 1px solid var(--vscode-errorForeground);
+}
+.modal-btn.danger:hover {
+  background: var(--vscode-errorForeground);
+  color: #ffffff;
+}
+.notice-banner {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--vscode-notifications-background);
+  border: 1px solid var(--vscode-notifications-border);
+  color: var(--vscode-notifications-foreground);
+  font-size: 13px;
+  z-index: 10001;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  animation: noticeSlide 0.2s ease-out;
+}
+@keyframes noticeSlide {
+  from { transform: translateX(-50%) translateY(-20px); opacity: 0; }
+  to { transform: translateX(-50%) translateY(0); opacity: 1; }
+}

@@ -1215,6 +1215,73 @@
     return node;
   }
 
+  /* ------------------------------------------------------------- task-list approval modal */
+
+  let taskListApprovalModal = null;
+
+  function showTaskListApproval(items) {
+    if (taskListApprovalModal) return; // already showing
+    const modal = el('div', 'modal task-list-approval-modal');
+    modal.innerHTML = `
+      <div class="modal-backdrop"></div>
+      <div class="modal-card task-list-approval-card">
+        <div class="modal-head">
+          <span class="modal-title">Approve task list?</span>
+          <span class="modal-close">✕</span>
+        </div>
+        <div class="modal-body">
+          <p>The model proposes the following task list for this task:</p>
+          <ul class="task-list-approval-items">
+            ${items.map((item) => {
+              const mark = item.status === 'done' ? '[x]' : item.status === 'in-progress' ? '[•]' : '[ ]';
+              return `<li><span class="task-mark">${mark}</span> <span class="task-title">${escapeHtml(item.title)}</span></li>`;
+            }).join('')}
+          </ul>
+          <p class="task-list-approval-hint">Review the list. Approve to proceed, or edit items before continuing.</p>
+        </div>
+        <div class="modal-actions">
+          <button class="modal-btn secondary" data-action="edit">Edit items</button>
+          <button class="modal-btn danger" data-action="reject">Reject</button>
+          <button class="modal-btn primary" data-action="approve">Approve</button>
+        </div>
+      </div>
+    `;
+    const backdrop = modal.querySelector('.modal-backdrop');
+    const closeBtn = modal.querySelector('.modal-close');
+    const respond = (decision) => {
+      hideTaskListApproval();
+      vscode.postMessage({ type: 'task-list-approval-response', decision });
+    };
+    backdrop.addEventListener('click', () => respond('reject'));
+    closeBtn.addEventListener('click', () => respond('reject'));
+    modal.querySelectorAll('[data-action]').forEach((btn) => {
+      btn.addEventListener('click', () => respond(btn.dataset.action));
+    });
+    document.body.appendChild(modal);
+    taskListApprovalModal = modal;
+  }
+
+  function hideTaskListApproval() {
+    if (!taskListApprovalModal) return;
+    document.body.removeChild(taskListApprovalModal);
+    taskListApprovalModal = null;
+  }
+
+  function addNotice(text) {
+    const existing = document.querySelector('.notice-banner');
+    if (existing) existing.remove();
+    const notice = el('div', 'notice-banner notice', text);
+    const container = document.querySelector('.panel') || document.body;
+    container.insertBefore(notice, container.firstChild);
+    setTimeout(() => notice.remove(), 5000);
+  }
+
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
   const DONE_LABEL = {
     complete: 'Done',
     'max-steps': 'Step limit reached',
@@ -2395,6 +2462,19 @@
         input.value = (input.value ? input.value + '\n' : '') + (message.text || '');
         input.focus();
         input.dispatchEvent(new Event('input'));
+        break;
+      case 'task-list-approval':
+        if (message.action === 'request') {
+          showTaskListApproval(message.items);
+        } else if (message.action === 'resolved') {
+          hideTaskListApproval();
+          if (message.decision === 'approve') {
+            renderTaskStrip(message.items ?? []);
+          } else if (message.decision === 'reject') {
+            setStatus('idle', 0, 0);
+            addNotice('Task cancelled by user.');
+          }
+        }
         break;
       default:
         break;
