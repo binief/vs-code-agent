@@ -2304,3 +2304,55 @@ body.dragging .composer-box {
 .msg.command .command-prompt {
   color: var(--vscode-descriptionForeground, #858585);
 }
+
+/* ------------------------------------------------------------- running commands modal */
+
+.running-command {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  margin-bottom: 6px;
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+}
+
+.running-command-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.running-command-label {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--vscode-foreground, #cccccc);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.running-command-meta {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground, #858585);
+}
+
+.running-command-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.running-command-actions .linklike {
+  font-size: 12px;
+  padding: 2px 8px;
+}
+
+#command-output-text {
+  white-space: pre-wrap;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 12px;
+  color: var(--vscode-foreground, #cccccc);
+  margin: 0;
+}

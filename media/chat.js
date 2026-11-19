@@ -22,6 +22,7 @@
   const btnImportChat = document.getElementById('btn-import-chat');
   const btnExportChat = document.getElementById('btn-export-chat');
   const btnSettings = document.getElementById('btn-settings');
+  const btnRunningCommands = document.getElementById('btn-running-commands');
   const btnSelection = document.getElementById('btn-selection');
   const btnCompact = document.getElementById('btn-compact');
   const btnMcp = document.getElementById('btn-mcp');
@@ -1816,6 +1817,7 @@
   if (btnCompact) btnCompact.addEventListener('click', () => vscode.postMessage({ type: 'compact' }));
   if (btnMcp) btnMcp.addEventListener('click', openMcpModal);
   if (btnAgents) btnAgents.addEventListener('click', () => vscode.postMessage({ type: 'open-agents' }));
+  if (btnRunningCommands) btnRunningCommands.addEventListener('click', () => vscode.postMessage({ type: 'list-running-commands' }));
   if (chipAgents) chipAgents.addEventListener('click', openAgentsModal);
   if (chipContext && contextBreakdownPanel) {
     const toggleContextBreakdown = () => { contextBreakdownPanel.hidden = !contextBreakdownPanel.hidden; chipContext.setAttribute('aria-expanded', String(!contextBreakdownPanel.hidden)); updateTokenChips(); };
@@ -1851,6 +1853,69 @@
   const mcpSave = document.getElementById('mcp-save');
   const mcpReloadBtn = document.getElementById('mcp-reload');
   const mcpModalClose = document.getElementById('mcp-modal-close');
+
+  /* ------------------------------------------------------ running commands modal */
+
+  const runningCommandsModal = document.getElementById('running-commands-modal');
+  const runningCommandsModalClose = document.getElementById('running-commands-modal-close');
+  const runningCommandsList = document.getElementById('running-commands-list');
+  const runningCommandsStopAll = document.getElementById('running-commands-stop-all');
+  const runningCommandsModalCloseFoot = document.getElementById('running-commands-modal-close-foot');
+
+  const commandOutputModal = document.getElementById('command-output-modal');
+  const commandOutputModalClose = document.getElementById('command-output-modal-close');
+  const commandOutputModalCloseFoot = document.getElementById('command-output-modal-close-foot');
+
+  /** Live set of running commands shown in the modal. */
+  let runningCommands = [];
+
+  function openRunningCommandsModal() {
+    runningCommandsModal.hidden = false;
+    runningCommandsList.innerHTML = '';
+    runningCommandsStopAll.hidden = runningCommands.length === 0;
+    for (const cmd of runningCommands) {
+      const row = el('div', 'running-command');
+      const info = el('div', 'running-command-info');
+      const label = el('span', 'running-command-label');
+      label.textContent = cmd.command;
+      const meta = el('span', 'running-command-meta');
+      meta.textContent =
+        'PID ' + cmd.pid +
+        (cmd.detached ? ' · detached' : '') +
+        ' · cwd: ' + cmd.cwd +
+        ' · started ' + new Date(cmd.startedAt).toLocaleTimeString() +
+        (cmd.outputLines && cmd.outputLines.length ? ' · ' + cmd.outputLines.length + ' output line(s)' : '');
+      info.appendChild(label);
+      info.appendChild(meta);
+      row.appendChild(info);
+
+      const actions = el('div', 'running-command-actions');
+      if (cmd.outputLines && cmd.outputLines.length > 0) {
+        const view = el('button', 'linklike');
+        view.type = 'button';
+        view.textContent = 'View output';
+        view.addEventListener('click', () => {
+          vscode.postMessage({ type: 'view-command-output', pid: cmd.pid });
+          closeRunningCommandsModal();
+        });
+        actions.appendChild(view);
+      }
+      const stop = el('button', 'danger');
+      stop.type = 'button';
+      stop.textContent = 'Stop';
+      stop.addEventListener('click', () => {
+        vscode.postMessage({ type: 'stop-command', pid: cmd.pid });
+        closeRunningCommandsModal();
+      });
+      actions.appendChild(stop);
+      row.appendChild(actions);
+      runningCommandsList.appendChild(row);
+    }
+  }
+
+  function closeRunningCommandsModal() {
+    runningCommandsModal.hidden = true;
+  }
 
   /** Live per-server status posted by the extension: { running, tools, error }. */
   let mcpServerStatus = {};
@@ -2176,11 +2241,27 @@
   mcpModal.addEventListener('click', (event) => {
     if (event.target === mcpModal) closeMcpModal();
   });
+  runningCommandsModalClose.addEventListener('click', closeRunningCommandsModal);
+  runningCommandsModalCloseFoot.addEventListener('click', closeRunningCommandsModal);
+  runningCommandsModal.addEventListener('click', (event) => {
+    if (event.target === runningCommandsModal) closeRunningCommandsModal();
+  });
+  runningCommandsStopAll.addEventListener('click', () => {
+    vscode.postMessage({ type: 'stop-all-commands' });
+    closeRunningCommandsModal();
+  });
+  commandOutputModalClose.addEventListener('click', () => { commandOutputModal.hidden = true; });
+  commandOutputModalCloseFoot.addEventListener('click', () => { commandOutputModal.hidden = true; });
+  commandOutputModal.addEventListener('click', (event) => {
+    if (event.target === commandOutputModal) commandOutputModal.hidden = true;
+  });
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
     if (!mcpModal.hidden) closeMcpModal();
     if (!featureModal.hidden) featureModal.hidden = true;
     if (agentsModal && !agentsModal.hidden) closeAgentsModal();
+    if (!runningCommandsModal.hidden) closeRunningCommandsModal();
+    if (!commandOutputModal.hidden) commandOutputModal.hidden = true;
   });
   mcpAddServer.addEventListener('click', () => {
     const emptyNoteNode = mcpServerList.querySelector('.mcp-empty');
@@ -2559,6 +2640,18 @@
           }
         }
         break;
+      case 'running-commands': {
+        showRunningCommandsModal(message.commands ?? []);
+        break;
+      }
+      case 'command-output': {
+        const output = message.output ?? [];
+        const text = document.getElementById('command-output-text');
+        if (text) text.textContent = output.length ? output.join('\n') : '(no output captured yet)';
+        const modal = document.getElementById('command-output-modal');
+        if (modal) modal.hidden = false;
+        break;
+      }
       default:
         break;
     }
