@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { createHash, randomUUID } from 'node:crypto';
+import * as cp from 'child_process';
 import * as vscode from 'vscode';
 import { HarnessSession, withDelegationSpec } from '../core/agent';
 import { estimateMessagesTokens } from '../core/compaction';
@@ -1254,6 +1255,162 @@ export class HarnessController {
       this.trimItems();
       await this.persistChat();
     }
+  }
+
+  /* --------------------------------------------------------------- slash commands */
+
+  /** Create task list items from a prompt (slash command /create_tasks). */
+  async createTasks(prompt: string): Promise<void> {
+    await this.whenReady();
+    if (!this.session) {
+      void vscode.window.showWarningMessage('Coding Harness session is not ready. Start a task first.');
+      return;
+    }
+    const trimmed = prompt.trim();
+    if (!trimmed) {
+      void vscode.window.showWarningMessage('Provide a prompt after /create_tasks.');
+      return;
+    }
+    const config = this.readConfig();
+    if (!config.taskListEnabled) {
+      void vscode.window.showWarningMessage('Enable codingHarness.taskList.enabled in settings to use /create_tasks.');
+      return;
+    }
+    this.setStatus('thinking', true);
+    try {
+      await this.session.decomposeProject(trimmed);
+    } finally {
+      this.setStatus('idle', false);
+    }
+  }
+
+  /** Edit a task list item (slash command /edit_task <id> status=done|title=...). */
+  async editTask(id: string, updates: { title?: string; status?: string }): Promise<void> {
+    await this.whenReady();
+    if (!id) {
+      void vscode.window.showWarningMessage('Usage: /edit_task <id> status=done|title=...');
+      return;
+    }
+    const patch: { title?: string; status?: 'pending' | 'in-progress' | 'done' } = {};
+    if (updates.title !== undefined) patch.title = updates.title;
+    if (updates.status !== undefined) {
+      if (!['pending', 'in-progress', 'done'].includes(updates.status)) {
+        void vscode.window.showWarningMessage('status must be pending, in-progress, or done.');
+        return;
+      }
+      patch.status = updates.status as 'pending' | 'in-progress' | 'done';
+    }
+    if (Object.keys(patch).length === 0) {
+      void vscode.window.showWarningMessage('Nothing to update. Use status=done or title=...');
+      return;
+    }
+    const store = this.session?.taskListStore;
+    if (!store) {
+      void vscode.window.showWarningMessage('No task list available.');
+      return;
+    }
+    const updated = store.update(id, patch);
+    if (!updated) {
+      void vscode.window.showWarningMessage(`Unknown task item id "${id}".`);
+      return;
+    }
+    this.taskListItems = store.list();
+    this.post({ type: 'task-list', items: this.taskListItems });
+  }
+
+  /** Start implementing pending task list items (slash command /start_implementation). */
+  async startImplementation(): Promise<void> {
+    await this.whenReady();
+    if (!this.session) {
+      void vscode.window.showWarningMessage('Coding Harness session is not ready.');
+      return;
+    }
+    const config = this.readConfig();
+    if (!config.taskListEnabled) {
+      void vscode.window.showWarningMessage('Enable codingHarness.taskList.enabled in settings to use /start_implementation.');
+      return;
+    }
+    const pending = this.taskListItems.filter((i) => i.status !== 'done');
+    if (pending.length === 0) {
+      void vscode.window.showInformationMessage('No pending task items. Use /create_tasks to create some first.');
+      return;
+    }
+    // Start a normal runTask so the model works through the pending items.
+    const prompt = `Work through the pending task list items. Start with the first pending item, mark it in-progress, implement it, then mark it done. Repeat until all items are done.\n\nPending items:\n${pending.map((i) => `- ${i.id}: ${i.title}`).join('\n')}`;
+    await this.run(prompt);
+  }
+
+  /** Re-emit the current task list to the panel (slash command /refresh_tasklist). */
+  refreshTasklist(): void {
+    this.post({ type: 'task-list', items: this.taskListItems });
+  }
+
+  /** Verify task list against actual file changes (slash command /verify_tasks).
+   *  Compares task item statuses with git diff output and flags stale items:
+   *  items marked 'done' but with no related file changes, or pending items
+   *  whose referenced files appear modified.
+   */
+  async verifyTasks(): Promise<void> {
+    await this.whenReady();
+    const config = this.readConfig();
+    if (!config.taskListEnabled) {
+      void vscode.window.showWarningMessage('Enable codingHarness.taskList.enabled in settings to use /verify_tasks.');
+      return;
+    }
+    const items = this.taskListItems;
+    if (items.length === 0) {
+      void vscode.window.showInformationMessage('No task list items. Use /create_tasks to create some first.');
+      return;
+    }
+
+    // Get files actually changed in the working tree vs HEAD.
+    let changedFiles: string[] = [];
+    try {
+      const root = this.workspaceRoot();
+      if (root) {
+        const stdout = cp.execSync('git diff --name-only HEAD', { cwd: root, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+        changedFiles = stdout.split('\n').map((f) => f.trim()).filter(Boolean);
+      }
+    } catch {
+      // Not a git repo or git unavailable: changedFiles stays empty.
+    }
+
+    const doneItems = items.filter((i) => i.status === 'done');
+    const pendingItems = items.filter((i) => i.status !== 'done');
+
+    const lines: string[] = [];
+    lines.push(`Task list verification (${items.length} item(s)):`);
+    lines.push('');
+
+    for (const item of items) {
+      const mark = item.status === 'done' ? '[x]' : item.status === 'in-progress' ? '[•]' : '[ ]';
+      lines.push(`${mark} ${item.id}: ${item.title}`);
+    }
+
+    lines.push('');
+    lines.push(`Changed files (git diff --name-only HEAD): ${changedFiles.length || 'none'}`);
+    for (const f of changedFiles.slice(0, 20)) {
+      lines.push(`  - ${f}`);
+    }
+    if (changedFiles.length > 20) lines.push(`  ... and ${changedFiles.length - 20} more`);
+
+    // Heuristic warnings.
+    const warnings: string[] = [];
+    if (doneItems.length > 0 && changedFiles.length === 0) {
+      warnings.push(`Warning: ${doneItems.length} item(s) marked 'done' but no files appear changed in git.`);
+    }
+    if (pendingItems.length > 0 && changedFiles.length > 0) {
+      warnings.push(`Info: ${changedFiles.length} file(s) changed but ${pendingItems.length} item(s) still not 'done'.`);
+    }
+
+    if (warnings.length > 0) {
+      lines.push('');
+      lines.push(...warnings);
+    }
+
+    const message = lines.join('\n');
+    void vscode.window.showInformationMessage(message, { modal: true });
+    this.post({ type: 'notice', level: 'info', message: 'Task verification complete. See notification for details.' });
   }
 
   cancel(): void {
