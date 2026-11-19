@@ -323,21 +323,26 @@ export const runCommandTool: Tool<{
       'info',
     );
 
-    // Warn when a command looks like a long-running server but detached is not set,
-    // so the user knows it may block the task until stopped.
+    // When a command looks like a long-running server and detached is not set,
+    // offer to move it to the background so the task can keep moving forward.
     const LONG_RUNNING = /\\b(mvn|maven|gradle|mvnw|gradlew|java|node|python|python3|ruby|php|dotnet)\\b/;
-    if (!args.detached && LONG_RUNNING.test(args.command)) {
-      ctx.host.notify?.(
-        `Command may run indefinitely: "${args.command}". Consider detached: true to start it in the background and return immediately.`,
-        'warn',
+    let detached = args.detached === true;
+    if (!detached && LONG_RUNNING.test(args.command) && ctx.host.prompt) {
+      const choice = await ctx.host.prompt(
+        `Command may run indefinitely: "${args.command}".\nRun it in the background so the task can continue?`,
+        ['Run in background', 'Run in foreground', 'Cancel'],
       );
+      if (choice === 2) {
+        return fail('User cancelled running this command.', 'cancelled', { cancelled: true });
+      }
+      detached = choice === 0;
     }
 
     const result = await runShellCommand(args.command, {
       cwd: cwd.abs,
       timeoutMs,
       signal: ctx.signal,
-      detached: args.detached,
+      detached,
       detached_timeout_ms: args.detached_timeout_ms,
     });
 

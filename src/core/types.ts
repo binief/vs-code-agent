@@ -188,6 +188,11 @@ export interface HarnessHost {
   getDiagnostics?(relPath?: string): Promise<Diagnostic[]>;
   openFile?(absPath: string, line?: number): Promise<void>;
   notify?(message: string, kind?: 'info' | 'warn' | 'error'): void;
+  /**
+   * Ask the user to choose from a list of options. Returns the index of the
+   * chosen option, or undefined if the user dismissed the prompt.
+   */
+  prompt?(message: string, options: string[]): Promise<number | undefined>;
   /** Editor/workspace facts used to build the context section of the prompt. */
   getWorkspaceContext?(): WorkspaceContext | Promise<WorkspaceContext>;
 }
