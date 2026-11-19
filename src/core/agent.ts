@@ -354,26 +354,10 @@ export class HarnessSession {
 
     if (signal?.aborted) return;
     if (relevantFiles.size === 0) {
-      // No relevant files found — create a single fallback task item so the
-      // user still gets a task list they can work with instead of silence.
-      if (!this.taskList) {
-        this.taskList = new TaskListStore();
-      }
-      this.taskList.add(`Task: ${prompt}`);
-      this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
-      const items = this.taskList?.list() ?? [];
-      if (items.length > 0) {
-        const decision = await this.waitForTaskListApproval(items);
-        if (decision === 'reject') {
-          this.taskList?.clear();
-          this.currentOnEvent?.({ type: 'task-list', items: [] });
-          return;
-        }
-        if (decision === 'edit') {
-          this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
-        }
-        this.taskListApproved = true;
-      }
+      // No relevant project files found. Use the LLM to decompose the prompt
+      // into discrete, actionable task items instead of creating a single
+      // fallback task with the raw prompt as its title.
+      await this.decomposePromptViaLLM(prompt);
       return;
     }
 
@@ -418,26 +402,9 @@ export class HarnessSession {
     if (current.files.length > 0) slices.push(current);
 
     if (slices.length === 0) {
-      // Slicing produced nothing (e.g. context window too small). Create a
-      // single fallback task item so the user still gets a task list.
-      if (!this.taskList) {
-        this.taskList = new TaskListStore();
-      }
-      this.taskList.add(`Task: ${prompt}`);
-      this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
-      const items = this.taskList?.list() ?? [];
-      if (items.length > 0) {
-        const decision = await this.waitForTaskListApproval(items);
-        if (decision === 'reject') {
-          this.taskList?.clear();
-          this.currentOnEvent?.({ type: 'task-list', items: [] });
-          return;
-        }
-        if (decision === 'edit') {
-          this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
-        }
-        this.taskListApproved = true;
-      }
+      // Slicing produced nothing (e.g. context window too small). Use the LLM
+      // to decompose the prompt into task items instead.
+      await this.decomposePromptViaLLM(prompt);
       return;
     }
 
@@ -471,6 +438,96 @@ export class HarnessSession {
         this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
       }
       this.taskListApproved = true;
+    }
+  }
+
+  /**
+   * Use the LLM to decompose a free-form prompt into discrete, actionable
+   * task list items. Called by decomposeProject when no project files match
+   * the prompt, so the user still gets a meaningful task list based on the
+   * prompt text itself rather than a single fallback task with the raw prompt
+   * as its title.
+   */
+  private async decomposePromptViaLLM(prompt: string): Promise<void> {
+    if (!this.taskList) {
+      this.taskList = new TaskListStore();
+    }
+
+    const system =
+      'You are a task decomposition assistant. Break down the user\'s request ' +
+      'into discrete, actionable task items. Each task item should be a single, ' +
+      'specific action that can be completed independently. Return a JSON array ' +
+      'of objects with "title" and optional "status" fields. Do not include any ' +
+      'explanation outside the JSON array.\n\n' +
+      'Example output:\n' +
+      '[\n' +
+      '  {"title": "Read and analyze requirement.md", "status": "pending"},\n' +
+      '  {"title": "Identify pending items from requirements", "status": "pending"},\n' +
+      '  {"title": "Implement each pending item", "status": "pending"},\n' +
+      '  {"title": "Verify implementation against requirements", "status": "pending"}\n' +
+      ']\n\n' +
+      'User request: ' + prompt;
+
+    try {
+      const response = await this.deps.provider.chat({
+        model: this.deps.config.model,
+        messages: [{ role: 'user', content: system }],
+        tools: [],
+        signal: this.controller?.signal,
+        temperature: 0.2,
+        maxTokens: 2048,
+      });
+
+      const text = response.text?.trim();
+      if (!text) return;
+
+      let items: { title: string; status?: string }[];
+      try {
+        items = JSON.parse(text);
+      } catch {
+        const match = text.match(/\[[\s\S]*\]/);
+        if (!match) return;
+        items = JSON.parse(match[0]);
+      }
+
+      if (!Array.isArray(items)) return;
+
+      for (const item of items) {
+        if (item && typeof item.title === 'string' && item.title.trim()) {
+          const id = this.taskList.add(item.title.trim());
+          const rawStatus = item.status as string | undefined;
+          const status = rawStatus &&
+            ['pending', 'in-progress', 'done'].includes(rawStatus)
+            ? rawStatus as 'pending' | 'in-progress' | 'done'
+            : 'pending';
+          if (status !== 'pending') {
+            this.taskList.update(id, { status });
+          }
+        }
+      }
+
+      // Emit task list for the panel strip.
+      this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
+
+      // Request user approval before starting slice execution.
+      const taskItems = this.taskList?.list() ?? [];
+      if (taskItems.length > 0) {
+        const decision = await this.waitForTaskListApproval(taskItems);
+        if (decision === 'reject') {
+          this.taskList?.clear();
+          this.currentOnEvent?.({ type: 'task-list', items: [] });
+          return;
+        }
+        if (decision === 'edit') {
+          this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
+        }
+        this.taskListApproved = true;
+      }
+    } catch (err) {
+      this.deps.host.log(
+        'warn',
+        `LLM-based decomposition failed: ${(err as Error).message}`,
+      );
     }
   }
 
