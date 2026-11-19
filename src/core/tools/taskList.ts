@@ -53,7 +53,10 @@ export const taskListTool: Tool<{
         if (args.status !== undefined) patch.status = args.status;
         if (Object.keys(patch).length === 0) return fail('Nothing to update.', 'bad arguments');
         const updated = store.update(args.id, patch as { title?: string; status?: 'pending' | 'in-progress' | 'done' });
-        if (!updated) return fail(`Unknown task item id "${args.id}".`, 'not found');
+        if (!updated) {
+          const available = store.list().map((i) => i.id).join(', ');
+          return fail(`Unknown task item id "${args.id}". Available: ${available || 'none'}.`, 'not found');
+        }
         return ok(`Updated task item ${args.id}.`, 'updated');
       }
       case 'list': {
@@ -68,7 +71,10 @@ export const taskListTool: Tool<{
       case 'remove': {
         if (!args.id) return fail('"id" is required for remove.', 'bad arguments');
         const removed = store.remove(args.id);
-        if (!removed) return fail(`Unknown task item id "${args.id}".`, 'not found');
+        if (!removed) {
+          const available = store.list().map((i) => i.id).join(', ');
+          return fail(`Unknown task item id "${args.id}". Available: ${available || 'none'}.`, 'not found');
+        }
         return ok(`Removed task item ${args.id}.`, 'removed');
       }
       default:

@@ -17,7 +17,7 @@ const step = (name: string): any => {
 };
 
 test('main updates and manual dispatch build and upload a VSIX after tests', () => {
-  assert.deepEqual(workflow.on.push.branches, ['main']);
+  assert.ok(!workflow.on.push, 'push trigger should be removed — VSIX pipeline is manual-only');
   assert.ok(Object.hasOwn(workflow.on, 'workflow_dispatch'));
   assert.equal(step('Check out the triggering commit').with.ref, '${{ github.sha }}');
   const commands = steps.map((item) => item.run);

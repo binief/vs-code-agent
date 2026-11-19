@@ -1295,11 +1295,6 @@ export class HarnessController {
     this.setStatus('thinking', true);
     try {
       await this.session.createTaskListFromPrompt(trimmed);
-      // Sync task list items from the session store so startImplementation
-      // sees the items createTaskListFromPrompt just created.
-      if (this.session?.taskListStore) {
-        this.taskListItems = this.session.taskListStore.list();
-      }
     } finally {
       this.setStatus('idle', false);
     }
@@ -1463,6 +1458,8 @@ export class HarnessController {
       return;
     }
     this.session?.reset();
+    // Clear the session's task list store so /edit_task etc. start fresh too.
+    this.session?.taskListStore?.clear();
     this.clearCompactionTrace();
     this.restoredHistory = [];
     this.restoredOriginalHistory = [];
@@ -1473,6 +1470,7 @@ export class HarnessController {
     this.items = [];
     this.subagentItemIds.clear();
     this.taskListItems = [];
+    this.post({ type: 'task-list', items: [] });
     this.state = {
       ...this.state,
       usage: { ...this.cumulativeUsage },
@@ -1603,6 +1601,10 @@ export class HarnessController {
       // Recreate the session so it picks up the new tool registry while
       // keeping the conversation intact.
       if (this.session && this.host) {
+        // Preserve task list items and approval state before recreating the
+        // session, so task items survive MCP reloads.
+        const oldTaskListItems = this.session.taskListStore?.list() ?? [];
+        const oldTaskListApproved = this.session.taskListApprovedFlag;
         const registry = new ToolRegistry([...createDefaultTools(), ...(this.mcpManager?.getTools() ?? [])]);
         const oldHistory = this.session.transcript;
         const oldOriginal = this.session.originalConversationSnapshot;
@@ -1614,6 +1616,10 @@ export class HarnessController {
           registry,
           agentSelection: this.agentSelection,
         });
+        if (oldTaskListItems.length > 0) {
+          this.session.replaceTaskList(oldTaskListItems);
+        }
+        this.session.setTaskListApprovedFlag(oldTaskListApproved);
         this.session.restoreConversation(oldHistory, this.cumulativeUsage, oldOriginal, oldOriginalComplete);
         this.state = { ...this.state, toolCount: registry.size };
         this.post({ type: 'state', state: this.state });
@@ -1719,6 +1725,10 @@ export class HarnessController {
       this.post({ type: 'mcp-status', enabled: false, servers: 0, tools: 0 });
       // Swap a live session back to the built-in tools so disabled servers go quiet.
       if (this.session && this.host) {
+        // Preserve task list items and approval state before recreating the
+        // session, so task items survive MCP settings changes.
+        const oldTaskListItems = this.session.taskListStore?.list() ?? [];
+        const oldTaskListApproved = this.session.taskListApprovedFlag;
         const config = this.readConfig();
         const registry = new ToolRegistry(createDefaultTools());
         const oldHistory = this.session.transcript;
@@ -1731,6 +1741,10 @@ export class HarnessController {
           registry,
           agentSelection: this.agentSelection,
         });
+        if (oldTaskListItems.length > 0) {
+          this.session.replaceTaskList(oldTaskListItems);
+        }
+        this.session.setTaskListApprovedFlag(oldTaskListApproved);
         this.session.restoreConversation(oldHistory, this.cumulativeUsage, oldOriginal, oldOriginalComplete);
         this.state = { ...this.state, toolCount: registry.size };
         this.post({ type: 'state', state: this.state });
