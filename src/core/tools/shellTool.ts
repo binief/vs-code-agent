@@ -211,13 +211,25 @@ function cap(text: string): string {
 function killTree(child: ReturnType<typeof spawn>): void {
   if (child.pid === undefined) return;
   try {
+    // Kill the child (shell) process directly first. On POSIX this sends
+    // SIGTERM; on Windows it calls TerminateProcess. This is the primary
+    // kill path so the shell is always targeted even if the process-group
+    // kill below fails silently.
+    child.kill();
     if (process.platform === 'win32') {
-      // Terminate the shell process immediately, then clean up its process
-      // tree (e.g. a Java process started via `start /b`) with taskkill /T.
-      child.kill();
+      // Clean up the process tree (e.g. a Java process started via `start /b`)
+      // with taskkill /T /F so no orphaned server processes survive.
       spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
     } else {
-      process.kill(-child.pid, 'SIGKILL');
+      // Kill the entire process group (shell + all child processes such as
+      // a Maven daemon or Node server spawned by the shell). SIGKILL cannot
+      // be caught, so this is the most reliable way to stop everything.
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        // Process group may not exist if the child is not a group leader;
+        // child.kill() above may have been sufficient.
+      }
     }
   } catch {
     try {
