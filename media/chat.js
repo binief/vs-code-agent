@@ -1869,7 +1869,8 @@
   /** Live set of running commands shown in the modal. */
   let runningCommands = [];
 
-  function openRunningCommandsModal() {
+  function showRunningCommandsModal(commands) {
+    runningCommands = commands;
     runningCommandsModal.hidden = false;
     runningCommandsList.innerHTML = '';
     runningCommandsStopAll.hidden = runningCommands.length === 0;
