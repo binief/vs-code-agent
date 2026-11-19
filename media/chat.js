@@ -1619,7 +1619,22 @@
     // Slash commands: /create_tasks, /edit_task, /start_implementation, /refresh_tasklist, /verify_tasks
     if (value.startsWith('/')) {
       const parsed = parseSlashCommand(value);
-      if (!parsed) return; // unknown command — fall through to normal submit
+      if (!parsed) {
+        // Unknown/invalid command — treat as normal message
+        vscode.postMessage({ type: 'submit', text: value, images: [] });
+        clearAttachments();
+        if (text === undefined) {
+          input.value = '';
+          input.style.height = 'auto';
+        }
+        stickToBottom = true;
+        autoScroll(true);
+        return;
+      }
+      // Show local command bubble immediately so user sees feedback
+      const localId = 'local-' + Date.now();
+      const cmdItem = { id: localId, kind: 'command', name: parsed.name, args: parsed.args };
+      addItem(cmdItem, true);
       vscode.postMessage({ type: 'command', ...parsed });
       clearAttachments();
       if (text === undefined) {
@@ -1633,6 +1648,10 @@
     // An image on its own is a valid prompt ("what is wrong in this screenshot?").
     if ((!value && pending.length === 0) || busy) return;
     const images = pending.map((entry) => ({ name: entry.name, mediaType: entry.mediaType, dataUrl: entry.dataUrl }));
+    // Show local user bubble immediately so user sees their message right away
+    const localId = 'local-' + Date.now();
+    const localItem = { id: localId, kind: 'user', text: value, images: images.length ? images.map(i => ({ name: i.name, mediaType: i.mediaType, dataUrl: i.dataUrl })) : undefined };
+    addItem(localItem, true);
     vscode.postMessage({ type: 'submit', text: value, images });
     clearAttachments();
     if (text === undefined) {
@@ -2361,6 +2380,20 @@
         autoScroll(true);
         break;
       case 'item':
+        // Replace local echo (id starts with 'local-') with the real item from controller
+        if (message.item.kind === 'user' || message.item.kind === 'command') {
+          const existingId = [...items.entries()].find(
+            ([id, item]) => id.startsWith('local-') && item.kind === message.item.kind && item.text === message.item.text
+          )?.[0];
+          if (existingId) {
+            const existingNode = elements.get(existingId);
+            if (existingNode && existingNode.parentElement) {
+              existingNode.parentElement.removeChild(existingNode);
+            }
+            elements.delete(existingId);
+            items.delete(existingId);
+          }
+        }
         addItem(message.item, message.item.kind === 'user' || message.item.kind === 'approval');
         break;
       case 'update':

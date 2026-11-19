@@ -1490,7 +1490,7 @@ body.dragging .composer-box {
   border: 1px solid var(--vscode-input-border, var(--border));
   border-radius: var(--radius);
   background: var(--vscode-input-background);
-  overflow: hidden;
+  overflow: visible;
 }
 
 .composer-box:focus-within {
