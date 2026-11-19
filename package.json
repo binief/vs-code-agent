@@ -326,7 +326,7 @@
         },
         "codingHarness.taskList.enabled": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "markdownDescription": "Always make the `task_list` tool available (regardless of agent.md `tools:` declaration) and instruct the model to maintain a task list for every long-running task. Shown in the panel strip and saved in the chat JSON."
         },
         "codingHarness.decomposition.enabled": {

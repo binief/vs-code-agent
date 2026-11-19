@@ -350,7 +350,7 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   showThinking: true,
   textToolMode: false,
   subagentsEnabled: false,
-  taskListEnabled: false,
+  taskListEnabled: true,
   decompositionEnabled: false,
   agentFiles: {
     enabled: true,
