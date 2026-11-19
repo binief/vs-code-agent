@@ -1,7 +1,15 @@
 import { createFileTool, deleteFileTool, listFilesTool, readFileTool, replaceInFileTool, writeFileTool } from './fsTools';
 import { getDiagnosticsTool, openFileTool } from './hostTools';
 import { searchTextTool } from './searchTools';
-import { runCommandTool, runShellCommand } from './shellTool';
+import {
+  runCommandTool,
+  runShellCommand,
+  getDetachedProcesses,
+  killDetachedProcess,
+  killAllDetachedProcesses,
+  DETACHED_DEFAULT_TIMEOUT_MS,
+  type DetachedProcessInfo,
+} from './shellTool';
 import { taskListTool } from './taskList';
 import { taskDecomposeTool } from './taskDecompose';
 import type { Tool, ToolSpec } from '../types';
@@ -76,5 +84,7 @@ export { createFileTool, deleteFileTool, listFilesTool, readFileTool, replaceInF
 export { getDiagnosticsTool, openFileTool };
 export { searchTextTool };
 export { runCommandTool, runShellCommand };
+export { getDetachedProcesses, killDetachedProcess, killAllDetachedProcesses, DETACHED_DEFAULT_TIMEOUT_MS };
+export type { DetachedProcessInfo };
 export { taskDecomposeTool };
 export { McpManager, McpClient } from './mcp';
