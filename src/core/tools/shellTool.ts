@@ -90,6 +90,8 @@ export function runShellCommand(
     env?: NodeJS.ProcessEnv;
     detached?: boolean;
     detached_timeout_ms?: number;
+    /** Kill the command if no stdout/stderr output arrives within this many ms. */
+    idleTimeoutMs?: number;
     /** Called incrementally with stdout/stderr text as it arrives. */
     onOutput?: (text: string, stream: 'stdout' | 'stderr') => void;
   },
@@ -100,11 +102,24 @@ export function runShellCommand(
       resolve({ exitCode: null, stdout: '', stderr: 'Cancelled before starting.', timedOut: false, durationMs: 0 });
       return;
     }
+    // Non-interactive environment: prevent pagers, prompts, and TTY-driven
+    // UI from blocking on stdin. stdin is set to 'ignore' (/dev/null) so any
+    // command that reads from stdin gets EOF immediately instead of hanging.
+    const nonInteractiveEnv = {
+      CI: '1',
+      GIT_PAGER: 'cat',
+      PAGER: 'cat',
+      TERM: 'dumb',
+      NO_COLOR: '1',
+      DEBIAN_FRONTEND: 'noninteractive',
+      ...(opts.env ?? {}),
+    };
     const child = spawn(command, {
       cwd: opts.cwd,
       shell: true,
-      env: { ...process.env, ...(opts.env ?? {}), CI: process.env.CI ?? '1' },
+      env: { ...process.env, ...nonInteractiveEnv },
       windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32' || opts.detached === true,
     });
 
@@ -112,12 +127,25 @@ export function runShellCommand(
     let stderr = '';
     let timedOut = false;
     let settled = false;
+    /** Timer that kills the process if no output arrives within idleTimeoutMs. */
+    let idleTimer: NodeJS.Timeout | undefined;
+
+    const resetIdleTimer = () => {
+      if (!opts.idleTimeoutMs || opts.idleTimeoutMs <= 0) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        timedOut = true;
+        killTree(child);
+        setTimeout(forceFinish, 2000);
+      }, opts.idleTimeoutMs);
+    };
 
     const append = (target: 'out' | 'err') => (chunk: Buffer) => {
       const text = chunk.toString('utf8');
       if (target === 'out') stdout = cap(stdout + text);
       else stderr = cap(stderr + text);
       opts.onOutput?.(text, target === 'out' ? 'stdout' : 'stderr');
+      resetIdleTimer();
 
       // Buffer output for monitoring background/detached commands.
       const entry = runningCommands.get(child.pid ?? 0);
@@ -174,6 +202,7 @@ export function runShellCommand(
     /** Kill the child process tree and resolve as cancelled/terminated. */
     const onAbort = () => {
       killTree(child);
+      if (idleTimer) clearTimeout(idleTimer);
       if (!opts.detached) {
         setTimeout(forceFinish, 2000);
       } else if (!settled) {
@@ -237,10 +266,14 @@ export function runShellCommand(
       setTimeout(forceFinish, 2000);
     }, Math.max(500, opts.timeoutMs));
 
+    // Start the idle watchdog so a command that produces no output is killed.
+    resetIdleTimer();
+
     const finish = (exitCode: number | null, signal: NodeJS.Signals | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
       opts.signal?.removeEventListener('abort', onAbort);
       cleanupTracking();
       resolve({ exitCode, stdout, stderr, timedOut, signal, durationMs: Date.now() - started });
@@ -250,7 +283,10 @@ export function runShellCommand(
       stderr = cap(`${stderr}${stderr ? '\n' : ''}spawn error: ${err.message}`);
       finish(-1, null);
     });
-    child.on('close', (code, signal) => finish(code, signal));
+    // Use 'exit' instead of 'close': 'close' waits for all stdio streams to
+    // close, which never happens if a grandchild inherits and holds stdout.
+    // 'exit' fires as soon as the process terminates, which is what we need.
+    child.on('exit', (code, signal) => finish(code, signal));
   });
 }
 
@@ -309,6 +345,9 @@ export const runCommandTool: Tool<{
    *  When omitted, detached servers run indefinitely and are never auto-killed.
    *  Only applies when detached is true. */
   detached_timeout_ms?: number;
+  /** Kill the command if no stdout/stderr output arrives within this many ms.
+   *  When omitted, no idle watchdog is used. */
+  idle_timeout_ms?: number;
 }> = {
   name: 'run_command',
   description:
@@ -327,6 +366,10 @@ export const runCommandTool: Tool<{
       detached_timeout_ms: {
         type: 'number',
         description: 'Auto-kill detached process after this many ms. When omitted, detached servers run indefinitely.',
+      },
+      idle_timeout_ms: {
+        type: 'number',
+        description: 'Kill the command if no stdout/stderr output arrives within this many ms.',
       },
     },
     required: ['command'],
@@ -410,6 +453,7 @@ export const runCommandTool: Tool<{
       signal: ctx.signal,
       detached,
       detached_timeout_ms: args.detached_timeout_ms,
+      idleTimeoutMs: args.idle_timeout_ms,
     });
 
     const parts: string[] = [];
