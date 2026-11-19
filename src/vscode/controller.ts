@@ -1292,8 +1292,6 @@ export class HarnessController {
       if (this.session?.taskListStore) {
         this.taskListItems = this.session.taskListStore.list();
       }
-      // Auto-start execution so the user doesn't need to run /start_implementation separately.
-      await this.startImplementation();
     } finally {
       this.setStatus('idle', false);
     }
