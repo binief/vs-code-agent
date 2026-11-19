@@ -1242,7 +1242,9 @@ export class HarnessSession {
     } finally {
       this.busy = false;
       this.controller = undefined;
-      this.taskList = undefined;
+      // Keep the task list alive after the task ends so /edit_task and
+      // /verify_tasks can still read and modify task items. Only reset
+      // per-run approval state.
       this.currentOnEvent = undefined;
       this.taskListApproved = false;
       // If a stream was interrupted before the provider returned, preserve
