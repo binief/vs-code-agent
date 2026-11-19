@@ -2,7 +2,7 @@
   "name": "coding-harness",
   "displayName": "Coding Harness",
   "description": "A tool harness for VS Code: file create/edit/search, shell commands and MCP tools, with context about the environment and workspace. Project instructions come from your agent.md files.",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "publisher": "binief",
   "license": "MIT",
   "repository": {
@@ -326,7 +326,7 @@
         },
         "codingHarness.taskList.enabled": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "markdownDescription": "Always make the `task_list` tool available (regardless of agent.md `tools:` declaration) and instruct the model to maintain a task list for every long-running task. Shown in the panel strip and saved in the chat JSON."
         },
         "codingHarness.decomposition.enabled": {
