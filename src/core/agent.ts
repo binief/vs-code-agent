@@ -353,7 +353,29 @@ export class HarnessSession {
     }
 
     if (signal?.aborted) return;
-    if (relevantFiles.size === 0) return;
+    if (relevantFiles.size === 0) {
+      // No relevant files found — create a single fallback task item so the
+      // user still gets a task list they can work with instead of silence.
+      if (!this.taskList) {
+        this.taskList = new TaskListStore();
+      }
+      this.taskList.add(`Task: ${prompt}`);
+      this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
+      const items = this.taskList?.list() ?? [];
+      if (items.length > 0) {
+        const decision = await this.waitForTaskListApproval(items);
+        if (decision === 'reject') {
+          this.taskList?.clear();
+          this.currentOnEvent?.({ type: 'task-list', items: [] });
+          return;
+        }
+        if (decision === 'edit') {
+          this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
+        }
+        this.taskListApproved = true;
+      }
+      return;
+    }
 
     // Deterministic ordering.
     const files = Array.from(relevantFiles)
@@ -395,7 +417,29 @@ export class HarnessSession {
     }
     if (current.files.length > 0) slices.push(current);
 
-    if (slices.length === 0) return;
+    if (slices.length === 0) {
+      // Slicing produced nothing (e.g. context window too small). Create a
+      // single fallback task item so the user still gets a task list.
+      if (!this.taskList) {
+        this.taskList = new TaskListStore();
+      }
+      this.taskList.add(`Task: ${prompt}`);
+      this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
+      const items = this.taskList?.list() ?? [];
+      if (items.length > 0) {
+        const decision = await this.waitForTaskListApproval(items);
+        if (decision === 'reject') {
+          this.taskList?.clear();
+          this.currentOnEvent?.({ type: 'task-list', items: [] });
+          return;
+        }
+        if (decision === 'edit') {
+          this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
+        }
+        this.taskListApproved = true;
+      }
+      return;
+    }
 
     // Ensure the task list store exists (it may not be initialized when
     // decomposeProject is called directly, e.g. via /create_tasks slash command).
@@ -554,8 +598,11 @@ export class HarnessSession {
     }
     // Reset server-side compaction counter for this task.
     this.serverSideCompactionCount = 0;
-    // Reset task list approval state for this task run.
-    this.taskListApproved = false;
+    // Reset task list approval state for this task run, unless it was already
+    // approved (e.g. via /create_tasks → decomposeProject → waitForTaskListApproval).
+    if (!this.taskListApproved) {
+      this.taskListApproved = false;
+    }
     this.currentOnEvent = onEvent;
     const host = this.deps.host;
 
