@@ -1279,6 +1279,11 @@ export class HarnessController {
       void vscode.window.showWarningMessage('Coding Harness session could not be created.');
       return;
     }
+    // Wire up the event handler so the task-list approval modal can be shown
+    // when decomposeProject is called directly (not through runTask).
+    this.session.setOnEvent((event) => {
+      this.handleEvent('id' in event ? { ...event, id: `${this.id()}:${event.id}` } : event);
+    });
     this.setStatus('thinking', true);
     try {
       await this.session.decomposeProject(trimmed);

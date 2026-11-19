@@ -216,6 +216,13 @@ export class HarnessSession {
     this.lastAllowedTools = undefined;
   }
 
+  /** Set the event callback used when `decomposeProject` is called directly
+   *  (e.g. from /create_tasks) instead of through `runTask`. Required so the
+   *  task-list approval modal can be shown to the user. */
+  setOnEvent(onEvent: (event: import('./types').HarnessEvent) => void): void {
+    this.currentOnEvent = onEvent;
+  }
+
   /**
    * Emits a task-list approval request and waits for the user to approve,
    * reject, or edit the proposed task list.

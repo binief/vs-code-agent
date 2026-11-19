@@ -2237,17 +2237,18 @@ body.dragging .composer-box {
 /* Commands menu dropdown */
 .cmd-menu {
   position: absolute;
-  top: 100%;
+  bottom: 100%;
   left: 0;
+  top: auto;
   max-width: 400px;
   max-height: 240px;
   overflow-y: auto;
   background: var(--vscode-dropdown-background, #1e1e1e);
   border: 1px solid var(--vscode-dropdown-border, #3c3c3c);
   border-radius: var(--radius-sm);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.4);
   z-index: 1000;
-  margin-top: 4px;
+  margin-bottom: 4px;
   padding: 4px 0;
 }
 .cmd-menu-item {
