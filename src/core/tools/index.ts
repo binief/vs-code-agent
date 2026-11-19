@@ -5,6 +5,7 @@ import {
   runCommandTool,
   runShellCommand,
   getRunningCommands,
+  getRunningCommandOutput,
   killRunningCommand,
   killAllRunningCommands,
   getDetachedProcesses,
@@ -89,6 +90,7 @@ export { searchTextTool };
 export { runCommandTool, runShellCommand };
 export {
   getRunningCommands,
+  getRunningCommandOutput,
   killRunningCommand,
   killAllRunningCommands,
   getDetachedProcesses,

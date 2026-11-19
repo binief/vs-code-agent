@@ -13,6 +13,7 @@ import {
   createDefaultTools,
   ToolRegistry,
   getRunningCommands,
+  getRunningCommandOutput,
   killRunningCommand,
   killAllRunningCommands,
   getDetachedProcesses,
@@ -1793,6 +1794,11 @@ export class HarnessController {
   /** Returns info about all currently running shell commands (detached and non-detached). */
   getRunningCommands(): RunningCommandInfo[] {
     return getRunningCommands();
+  }
+
+  /** Returns recent output lines for a running command, for monitoring. */
+  getRunningCommandOutput(pid: number): string[] {
+    return getRunningCommandOutput(pid);
   }
 
   /** Kills a running command by PID. Returns true if found and killed. */
