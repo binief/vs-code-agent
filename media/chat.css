@@ -2038,6 +2038,36 @@ body.dragging .composer-box {
   list-style: none;
   margin: 0;
   padding: 0;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.task-strip.collapsed .task-strip-items {
+  display: none;
+}
+
+.task-strip-toggle {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+}
+
+.task-strip-toggle:hover {
+  background: var(--surface-2);
+  color: var(--vscode-foreground);
+}
+
+.task-strip.collapsed .task-strip-toggle::before {
+  content: "▼";
+}
+
+.task-strip-toggle::before {
+  content: "▲";
 }
 
 .task-item {

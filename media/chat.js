@@ -64,6 +64,7 @@
   const btnCompactDismiss = document.getElementById('btn-compact-dismiss');
   const taskStrip = document.getElementById('task-strip');
   const taskStripItems = document.getElementById('task-strip-items');
+  const taskStripToggle = document.getElementById('task-strip-toggle');
   const attachments = document.getElementById('attachments');
   const btnAttach = document.getElementById('btn-attach');
   const fileInput = document.getElementById('file-input');
@@ -1840,6 +1841,12 @@
     fileInput.addEventListener('change', () => {
       for (const file of fileInput.files || []) stageFile(file);
       fileInput.value = '';
+    });
+  }
+
+  if (taskStripToggle) {
+    taskStripToggle.addEventListener('click', () => {
+      taskStrip.classList.toggle('collapsed');
     });
   }
 
