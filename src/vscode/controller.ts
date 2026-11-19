@@ -1259,13 +1259,10 @@ export class HarnessController {
 
   /* --------------------------------------------------------------- slash commands */
 
-  /** Create task list items from a prompt (slash command /create_tasks). */
+  /** Create task list items from a prompt (slash command /create_tasks).
+   *  Works as the first prompt — no active session required. */
   async createTasks(prompt: string): Promise<void> {
     await this.whenReady();
-    if (!this.session) {
-      void vscode.window.showWarningMessage('Coding Harness session is not ready. Start a task first.');
-      return;
-    }
     const trimmed = prompt.trim();
     if (!trimmed) {
       void vscode.window.showWarningMessage('Provide a prompt after /create_tasks.');
@@ -1274,6 +1271,12 @@ export class HarnessController {
     const config = this.readConfig();
     if (!config.taskListEnabled) {
       void vscode.window.showWarningMessage('Enable codingHarness.taskList.enabled in settings to use /create_tasks.');
+      return;
+    }
+    // Ensure a session exists so decomposeProject has a task list store to write to.
+    await this.ensureSession();
+    if (!this.session) {
+      void vscode.window.showWarningMessage('Coding Harness session could not be created.');
       return;
     }
     this.setStatus('thinking', true);
@@ -1321,10 +1324,6 @@ export class HarnessController {
   /** Start implementing pending task list items (slash command /start_implementation). */
   async startImplementation(): Promise<void> {
     await this.whenReady();
-    if (!this.session) {
-      void vscode.window.showWarningMessage('Coding Harness session is not ready.');
-      return;
-    }
     const config = this.readConfig();
     if (!config.taskListEnabled) {
       void vscode.window.showWarningMessage('Enable codingHarness.taskList.enabled in settings to use /start_implementation.');
