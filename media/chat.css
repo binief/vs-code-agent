@@ -2202,3 +2202,73 @@ body.dragging .composer-box {
   from { transform: translateX(-50%) translateY(-20px); opacity: 0; }
   to { transform: translateX(-50%) translateY(0); opacity: 1; }
 }
+
+/* Slash command autocomplete dropdown */
+.cmd-list {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--vscode-dropdown-background, #1e1e1e);
+  border: 1px solid var(--vscode-dropdown-border, #3c3c3c);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  z-index: 1000;
+  margin-top: 4px;
+}
+.cmd-item {
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--vscode-foreground, #cccccc);
+  border-bottom: 1px solid var(--vscode-dropdown-border, #3c3c3c);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cmd-item:last-child {
+  border-bottom: none;
+}
+.cmd-item.selected {
+  background: var(--vscode-list-activeSelectionBackground, #373737);
+  color: var(--vscode-list-activeSelectionForeground, #ffffff);
+}
+.cmd-item .cmd-name {
+  font-weight: bold;
+  color: var(--vscode-textLink-foreground, #3794ff);
+  white-space: nowrap;
+}
+.cmd-item .cmd-desc {
+  color: var(--vscode-descriptionForeground, #858585);
+  margin-left: 8px;
+  font-size: 12px;
+}
+.cmd-list[hidden] {
+  display: none;
+}
+
+/* Slash command message bubble */
+.msg.command {
+  background: var(--vscode-input-background, #252525);
+  border: 1px solid var(--vscode-input-border, #3c3c3c);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  margin: 4px 0;
+  font-size: 13px;
+  color: var(--vscode-foreground, #cccccc);
+}
+.msg.command .command-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.msg.command .command-name {
+  font-weight: bold;
+  color: var(--vscode-textLink-foreground, #3794ff);
+  white-space: nowrap;
+}
+.msg.command .command-prompt {
+  color: var(--vscode-descriptionForeground, #858585);
+}

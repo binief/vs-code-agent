@@ -12,6 +12,7 @@
      set inherits currentColor, so it follows the active theme. -->
 <svg class="sprite" width="0" height="0" aria-hidden="true" focusable="false">
   <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3.5v9M3.5 8h9"/></symbol>
+  <symbol id="i-slash" viewBox="0 0 16 16"><path d="M2 4l12 8M2 12l12-4" stroke="currentColor" stroke-width="2" fill="none"/></symbol>
   <symbol id="i-file" viewBox="0 0 16 16"><path d="M4 2.5h4.4L12 6.1v7.4H4z"/><path d="M8.4 2.5v3.6H12"/><path d="M5.8 9.2h4.4M5.8 11.4h3"/></symbol>
   <symbol id="i-plug" viewBox="0 0 16 16"><path d="M5.6 2.5v3M10.4 2.5v3"/><path d="M4 5.5h8v1.9a4 4 0 0 1-8 0z"/><path d="M8 11.4v2.1"/></symbol>
   <symbol id="i-archive" viewBox="0 0 16 16"><path d="M2.6 5.6h10.8v7.8H2.6z"/><path d="M2 2.6h12v3H2z"/><path d="M6.4 8.6h3.2"/></symbol>
@@ -168,6 +169,13 @@
     <div class="attachments" id="attachments" hidden></div>
     <div class="composer-box">
       <textarea id="input" rows="1" placeholder="Describe a task, ask a question, or paste a screenshot…" spellcheck="false" aria-label="Message"></textarea>
+      <div class="cmd-list" id="cmd-list" hidden>
+        <div class="cmd-item" data-cmd="create_tasks">/<span class="cmd-name">create_tasks</span> <span class="cmd-desc">Create task list items from a prompt</span></div>
+        <div class="cmd-item" data-cmd="edit_task">/<span class="cmd-name">edit_task</span> <span class="cmd-desc">Edit a task item (status=done)</span></div>
+        <div class="cmd-item" data-cmd="start_implementation">/<span class="cmd-name">start_implementation</span> <span class="cmd-desc">Start working through pending tasks</span></div>
+        <div class="cmd-item" data-cmd="refresh_tasklist">/<span class="cmd-name">refresh_tasklist</span> <span class="cmd-desc">Re-sync task list to panel</span></div>
+        <div class="cmd-item" data-cmd="verify_tasks">/<span class="cmd-name">verify_tasks</span> <span class="cmd-desc">Verify task list against file changes</span></div>
+      </div>
       <div class="composer-bar">
         <div class="composer-tools">
           <button type="button" class="tool-btn" id="btn-attach" title="Attach an image (or paste one)">
