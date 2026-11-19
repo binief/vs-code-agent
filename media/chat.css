@@ -1486,6 +1486,7 @@ body.dragging .composer-box {
 .composer-box {
   display: flex;
   flex-direction: column;
+  position: relative;
   border: 1px solid var(--vscode-input-border, var(--border));
   border-radius: var(--radius);
   background: var(--vscode-input-background);
@@ -2233,12 +2234,12 @@ body.dragging .composer-box {
   to { transform: translateX(-50%) translateY(0); opacity: 1; }
 }
 
-/* Slash command autocomplete dropdown */
-.cmd-list {
+/* Commands menu dropdown */
+.cmd-menu {
   position: absolute;
   top: 100%;
   left: 0;
-  right: 0;
+  max-width: 400px;
   max-height: 240px;
   overflow-y: auto;
   background: var(--vscode-dropdown-background, #1e1e1e);
@@ -2247,9 +2248,10 @@ body.dragging .composer-box {
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
   z-index: 1000;
   margin-top: 4px;
+  padding: 4px 0;
 }
-.cmd-item {
-  padding: 8px 12px;
+.cmd-menu-item {
+  padding: 6px 12px;
   cursor: pointer;
   font-size: 13px;
   color: var(--vscode-foreground, #cccccc);
@@ -2258,24 +2260,23 @@ body.dragging .composer-box {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.cmd-item:last-child {
+.cmd-menu-item:last-child {
   border-bottom: none;
 }
-.cmd-item.selected {
-  background: var(--vscode-list-activeSelectionBackground, #373737);
-  color: var(--vscode-list-activeSelectionForeground, #ffffff);
+.cmd-menu-item:hover {
+  background: var(--vscode-list-hoverBackground, #373737);
 }
-.cmd-item .cmd-name {
+.cmd-menu-item .cmd-name {
   font-weight: bold;
   color: var(--vscode-textLink-foreground, #3794ff);
   white-space: nowrap;
 }
-.cmd-item .cmd-desc {
+.cmd-menu-item .cmd-desc {
   color: var(--vscode-descriptionForeground, #858585);
   margin-left: 8px;
   font-size: 12px;
 }
-.cmd-list[hidden] {
+.cmd-menu[hidden] {
   display: none;
 }
 
