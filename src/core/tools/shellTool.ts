@@ -6,6 +6,8 @@ import { resolveWorkspacePath } from '../paths';
 import { fail, ok, type Tool } from '../types';
 
 const MAX_OUTPUT_CHARS = 20_000;
+/** Max number of output lines to keep per running command for monitoring. */
+const MAX_OUTPUT_LINES = 200;
 
 /** No default timeout for detached commands — servers run indefinitely.
  *  Set `detached_timeout_ms` explicitly if you want auto-kill behavior. */
@@ -18,18 +20,31 @@ export interface RunningCommandInfo {
   cwd: string;
   startedAt: number;
   detached: boolean;
+  /** Most recent output lines (capped), for monitoring background commands. */
+  outputLines: string[];
+}
+
+/** Internal tracking entry: child process plus buffered output. */
+interface RunningCommandEntry {
+  child: ReturnType<typeof spawn>;
+  info: RunningCommandInfo;
+  /** Accumulator for incomplete lines that span chunks. */
+  outputBuffer: string;
 }
 
 /** Tracks currently running shell commands (both detached and non-detached)
  *  so they can be listed or killed when they hang. */
-const runningCommands = new Map<
-  number,
-  { child: ReturnType<typeof spawn>; info: RunningCommandInfo }
->();
+const runningCommands = new Map<number, RunningCommandEntry>();
 
 /** Returns info about all currently running shell commands. */
 export function getRunningCommands(): RunningCommandInfo[] {
   return [...runningCommands.values()].map((entry) => entry.info);
+}
+
+/** Returns the most recent output lines for a running command (capped). */
+export function getRunningCommandOutput(pid: number): string[] {
+  const entry = runningCommands.get(pid);
+  return entry ? [...entry.info.outputLines] : [];
 }
 
 /** Kills a running command by PID. Returns true if found and killed. */
@@ -103,6 +118,24 @@ export function runShellCommand(
       if (target === 'out') stdout = cap(stdout + text);
       else stderr = cap(stderr + text);
       opts.onOutput?.(text, target === 'out' ? 'stdout' : 'stderr');
+
+      // Buffer output for monitoring background/detached commands.
+      const entry = runningCommands.get(child.pid ?? 0);
+      if (entry) {
+        entry.outputBuffer += text;
+        const lines = entry.outputBuffer.split('\n');
+        // Everything before the last fragment is a complete line.
+        for (let i = 0; i < lines.length - 1; i++) {
+          const line = lines[i].trimEnd();
+          if (line) {
+            entry.info.outputLines.push(`[${target}] ${line}`);
+            if (entry.info.outputLines.length > MAX_OUTPUT_LINES) {
+              entry.info.outputLines.shift();
+            }
+          }
+        }
+        entry.outputBuffer = lines[lines.length - 1];
+      }
     };
 
     child.stdout?.on('data', append('out'));
@@ -122,10 +155,19 @@ export function runShellCommand(
       cwd: opts.cwd,
       startedAt: started,
       detached: opts.detached === true,
+      outputLines: [],
     };
-    runningCommands.set(child.pid ?? 0, { child, info });
+    runningCommands.set(child.pid ?? 0, { child, info, outputBuffer: '' });
 
     const cleanupTracking = () => {
+      // Flush any remaining partial line before removing from tracking.
+      const entry = runningCommands.get(child.pid ?? 0);
+      if (entry && entry.outputBuffer.trim()) {
+        entry.info.outputLines.push(`[stdout] ${entry.outputBuffer.trim()}`);
+        if (entry.info.outputLines.length > MAX_OUTPUT_LINES) {
+          entry.info.outputLines.shift();
+        }
+      }
       runningCommands.delete(child.pid ?? 0);
     };
 

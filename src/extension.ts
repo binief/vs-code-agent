@@ -156,7 +156,7 @@ function registerCommands(
       }
       const lines = processes.map(
         (p) =>
-          `PID ${p.pid}${p.detached ? ' [detached]' : ''}: ${p.command} (cwd: ${p.cwd}, started ${new Date(p.startedAt).toLocaleTimeString()})`,
+          `PID ${p.pid}${p.detached ? ' [detached]' : ''}: ${p.command} (cwd: ${p.cwd}, started ${new Date(p.startedAt).toLocaleTimeString()})${p.outputLines.length ? ` · ${p.outputLines.length} output line(s)` : ''}`,
       );
       void vscode.window.showInformationMessage(
         `Running shell commands (${processes.length}):\\n${lines.join('\\n')}`,
@@ -213,6 +213,43 @@ function registerCommands(
         return;
       }
       void vscode.window.showInformationMessage(`Stopped ${count} running command(s).`);
+    }),
+
+    vscode.commands.registerCommand('codingHarness.showCommandOutput', async () => {
+      await chatView.reveal();
+      const processes = controller.getRunningCommands();
+      if (processes.length === 0) {
+        void vscode.window.showInformationMessage('No shell commands are currently running.');
+        return;
+      }
+
+      const pick = processes.map((p) => ({
+        label: `PID ${p.pid}${p.detached ? ' [detached]' : ''}`,
+        description: p.command,
+        detail: `${p.outputLines.length} output line(s) · cwd: ${p.cwd}`,
+        pid: p.pid,
+      }));
+
+      const selected = await vscode.window.showQuickPick(pick, {
+        title: 'Coding Harness — view command output',
+        placeHolder: 'Choose a command to see its recent output.',
+      });
+      if (!selected) return;
+
+      const output = controller.getRunningCommandOutput(selected.pid);
+      if (output.length === 0) {
+        void vscode.window.showInformationMessage(
+          `No output captured yet for PID ${selected.pid}.`,
+        );
+        return;
+      }
+
+      const content = output.join('\n');
+      const doc = await vscode.workspace.openTextDocument({
+        content,
+        language: 'log',
+      });
+      await vscode.window.showTextDocument(doc, { preview: false, preserveFocus: false });
     }),
 
     vscode.commands.registerCommand('codingHarness.selectCopilotModel', async () => {
