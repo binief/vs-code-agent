@@ -117,7 +117,7 @@ export function evaluateCommand(
   // safe pattern are treated as safe infrastructure operations under auto-safe.
   // E.g. "start /b ... && timeout /t 12 && netstat ... | findstr ..."
   // Splits on command separators but not on redirection operators like 2>&1.
-  const parts = cmd.split(/(?:^|[^&< >])[;&|](?:[^&< >]|$)/);
+  const parts = cmd.split(/\s*[;&|]\s*/);
   const allPartsSafe =
     parts.length > 1 &&
     parts.every((p) => {
