@@ -274,6 +274,8 @@ function toolsSection(config: HarnessConfig, tools: ToolSpec[]): string {
     '',
     'Tool behaviour comes from the extension, not from this message: edits are checkpointed and can be reverted; ' +
       `writes follow editPolicy=${config.editPolicy}; shell commands follow commandPolicy=${config.commandPolicy}.`,
+      ' Long-running servers (e.g. `mvn spring-boot:run`, `npm run dev`, `java -jar app.jar`) should use `detached: true` ' +
+      'so the command returns immediately instead of blocking the task.',
   );
   return lines.join('\n');
 }

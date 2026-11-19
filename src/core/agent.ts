@@ -583,6 +583,11 @@ export class HarnessSession {
     this.inputCalibration = 1;
     this.lastSystemPrompt = '';
     this.lastAllowedTools = undefined;
+    // Clear the task list so a reset starts fresh.
+    this.taskList = undefined;
+    this.pendingTaskList = undefined;
+    this.taskListApproved = false;
+    this.taskListApprovalResolve = undefined;
   }
 
   cancel(): void {
@@ -884,7 +889,7 @@ export class HarnessSession {
         }
         if (!result.compacted) {
           // Retry only after the conversation has grown, not on every step.
-          autoCompactRetryAt = this.history.length + taskMessages.length + 2;
+          autoCompactRetryAt = this.history.length + taskMessages.length + 10;
           onEvent({ type: 'notice', message: `Could not compact conversation: ${result.summary} Original context was retained.`, level: 'warn' });
           return false;
         }
@@ -893,7 +898,7 @@ export class HarnessSession {
         const targetNote = result.targetMet === false ? ' The estimated target was not met; fixed context or images may still exceed the window.' : '';
         const lengthNote = result.usedLongerSummary ? ' A completed reducing summary exceeded the requested length; the best available summary was used.' : '';
         const localNote = result.strategy === 'local' ? ` Local excerpts are lossy and may omit important details. ${result.fallbackReason ?? ''}` : '';
-        if (result.targetMet === false) autoCompactRetryAt = this.history.length + taskMessages.length + 2;
+        if (result.targetMet === false) autoCompactRetryAt = this.history.length + taskMessages.length + 10;
         onEvent({ type: 'notice', message: `${result.strategy === 'local' ? 'Local fallback' : 'LLM'} compacted conversation: removed ${result.removedMessages} messages, saved approximately ${result.originalTokens - result.newTokens} tokens.${lengthNote}${targetNote}${localNote}`, level: result.strategy === 'local' || result.targetMet === false || result.usedLongerSummary ? 'warn' : 'info' });
         host.log('info', `${result.strategy === 'local' ? 'Local fallback' : 'LLM'} compaction: ${result.originalTokens} -> ${result.newTokens} estimated tokens`);
         return true;
@@ -928,6 +933,8 @@ export class HarnessSession {
             this.taskList.list(),
           );
           if (decision === 'reject') {
+            this.taskList?.clear();
+            onEvent({ type: 'task-list', items: [] });
             outcome = 'cancelled';
             break;
           }
@@ -1523,10 +1530,6 @@ export class HarnessSession {
 
     try {
       const result = await tool.run(args, context);
-      // Broadcast the current task list so the panel strip stays in sync.
-      if ((call.name === 'task_list' || call.name === 'task_decompose') && result.ok && this.taskList) {
-        onEvent({ type: 'task-list', items: this.taskList.list() });
-      }
       return finish(result);
     } catch (err) {
       const message = (err as Error).message;
@@ -1536,6 +1539,12 @@ export class HarnessSession {
         content: `Tool "${call.name}" failed: ${message}`,
         summary: `error: ${message.slice(0, 80)}`,
       });
+    } finally {
+      // Broadcast the current task list so the panel strip stays in sync,
+      // even when the call failed (e.g. unknown task item id).
+      if ((call.name === 'task_list' || call.name === 'task_decompose') && this.taskList) {
+        onEvent({ type: 'task-list', items: this.taskList.list() });
+      }
     }
   }
 }
