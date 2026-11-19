@@ -535,10 +535,13 @@ export class HarnessSession {
     const signal = this.controller.signal;
     this.lastSystemPrompt = '';
     this.lastAllowedTools = undefined;
-    // Fresh per-task task list; cleared when the task ends.
-    this.taskList = new TaskListStore();
+    // Per-task task list. Preserve any items already created (e.g. by
+    // /create_tasks via decomposeProject) instead of discarding them.
+    if (!this.taskList) {
+      this.taskList = new TaskListStore();
+    }
     // Seed the list from a restored chat so saved task items survive reloads.
-    if (this.pendingTaskList) {
+    if (this.pendingTaskList && this.taskList.list().length === 0) {
       this.taskList.restore(this.pendingTaskList);
       this.pendingTaskList = undefined;
     }
