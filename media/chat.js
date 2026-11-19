@@ -42,6 +42,8 @@
   const chipStream = document.getElementById('chip-stream');
   const chipThinking = document.getElementById('chip-thinking');
   const hintUsage = document.getElementById('hint-usage');
+  const cmdList = document.getElementById('cmd-list');
+  let cmdSelectedIndex = -1;
   const activityBox = document.getElementById('activity');
   const activityText = document.getElementById('activity-text');
   const activityDetail = document.getElementById('activity-detail');
@@ -62,6 +64,7 @@
   const btnCompactDismiss = document.getElementById('btn-compact-dismiss');
   const taskStrip = document.getElementById('task-strip');
   const taskStripItems = document.getElementById('task-strip-items');
+  const taskStripToggle = document.getElementById('task-strip-toggle');
   const attachments = document.getElementById('attachments');
   const btnAttach = document.getElementById('btn-attach');
   const fileInput = document.getElementById('file-input');
@@ -937,6 +940,8 @@
         return renderThinking(item);
       case 'notice':
         return renderNotice(item);
+      case 'command':
+        return renderCommand(item);
       case 'tool':
         return renderTool(item);
       case 'approval':
@@ -1025,6 +1030,21 @@
     node.dataset.id = item.id;
     node.appendChild(icon(item.level === 'error' || item.level === 'warn' ? 'warn' : 'info'));
     node.appendChild(el('div', 'notice-text', (item.source === 'subagent' ? 'Subagent · ' : '') + item.message));
+    return node;
+  }
+
+  function renderCommand(item) {
+    const node = el('div', 'msg command');
+    node.dataset.id = item.id;
+    node.appendChild(icon('slash'));
+    const body = el('div', 'command-body');
+    const name = el('span', 'command-name', '/' + item.name);
+    body.appendChild(name);
+    if (item.args && item.args.prompt) {
+      const prompt = el('span', 'command-prompt', ' — ' + item.args.prompt);
+      body.appendChild(prompt);
+    }
+    node.appendChild(body);
     return node;
   }
 
@@ -1223,7 +1243,6 @@
     if (taskListApprovalModal) return; // already showing
     const modal = el('div', 'modal task-list-approval-modal');
     modal.innerHTML = `
-      <div class="modal-backdrop"></div>
       <div class="modal-card task-list-approval-card">
         <div class="modal-head">
           <span class="modal-title">Approve task list?</span>
@@ -1246,13 +1265,11 @@
         </div>
       </div>
     `;
-    const backdrop = modal.querySelector('.modal-backdrop');
     const closeBtn = modal.querySelector('.modal-close');
     const respond = (decision) => {
       hideTaskListApproval();
       vscode.postMessage({ type: 'task-list-approval-response', decision });
     };
-    backdrop.addEventListener('click', () => respond('reject'));
     closeBtn.addEventListener('click', () => respond('reject'));
     modal.querySelectorAll('[data-action]').forEach((btn) => {
       btn.addEventListener('click', () => respond(btn.dataset.action));
@@ -1609,6 +1626,14 @@
     if (value.startsWith('/')) {
       const parsed = parseSlashCommand(value);
       if (parsed) {
+        // Show a command message bubble so the user sees feedback.
+        const cmdItem = {
+          id: 'cmd-' + Date.now(),
+          kind: 'command',
+          name: parsed.name,
+          args: parsed.args,
+        };
+        addItem(cmdItem, true);
         vscode.postMessage({ type: 'command', ...parsed });
         clearAttachments();
         if (text === undefined) {
@@ -1634,16 +1659,137 @@
     autoScroll(true);
   }
 
-  btnSend.addEventListener('click', () => submit());
+  /* ------------------------------------------------------ slash command autocomplete */
+
+  const CMD_COMMANDS = [
+    { cmd: 'create_tasks', desc: 'Create task list items from a prompt', usage: '<prompt>' },
+    { cmd: 'edit_task', desc: 'Edit a task item', usage: '<id> status=done|title=...' },
+    { cmd: 'start_implementation', desc: 'Start working through pending tasks', usage: '' },
+    { cmd: 'refresh_tasklist', desc: 'Re-sync task list to panel', usage: '' },
+    { cmd: 'verify_tasks', desc: 'Verify task list against file changes', usage: '' },
+  ];
+
+  function showCmdList(filter) {
+    if (!cmdList) return;
+    cmdList.innerHTML = '';
+    let matchCount = 0;
+    for (const c of CMD_COMMANDS) {
+      const label = '/' + c.cmd + (c.usage ? ' ' + c.usage : '');
+      if (filter && !label.toLowerCase().includes(filter.toLowerCase())) continue;
+      const div = document.createElement('div');
+      div.className = 'cmd-item';
+      div.dataset.cmd = c.cmd;
+      div.innerHTML = '<span class="cmd-name">' + c.cmd + '</span> <span class="cmd-desc">' + c.desc + '</span>';
+      div.title = label;
+      cmdList.appendChild(div);
+      matchCount++;
+    }
+    cmdList.hidden = matchCount === 0;
+    cmdSelectedIndex = -1;
+  }
+
+  function selectCmdItem(index) {
+    if (!cmdList) return;
+    const items = cmdList.querySelectorAll('.cmd-item');
+    items.forEach((el, i) => {
+      el.classList.toggle('selected', i === index);
+    });
+    if (items[index]) {
+      items[index].scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function insertCmd(name, usage) {
+    if (!cmdList) return;
+    const items = cmdList.querySelectorAll('.cmd-item');
+    let selected = '';
+    items.forEach((el) => {
+      if (el.classList.contains('selected')) selected = el.dataset.cmd;
+    });
+    const chosen = selected || name;
+    const suffix = usage ? ' ' : '';
+    input.value = '/' + chosen + suffix;
+    input.focus();
+    cmdList.hidden = true;
+    cmdSelectedIndex = -1;
+    input.style.height = 'auto';
+    input.style.height = Math.min(200, input.scrollHeight) + 'px';
+  }
+
+  function hideCmdList() {
+    if (cmdList) cmdList.hidden = true;
+    cmdSelectedIndex = -1;
+  }
+
+  /* Wire up command list clicks */
+  if (cmdList) {
+    cmdList.addEventListener('mousedown', (event) => {
+      const item = event.target.closest('.cmd-item');
+      if (!item) return;
+      event.preventDefault();
+      const name = item.dataset.cmd;
+      const c = CMD_COMMANDS.find((x) => x.cmd === name);
+      if (c) insertCmd(name, c.usage);
+    });
+  }
+
+  /* Close dropdown when clicking elsewhere */
+  document.addEventListener('mousedown', (event) => {
+    if (cmdList && !cmdList.hidden && !cmdList.contains(event.target) && event.target !== input) {
+      hideCmdList();
+    }
+  });
+
+  btnSend.addEventListener('click', () => {
+    hideCmdList();
+    submit();
+  });
   input.addEventListener('keydown', (event) => {
+    if (cmdList && !cmdList.hidden) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        cmdSelectedIndex = Math.min(cmdSelectedIndex + 1, cmdList.querySelectorAll('.cmd-item').length - 1);
+        selectCmdItem(cmdSelectedIndex);
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        cmdSelectedIndex = Math.max(cmdSelectedIndex - 1, -1);
+        selectCmdItem(cmdSelectedIndex);
+        return;
+      }
+      if (event.key === 'Enter') {
+        const items = cmdList.querySelectorAll('.cmd-item');
+        if (cmdSelectedIndex >= 0 && items[cmdSelectedIndex]) {
+          event.preventDefault();
+          const name = items[cmdSelectedIndex].dataset.cmd;
+          const c = CMD_COMMANDS.find((x) => x.cmd === name);
+          if (c) insertCmd(name, c.usage);
+          return;
+        }
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        hideCmdList();
+        return;
+      }
+    }
     if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
       event.preventDefault();
       submit();
     }
   });
   input.addEventListener('input', () => {
+    const value = input.value;
     input.style.height = 'auto';
     input.style.height = Math.min(200, input.scrollHeight) + 'px';
+    if (cmdList) {
+      if (value.startsWith('/')) {
+        showCmdList(value.slice(1));
+      } else {
+        hideCmdList();
+      }
+    }
   });
 
   /* Pasting a screenshot: the clipboard carries it as an image/* item, which we
@@ -1695,6 +1841,12 @@
     fileInput.addEventListener('change', () => {
       for (const file of fileInput.files || []) stageFile(file);
       fileInput.value = '';
+    });
+  }
+
+  if (taskStripToggle) {
+    taskStripToggle.addEventListener('click', () => {
+      taskStrip.classList.toggle('collapsed');
     });
   }
 
@@ -2326,9 +2478,7 @@
           else if (contextWindow && contextTokens) contextPercent = (contextTokens / contextWindow) * 100;
 
           if (hintUsage) {
-            const total = cumulativeUsage.totalTokens || 0;
-            const speed = currentSpeed > 0 ? ' · ' + currentSpeed.toFixed(1) + ' tok/s' : '';
-            hintUsage.textContent = (step ? 'step ' + step + ' · ' : '') + total + ' tokens' + speed;
+            hintUsage.textContent = '';
           }
           updateTokenChips();
         }
