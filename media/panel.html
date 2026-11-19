@@ -170,13 +170,6 @@
     <div class="attachments" id="attachments" hidden></div>
     <div class="composer-box">
       <textarea id="input" rows="1" placeholder="Describe a task, ask a question, or paste a screenshot…" spellcheck="false" aria-label="Message"></textarea>
-      <div class="cmd-list" id="cmd-list" hidden>
-        <div class="cmd-item" data-cmd="create_tasks">/<span class="cmd-name">create_tasks</span> <span class="cmd-desc">Create task list items from a prompt</span></div>
-        <div class="cmd-item" data-cmd="edit_task">/<span class="cmd-name">edit_task</span> <span class="cmd-desc">Edit a task item (status=done)</span></div>
-        <div class="cmd-item" data-cmd="start_implementation">/<span class="cmd-name">start_implementation</span> <span class="cmd-desc">Start working through pending tasks</span></div>
-        <div class="cmd-item" data-cmd="refresh_tasklist">/<span class="cmd-name">refresh_tasklist</span> <span class="cmd-desc">Re-sync task list to panel</span></div>
-        <div class="cmd-item" data-cmd="verify_tasks">/<span class="cmd-name">verify_tasks</span> <span class="cmd-desc">Verify task list against file changes</span></div>
-      </div>
       <div class="composer-bar">
         <div class="composer-tools">
           <button type="button" class="tool-btn" id="btn-attach" title="Attach an image (or paste one)">
@@ -185,6 +178,16 @@
           <button type="button" class="tool-btn" id="btn-selection" title="Insert the current editor selection">
             <svg class="icon" aria-hidden="true"><use href="#i-code"></use></svg><span>Selection</span>
           </button>
+          <button type="button" class="tool-btn" id="btn-commands" title="Show available commands">
+            <svg class="icon" aria-hidden="true"><use href="#i-slash"></use></svg><span>/</span>
+          </button>
+          <div class="cmd-menu" id="cmd-menu" hidden>
+            <div class="cmd-menu-item" data-cmd="create_tasks" data-usage="<prompt>">/<span class="cmd-name">create_tasks</span> <span class="cmd-desc">Create task list items from a prompt</span></div>
+            <div class="cmd-menu-item" data-cmd="edit_task" data-usage="<id> status=done|title=...">/<span class="cmd-name">edit_task</span> <span class="cmd-desc">Edit a task item</span></div>
+            <div class="cmd-menu-item" data-cmd="start_implementation" data-usage="">/<span class="cmd-name">start_implementation</span> <span class="cmd-desc">Start working through pending tasks</span></div>
+            <div class="cmd-menu-item" data-cmd="refresh_tasklist" data-usage="">/<span class="cmd-name">refresh_tasklist</span> <span class="cmd-desc">Re-sync task list to panel</span></div>
+            <div class="cmd-menu-item" data-cmd="verify_tasks" data-usage="">/<span class="cmd-name">verify_tasks</span> <span class="cmd-desc">Verify task list against file changes</span></div>
+          </div>
           <input type="file" id="file-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden />
         </div>
         <span class="hint-usage" id="hint-usage"></span>

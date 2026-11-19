@@ -42,8 +42,6 @@
   const chipStream = document.getElementById('chip-stream');
   const chipThinking = document.getElementById('chip-thinking');
   const hintUsage = document.getElementById('hint-usage');
-  const cmdList = document.getElementById('cmd-list');
-  let cmdSelectedIndex = -1;
   const activityBox = document.getElementById('activity');
   const activityText = document.getElementById('activity-text');
   const activityDetail = document.getElementById('activity-detail');
@@ -1612,39 +1610,25 @@
         if (k === 'status') args.status = v;
         else if (k === 'title') args.title = v;
       }
-    } else if (name === 'start_implementation' || name === 'refresh_tasklist' || name === 'verify_tasks') {
-      // no args needed
-    } else {
-      return null; // unknown command — fall through to normal submit
     }
     return { name, args };
   }
 
   function submit(text) {
     const value = (text !== undefined ? text : input.value).trim();
-    // Slash commands: /create_tasks, /edit_task, /start_implementation, /refresh_tasklist
+    // Slash commands: /create_tasks, /edit_task, /start_implementation, /refresh_tasklist, /verify_tasks
     if (value.startsWith('/')) {
       const parsed = parseSlashCommand(value);
-      if (parsed) {
-        // Show a command message bubble so the user sees feedback.
-        const cmdItem = {
-          id: 'cmd-' + Date.now(),
-          kind: 'command',
-          name: parsed.name,
-          args: parsed.args,
-        };
-        addItem(cmdItem, true);
-        vscode.postMessage({ type: 'command', ...parsed });
-        clearAttachments();
-        if (text === undefined) {
-          input.value = '';
-          input.style.height = 'auto';
-        }
-        stickToBottom = true;
-        autoScroll(true);
-        return;
+      if (!parsed) return; // unknown command — fall through to normal submit
+      vscode.postMessage({ type: 'command', ...parsed });
+      clearAttachments();
+      if (text === undefined) {
+        input.value = '';
+        input.style.height = 'auto';
       }
-      // Unknown slash command: fall through to normal submit.
+      stickToBottom = true;
+      autoScroll(true);
+      return;
     }
     // An image on its own is a valid prompt ("what is wrong in this screenshot?").
     if ((!value && pending.length === 0) || busy) return;
@@ -1659,7 +1643,7 @@
     autoScroll(true);
   }
 
-  /* ------------------------------------------------------ slash command autocomplete */
+  /* ------------------------------------------------------ commands menu button */
 
   const CMD_COMMANDS = [
     { cmd: 'create_tasks', desc: 'Create task list items from a prompt', usage: '<prompt>' },
@@ -1669,111 +1653,70 @@
     { cmd: 'verify_tasks', desc: 'Verify task list against file changes', usage: '' },
   ];
 
-  function showCmdList(filter) {
-    if (!cmdList) return;
-    cmdList.innerHTML = '';
-    let matchCount = 0;
+  const cmdMenu = document.getElementById('cmd-menu');
+  const btnCommands = document.getElementById('btn-commands');
+
+  function showCmdMenu() {
+    if (!cmdMenu) return;
+    cmdMenu.innerHTML = '';
     for (const c of CMD_COMMANDS) {
-      const label = '/' + c.cmd + (c.usage ? ' ' + c.usage : '');
-      if (filter && !label.toLowerCase().includes(filter.toLowerCase())) continue;
       const div = document.createElement('div');
-      div.className = 'cmd-item';
+      div.className = 'cmd-menu-item';
       div.dataset.cmd = c.cmd;
+      div.dataset.usage = c.usage;
       div.innerHTML = '<span class="cmd-name">' + c.cmd + '</span> <span class="cmd-desc">' + c.desc + '</span>';
-      div.title = label;
-      cmdList.appendChild(div);
-      matchCount++;
+      div.title = '/' + c.cmd + (c.usage ? ' ' + c.usage : '');
+      cmdMenu.appendChild(div);
     }
-    cmdList.hidden = matchCount === 0;
-    cmdSelectedIndex = -1;
+    cmdMenu.hidden = false;
+    cmdMenu.focus();
   }
 
-  function selectCmdItem(index) {
-    if (!cmdList) return;
-    const items = cmdList.querySelectorAll('.cmd-item');
-    items.forEach((el, i) => {
-      el.classList.toggle('selected', i === index);
-    });
-    if (items[index]) {
-      items[index].scrollIntoView({ block: 'nearest' });
-    }
+  function hideCmdMenu() {
+    if (cmdMenu) cmdMenu.hidden = true;
   }
 
-  function insertCmd(name, usage) {
-    if (!cmdList) return;
-    const items = cmdList.querySelectorAll('.cmd-item');
-    let selected = '';
-    items.forEach((el) => {
-      if (el.classList.contains('selected')) selected = el.dataset.cmd;
-    });
-    const chosen = selected || name;
-    const suffix = usage ? ' ' : '';
-    input.value = '/' + chosen + suffix;
+  function pasteCmd(cmd, usage) {
+    input.value = '/' + cmd + (usage ? ' ' : '');
     input.focus();
-    cmdList.hidden = true;
-    cmdSelectedIndex = -1;
+    hideCmdMenu();
     input.style.height = 'auto';
     input.style.height = Math.min(200, input.scrollHeight) + 'px';
   }
 
-  function hideCmdList() {
-    if (cmdList) cmdList.hidden = true;
-    cmdSelectedIndex = -1;
-  }
-
-  /* Wire up command list clicks */
-  if (cmdList) {
-    cmdList.addEventListener('mousedown', (event) => {
-      const item = event.target.closest('.cmd-item');
-      if (!item) return;
-      event.preventDefault();
-      const name = item.dataset.cmd;
-      const c = CMD_COMMANDS.find((x) => x.cmd === name);
-      if (c) insertCmd(name, c.usage);
+  if (btnCommands) {
+    btnCommands.addEventListener('click', (event) => {
+      event.stopPropagation();
+      if (cmdMenu && !cmdMenu.hidden) {
+        hideCmdMenu();
+      } else {
+        showCmdMenu();
+      }
     });
   }
 
-  /* Close dropdown when clicking elsewhere */
+  if (cmdMenu) {
+    cmdMenu.addEventListener('mousedown', (event) => {
+      const item = event.target.closest('.cmd-menu-item');
+      if (!item) return;
+      event.preventDefault();
+      const cmd = item.dataset.cmd;
+      const usage = item.dataset.usage;
+      if (cmd) pasteCmd(cmd, usage);
+    });
+  }
+
   document.addEventListener('mousedown', (event) => {
-    if (cmdList && !cmdList.hidden && !cmdList.contains(event.target) && event.target !== input) {
-      hideCmdList();
+    if (cmdMenu && !cmdMenu.hidden && !cmdMenu.contains(event.target) && event.target !== btnCommands) {
+      hideCmdMenu();
     }
   });
 
   btnSend.addEventListener('click', () => {
-    hideCmdList();
+    hideCmdMenu();
     submit();
   });
   input.addEventListener('keydown', (event) => {
-    if (cmdList && !cmdList.hidden) {
-      if (event.key === 'ArrowDown') {
-        event.preventDefault();
-        cmdSelectedIndex = Math.min(cmdSelectedIndex + 1, cmdList.querySelectorAll('.cmd-item').length - 1);
-        selectCmdItem(cmdSelectedIndex);
-        return;
-      }
-      if (event.key === 'ArrowUp') {
-        event.preventDefault();
-        cmdSelectedIndex = Math.max(cmdSelectedIndex - 1, -1);
-        selectCmdItem(cmdSelectedIndex);
-        return;
-      }
-      if (event.key === 'Enter') {
-        const items = cmdList.querySelectorAll('.cmd-item');
-        if (cmdSelectedIndex >= 0 && items[cmdSelectedIndex]) {
-          event.preventDefault();
-          const name = items[cmdSelectedIndex].dataset.cmd;
-          const c = CMD_COMMANDS.find((x) => x.cmd === name);
-          if (c) insertCmd(name, c.usage);
-          return;
-        }
-      }
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        hideCmdList();
-        return;
-      }
-    }
     if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
       event.preventDefault();
       submit();
@@ -1783,13 +1726,7 @@
     const value = input.value;
     input.style.height = 'auto';
     input.style.height = Math.min(200, input.scrollHeight) + 'px';
-    if (cmdList) {
-      if (value.startsWith('/')) {
-        showCmdList(value.slice(1));
-      } else {
-        hideCmdList();
-      }
-    }
+    hideCmdMenu();
   });
 
   /* Pasting a screenshot: the clipboard carries it as an image/* item, which we
