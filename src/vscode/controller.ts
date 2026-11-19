@@ -1287,6 +1287,13 @@ export class HarnessController {
     this.setStatus('thinking', true);
     try {
       await this.session.decomposeProject(trimmed);
+      // Sync task list items from the session store so startImplementation
+      // sees the items decomposeProject just created.
+      if (this.session?.taskListStore) {
+        this.taskListItems = this.session.taskListStore.list();
+      }
+      // Auto-start execution so the user doesn't need to run /start_implementation separately.
+      await this.startImplementation();
     } finally {
       this.setStatus('idle', false);
     }
@@ -1333,6 +1340,12 @@ export class HarnessController {
     if (!config.taskListEnabled) {
       void vscode.window.showWarningMessage('Enable codingHarness.taskList.enabled in settings to use /start_implementation.');
       return;
+    }
+    // Ensure a session exists and sync task list items from the session store
+    // so items created by /create_tasks (via decomposeProject) are visible here.
+    await this.ensureSession();
+    if (this.session?.taskListStore) {
+      this.taskListItems = this.session.taskListStore.list();
     }
     const pending = this.taskListItems.filter((i) => i.status !== 'done');
     if (pending.length === 0) {
