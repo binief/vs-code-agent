@@ -171,6 +171,23 @@ export function runShellCommand(
       runningCommands.delete(child.pid ?? 0);
     };
 
+    /** Kill the child process tree and resolve as cancelled/terminated. */
+    const onAbort = () => {
+      killTree(child);
+      if (!opts.detached) {
+        setTimeout(forceFinish, 2000);
+      } else if (!settled) {
+        settled = true;
+        opts.signal?.removeEventListener('abort', onAbort);
+        cleanupTracking();
+        resolve({ exitCode: null, stdout, stderr, timedOut: false, signal: 'SIGKILL', durationMs: Date.now() - started });
+      }
+    };
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
+    // Guard against a race where the signal aborts between the pre-spawn
+    // aborted check and the listener registration above.
+    if (opts.signal?.aborted) onAbort();
+
     if (opts.detached === true) {
       // Detached mode: resolve after a short delay so initial output can be
       // captured, without waiting for background child processes to exit.
@@ -201,6 +218,7 @@ export function runShellCommand(
       child.on('close', () => {
         cleanupTracking();
         if (timeoutTimer) clearTimeout(timeoutTimer);
+        opts.signal?.removeEventListener('abort', onAbort);
       });
 
       setTimeout(() => {
@@ -218,15 +236,6 @@ export function runShellCommand(
       killTree(child);
       setTimeout(forceFinish, 2000);
     }, Math.max(500, opts.timeoutMs));
-
-    const onAbort = () => {
-      killTree(child);
-      setTimeout(forceFinish, 2000);
-    };
-    opts.signal?.addEventListener('abort', onAbort, { once: true });
-    // Guard against a race where the signal aborts between the pre-spawn
-    // aborted check and the listener registration above.
-    if (opts.signal?.aborted) onAbort();
 
     const finish = (exitCode: number | null, signal: NodeJS.Signals | null) => {
       if (settled) return;
@@ -253,24 +262,27 @@ function cap(text: string): string {
 function killTree(child: ReturnType<typeof spawn>): void {
   if (child.pid === undefined) return;
   try {
-    // Kill the child (shell) process directly first. On POSIX this sends
-    // SIGTERM; on Windows it calls TerminateProcess. This is the primary
-    // kill path so the shell is always targeted even if the process-group
-    // kill below fails silently.
-    child.kill();
+    // SIGKILL cannot be caught or ignored, so it is the only reliable way
+    // to stop the shell and force it to release its child processes.
+    child.kill('SIGKILL');
     if (process.platform === 'win32') {
       // Clean up the process tree (e.g. a Java process started via `start /b`)
       // with taskkill /T /F so no orphaned server processes survive.
       spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
     } else {
-      // Kill the entire process group (shell + all child processes such as
-      // a Maven daemon or Node server spawned by the shell). SIGKILL cannot
-      // be caught, so this is the most reliable way to stop everything.
+      // Kill the entire process group (shell + all grandchildren such as
+      // a Maven daemon or Node server spawned by the shell). Use a positive
+      // PID first in case -pid is not a valid process group ID, then fall
+      // back to the negated process-group kill.
+      try {
+        process.kill(child.pid, 'SIGKILL');
+      } catch {
+        /* child may already be gone */
+      }
       try {
         process.kill(-child.pid, 'SIGKILL');
       } catch {
-        // Process group may not exist if the child is not a group leader;
-        // child.kill() above may have been sufficient.
+        /* process group may not exist; child.kill('SIGKILL') above was tried */
       }
     }
   } catch {
