@@ -2356,3 +2356,34 @@ body.dragging .composer-box {
   color: var(--vscode-foreground, #cccccc);
   margin: 0;
 }
+
+.cmd-menu-item.cmd-focused {
+  background: var(--vscode-list-activeSelectionBackground, #0e639c);
+  color: var(--vscode-list-activeSelectionForeground, #ffffff);
+}
+
+/* Slash command message bubble status styling */
+.msg.command.command-pending {
+  border-color: var(--vscode-input-border, #3c3c3c);
+  opacity: 0.85;
+}
+.msg.command.command-done {
+  border-color: var(--vscode-input-validation-infoBorder, #3c3c3c);
+  opacity: 0.9;
+}
+.msg.command.command-error {
+  border-color: var(--vscode-input-validation-errorBorder, #871f1f);
+  opacity: 0.9;
+}
+
+.command-detail {
+  color: var(--vscode-descriptionForeground, #858585);
+  font-size: 12px;
+  margin-left: 6px;
+}
+
+.command-result-msg {
+  color: var(--vscode-descriptionForeground, #858585);
+  font-size: 12px;
+  margin-left: 6px;
+}
