@@ -315,6 +315,14 @@ export const runCommandTool: Tool<{
     const timeoutMs = Math.max(1000, Math.min(args.timeout_ms ?? ctx.config.commandTimeoutMs, 10 * 60_000));
     ctx.host.log('info', `run_command${verdict.decision === 'allow' ? ' (auto)' : ''}: ${args.command} [cwd=${cwd.rel}]`);
 
+    // Notify the user that a command is running and how to stop it if it hangs.
+    // This is shown for every non-detached command so the user always has a
+    // way to manually stop a long-running command.
+    ctx.host.notify?.(
+      `Command running: ${args.command}\nUse "Coding Harness: Stop Running Commands" to stop it if it takes too long.`,
+      'info',
+    );
+
     // Warn when a command looks like a long-running server but detached is not set,
     // so the user knows it may block the task until stopped.
     const LONG_RUNNING = /\\b(mvn|maven|gradle|mvnw|gradlew|java|node|python|python3|ruby|php|dotnet)\\b/;
