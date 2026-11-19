@@ -1317,14 +1317,19 @@ export class HarnessController {
       void vscode.window.showWarningMessage('Nothing to update. Use status=done or title=...');
       return;
     }
+    // Ensure a session exists so the task list store is available.
+    await this.ensureSession();
     const store = this.session?.taskListStore;
     if (!store) {
-      void vscode.window.showWarningMessage('No task list available.');
+      void vscode.window.showWarningMessage('No task list available. Use /create_tasks to create some first.');
       return;
     }
     const updated = store.update(id, patch);
     if (!updated) {
-      void vscode.window.showWarningMessage(`Unknown task item id "${id}".`);
+      const availableIds = store.list().map((i) => i.id).join(', ');
+      void vscode.window.showWarningMessage(
+        `Unknown task item id "${id}". Available: ${availableIds || 'none'}.`,
+      );
       return;
     }
     this.taskListItems = store.list();
