@@ -1242,7 +1242,6 @@
     if (taskListApprovalModal) return; // already showing
     const modal = el('div', 'modal task-list-approval-modal');
     modal.innerHTML = `
-      <div class="modal-backdrop"></div>
       <div class="modal-card task-list-approval-card">
         <div class="modal-head">
           <span class="modal-title">Approve task list?</span>
@@ -1265,13 +1264,11 @@
         </div>
       </div>
     `;
-    const backdrop = modal.querySelector('.modal-backdrop');
     const closeBtn = modal.querySelector('.modal-close');
     const respond = (decision) => {
       hideTaskListApproval();
       vscode.postMessage({ type: 'task-list-approval-response', decision });
     };
-    backdrop.addEventListener('click', () => respond('reject'));
     closeBtn.addEventListener('click', () => respond('reject'));
     modal.querySelectorAll('[data-action]').forEach((btn) => {
       btn.addEventListener('click', () => respond(btn.dataset.action));

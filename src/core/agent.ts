@@ -390,11 +390,17 @@ export class HarnessSession {
 
     if (slices.length === 0) return;
 
+    // Ensure the task list store exists (it may not be initialized when
+    // decomposeProject is called directly, e.g. via /create_tasks slash command).
+    if (!this.taskList) {
+      this.taskList = new TaskListStore();
+    }
+
     // Create task_list items for each slice.
     for (let i = 0; i < slices.length; i += 1) {
       const slice = slices[i];
       const title = `Slice ${i + 1}/${slices.length}: ${slice.files.length} file(s), ~${slice.tokens.toLocaleString()} tokens`;
-      this.taskList?.add(title);
+      this.taskList.add(title);
     }
 
     // Emit task list for the panel strip.
