@@ -120,6 +120,8 @@ export class HarnessSession {
   private serverSideCompactionCount = 0;
   /** Whether the task list has been approved by the user this task run. */
   private taskListApproved = false;
+  /** Snapshot of the task list at approval time, used to detect changes across task runs. */
+  private taskListApprovedSnapshot: TaskItem[] | undefined = undefined;
   /** Resolver for the pending task-list approval promise. */
   private taskListApprovalResolve?: (decision: 'approve' | 'reject' | 'edit') => void;
   /** The onEvent callback active during the current runTask call. */
@@ -218,6 +220,11 @@ export class HarnessSession {
   /** Set the task list approval state (used when session is recreated). */
   setTaskListApprovedFlag(approved: boolean): void {
     this.taskListApproved = approved;
+    if (approved) {
+      this.taskListApprovedSnapshot = [...(this.taskList?.list() ?? [])];
+    } else {
+      this.taskListApprovedSnapshot = undefined;
+    }
   }
 
   updateConfig(config: HarnessConfig): void {
@@ -423,6 +430,13 @@ export class HarnessSession {
       this.taskList = new TaskListStore();
     }
 
+    // If the task list was already approved, clear approval since we're
+    // adding new tasks — the user should re-approve the updated list.
+    if (this.taskListApproved) {
+      this.taskListApproved = false;
+      this.taskListApprovedSnapshot = undefined;
+    }
+
     // Create task_list items for each slice.
     for (let i = 0; i < slices.length; i += 1) {
       const slice = slices[i];
@@ -499,6 +513,13 @@ export class HarnessSession {
       }
 
       if (!Array.isArray(items)) return;
+
+      // If the task list was already approved, clear approval since we're
+      // adding new tasks — the user should re-approve the updated list.
+      if (this.taskListApproved) {
+        this.taskListApproved = false;
+        this.taskListApprovedSnapshot = undefined;
+      }
 
       for (const item of items) {
         if (item && typeof item.title === 'string' && item.title.trim()) {
@@ -669,8 +690,24 @@ export class HarnessSession {
     // Reset server-side compaction counter for this task.
     this.serverSideCompactionCount = 0;
     // Reset task list approval state for this task run, unless it was already
-    // approved (e.g. via /create_tasks → decomposeProject → waitForTaskListApproval).
-    if (!this.taskListApproved) {
+    // approved AND the task list hasn't changed since approval. If new tasks
+    // were added or existing ones modified, re-approval is required.
+    if (this.taskListApproved && this.taskListApprovedSnapshot) {
+      const snapshot = this.taskListApprovedSnapshot;
+      const current = this.taskList.list();
+      const same =
+        current.length === snapshot.length &&
+        current.every(
+          (item, i) =>
+            item.id === snapshot[i].id &&
+            item.title === snapshot[i].title &&
+            item.status === snapshot[i].status,
+        );
+      if (!same) {
+        this.taskListApproved = false;
+        this.taskListApprovedSnapshot = undefined;
+      }
+    } else {
       this.taskListApproved = false;
     }
     this.currentOnEvent = onEvent;
@@ -1544,6 +1581,12 @@ export class HarnessSession {
       // even when the call failed (e.g. unknown task item id).
       if ((call.name === 'task_list' || call.name === 'task_decompose') && this.taskList) {
         onEvent({ type: 'task-list', items: this.taskList.list() });
+      }
+      // If task decomposition modified the list after approval, clear approval
+      // so the user re-approves the updated list on the next step.
+      if (call.name === 'task_decompose' && this.taskListApproved) {
+        this.taskListApproved = false;
+        this.taskListApprovedSnapshot = undefined;
       }
     }
   }
