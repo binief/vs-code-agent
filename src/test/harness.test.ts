@@ -402,6 +402,35 @@ test('run_command reports exit codes, output and refuses dangerous commands', as
   assert.equal(host.approvals.length, 1, 'destructive commands must ask first');
 });
 
+test('run_command does not hang on commands waiting for stdin', async () => {
+  const root = makeTempWorkspace();
+  const ctx = makeContext(root, new FakeHost(root), { commandPolicy: 'auto-safe' });
+
+  // cat with no arguments reads from stdin; with stdin=ignore it gets EOF immediately.
+  const start = Date.now();
+  const res = await runCommandTool.run({ command: 'cat' }, ctx);
+  const elapsed = Date.now() - start;
+
+  // Should return quickly (not hang indefinitely waiting for input).
+  assert.ok(elapsed < 5000, `cat should return quickly, took ${elapsed}ms`);
+  assert.equal(res.ok, true);
+});
+
+test('run_command kills idle command after idle_timeout_ms', async () => {
+  const root = makeTempWorkspace();
+  const ctx = makeContext(root, new FakeHost(root), { commandPolicy: 'auto-safe' });
+
+  // sleep produces no output; idle watchdog should kill it before the full 10s.
+  const start = Date.now();
+  const res = await runCommandTool.run({ command: 'sleep 10', idle_timeout_ms: 1000 }, ctx);
+  const elapsed = Date.now() - start;
+
+  // Should be killed by idle watchdog, not run for full 10 seconds.
+  assert.ok(elapsed < 5000, `sleep should be killed by idle watchdog, took ${elapsed}ms`);
+  assert.equal(res.ok, false);
+  assert.match(res.content, /timed out/);
+});
+
 test('run_command respects cwd inside the workspace and rejects escapes', async () => {
   const root = makeTempWorkspace({ 'sub/.keep': '' });
   const ctx = makeContext(root, new FakeHost(root));
