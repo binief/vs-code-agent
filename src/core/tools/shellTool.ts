@@ -7,8 +7,9 @@ import { fail, ok, type Tool } from '../types';
 
 const MAX_OUTPUT_CHARS = 20_000;
 
-/** Default timeout for detached commands: 2 minutes. */
-export const DETACHED_DEFAULT_TIMEOUT_MS = 120_000;
+/** No default timeout for detached commands — servers run indefinitely.
+ *  Set `detached_timeout_ms` explicitly if you want auto-kill behavior. */
+export const DETACHED_DEFAULT_TIMEOUT_MS: number | undefined = undefined;
 
 /** Tracks currently running detached processes so they can be listed or killed. */
 export interface DetachedProcessInfo {
@@ -103,24 +104,28 @@ export function runShellCommand(
     if (opts.detached === true) {
       // Detached mode: resolve after a short delay so initial output can be
       // captured, without waiting for background child processes to exit.
-      const detachedTimeoutMs = opts.detached_timeout_ms ?? DETACHED_DEFAULT_TIMEOUT_MS;
-      const timeoutTimer = setTimeout(() => {
-        // Auto-kill detached process after timeout so it doesn't run forever.
-        killTree(child);
-        detachedProcesses.delete(child.pid ?? 0);
-        if (!settled) {
-          settled = true;
-          opts.signal?.removeEventListener('abort', onAbort);
-          resolve({
-            exitCode: null,
-            stdout,
-            stderr: `${stderr}\n[detached process killed after ${detachedTimeoutMs}ms timeout]`,
-            timedOut: true,
-            signal: 'SIGKILL',
-            durationMs: Date.now() - started,
-          });
-        }
-      }, detachedTimeoutMs);
+      // Servers run indefinitely — auto-kill only when detached_timeout_ms
+      // is explicitly set by the caller.
+      let timeoutTimer: NodeJS.Timeout | undefined;
+      if (opts.detached_timeout_ms !== undefined) {
+        timeoutTimer = setTimeout(() => {
+          // Auto-kill detached process after explicit timeout.
+          killTree(child);
+          detachedProcesses.delete(child.pid ?? 0);
+          if (!settled) {
+            settled = true;
+            opts.signal?.removeEventListener('abort', onAbort);
+            resolve({
+              exitCode: null,
+              stdout,
+              stderr: `${stderr}\n[detached process killed after ${opts.detached_timeout_ms}ms timeout]`,
+              timedOut: true,
+              signal: 'SIGKILL',
+              durationMs: Date.now() - started,
+            });
+          }
+        }, opts.detached_timeout_ms);
+      }
 
       const info: DetachedProcessInfo = {
         pid: child.pid ?? 0,
@@ -133,7 +138,7 @@ export function runShellCommand(
       // Clean up from tracking when the process exits on its own.
       child.on('close', () => {
         detachedProcesses.delete(child.pid ?? 0);
-        clearTimeout(timeoutTimer);
+        if (timeoutTimer) clearTimeout(timeoutTimer);
       });
 
       setTimeout(() => {
@@ -214,7 +219,8 @@ export const runCommandTool: Tool<{
    *  detached from the harness. */
   detached?: boolean;
   /** Auto-kill the detached process after this many milliseconds.
-   *  Defaults to 120000 (2 minutes). Only applies when detached is true. */
+   *  When omitted, detached servers run indefinitely and are never auto-killed.
+   *  Only applies when detached is true. */
   detached_timeout_ms?: number;
 }> = {
   name: 'run_command',
