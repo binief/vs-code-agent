@@ -12,9 +12,13 @@ import { apiKeyFromEnv, createProvider } from '../core/providers';
 import {
   createDefaultTools,
   ToolRegistry,
+  getRunningCommands,
+  killRunningCommand,
+  killAllRunningCommands,
   getDetachedProcesses,
   killDetachedProcess,
   killAllDetachedProcesses,
+  type RunningCommandInfo,
 } from '../core/tools';
 import { resolveAgentToolPolicy } from '../core/toolPolicy';
 import { McpManager, sanitizeMcpServers } from '../core/tools/mcp';
@@ -1764,7 +1768,7 @@ export class HarnessController {
   /* ------------------------------------------------------ detached processes */
 
   /** Returns info about all currently running detached (background) processes. */
-  getDetachedProcesses(): import('../core/tools/shellTool').DetachedProcessInfo[] {
+  getDetachedProcesses(): RunningCommandInfo[] {
     return getDetachedProcesses();
   }
 
@@ -1776,6 +1780,23 @@ export class HarnessController {
   /** Kills all running detached processes. Returns the count killed. */
   killAllDetachedProcesses(): number {
     return killAllDetachedProcesses();
+  }
+
+  /* ------------------------------------------------------ running commands */
+
+  /** Returns info about all currently running shell commands (detached and non-detached). */
+  getRunningCommands(): RunningCommandInfo[] {
+    return getRunningCommands();
+  }
+
+  /** Kills a running command by PID. Returns true if found and killed. */
+  killRunningCommand(pid: number): boolean {
+    return killRunningCommand(pid);
+  }
+
+  /** Kills all running shell commands. Returns the count killed. */
+  killAllRunningCommands(): number {
+    return killAllRunningCommands();
   }
 
   /* ------------------------------------------------------ agent instructions */

@@ -4,11 +4,14 @@ import { searchTextTool } from './searchTools';
 import {
   runCommandTool,
   runShellCommand,
+  getRunningCommands,
+  killRunningCommand,
+  killAllRunningCommands,
   getDetachedProcesses,
   killDetachedProcess,
   killAllDetachedProcesses,
   DETACHED_DEFAULT_TIMEOUT_MS,
-  type DetachedProcessInfo,
+  type RunningCommandInfo,
 } from './shellTool';
 import { taskListTool } from './taskList';
 import { taskDecomposeTool } from './taskDecompose';
@@ -84,7 +87,15 @@ export { createFileTool, deleteFileTool, listFilesTool, readFileTool, replaceInF
 export { getDiagnosticsTool, openFileTool };
 export { searchTextTool };
 export { runCommandTool, runShellCommand };
-export { getDetachedProcesses, killDetachedProcess, killAllDetachedProcesses, DETACHED_DEFAULT_TIMEOUT_MS };
-export type { DetachedProcessInfo };
+export {
+  getRunningCommands,
+  killRunningCommand,
+  killAllRunningCommands,
+  getDetachedProcesses,
+  killDetachedProcess,
+  killAllDetachedProcesses,
+  DETACHED_DEFAULT_TIMEOUT_MS,
+};
+export type { RunningCommandInfo };
 export { taskDecomposeTool };
 export { McpManager, McpClient } from './mcp';

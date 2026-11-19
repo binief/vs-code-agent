@@ -147,6 +147,33 @@ function registerCommands(
       void vscode.window.showInformationMessage(`Stopped ${count} detached background process(es).`);
     }),
 
+    vscode.commands.registerCommand('codingHarness.listRunningCommands', async () => {
+      await chatView.reveal();
+      const processes = controller.getRunningCommands();
+      if (processes.length === 0) {
+        void vscode.window.showInformationMessage('No shell commands are currently running.');
+        return;
+      }
+      const lines = processes.map(
+        (p) =>
+          `PID ${p.pid}${p.detached ? ' [detached]' : ''}: ${p.command} (cwd: ${p.cwd}, started ${new Date(p.startedAt).toLocaleTimeString()})`,
+      );
+      void vscode.window.showInformationMessage(
+        `Running shell commands (${processes.length}):\\n${lines.join('\\n')}`,
+        { modal: true },
+      );
+    }),
+
+    vscode.commands.registerCommand('codingHarness.stopRunningCommands', async () => {
+      await chatView.reveal();
+      const count = controller.killAllRunningCommands();
+      if (count === 0) {
+        void vscode.window.showInformationMessage('No shell commands to stop.');
+        return;
+      }
+      void vscode.window.showInformationMessage(`Stopped ${count} running command(s).`);
+    }),
+
     vscode.commands.registerCommand('codingHarness.selectCopilotModel', async () => {
       await controller.selectCopilotModel();
     }),

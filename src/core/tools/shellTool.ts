@@ -11,39 +11,50 @@ const MAX_OUTPUT_CHARS = 20_000;
  *  Set `detached_timeout_ms` explicitly if you want auto-kill behavior. */
 export const DETACHED_DEFAULT_TIMEOUT_MS: number | undefined = undefined;
 
-/** Tracks currently running detached processes so they can be listed or killed. */
-export interface DetachedProcessInfo {
+/** Info about a currently running shell command. */
+export interface RunningCommandInfo {
   pid: number;
   command: string;
   cwd: string;
   startedAt: number;
+  detached: boolean;
 }
 
-const detachedProcesses = new Map<number, { child: ReturnType<typeof spawn>; info: DetachedProcessInfo }>();
+/** Tracks currently running shell commands (both detached and non-detached)
+ *  so they can be listed or killed when they hang. */
+const runningCommands = new Map<
+  number,
+  { child: ReturnType<typeof spawn>; info: RunningCommandInfo }
+>();
 
-/** Returns info about all currently running detached processes. */
-export function getDetachedProcesses(): DetachedProcessInfo[] {
-  return [...detachedProcesses.values()].map((entry) => entry.info);
+/** Returns info about all currently running shell commands. */
+export function getRunningCommands(): RunningCommandInfo[] {
+  return [...runningCommands.values()].map((entry) => entry.info);
 }
 
-/** Kills a detached process by PID. Returns true if found and killed. */
-export function killDetachedProcess(pid: number): boolean {
-  const entry = detachedProcesses.get(pid);
+/** Kills a running command by PID. Returns true if found and killed. */
+export function killRunningCommand(pid: number): boolean {
+  const entry = runningCommands.get(pid);
   if (!entry) return false;
   killTree(entry.child);
-  detachedProcesses.delete(pid);
+  runningCommands.delete(pid);
   return true;
 }
 
-/** Kills all running detached processes. Returns the count killed. */
-export function killAllDetachedProcesses(): number {
-  const count = detachedProcesses.size;
-  for (const entry of detachedProcesses.values()) {
+/** Kills all running shell commands. Returns the count killed. */
+export function killAllRunningCommands(): number {
+  const count = runningCommands.size;
+  for (const entry of runningCommands.values()) {
     killTree(entry.child);
   }
-  detachedProcesses.clear();
+  runningCommands.clear();
   return count;
 }
+
+/** Backwards-compatible aliases for detached process management. */
+export const getDetachedProcesses = getRunningCommands;
+export const killDetachedProcess = killRunningCommand;
+export const killAllDetachedProcesses = killAllRunningCommands;
 
 export interface CommandOutput {
   exitCode: number | null;
@@ -64,6 +75,8 @@ export function runShellCommand(
     env?: NodeJS.ProcessEnv;
     detached?: boolean;
     detached_timeout_ms?: number;
+    /** Called incrementally with stdout/stderr text as it arrives. */
+    onOutput?: (text: string, stream: 'stdout' | 'stderr') => void;
   },
 ): Promise<CommandOutput> {
   return new Promise((resolve) => {
@@ -89,6 +102,7 @@ export function runShellCommand(
       const text = chunk.toString('utf8');
       if (target === 'out') stdout = cap(stdout + text);
       else stderr = cap(stderr + text);
+      opts.onOutput?.(text, target === 'out' ? 'stdout' : 'stderr');
     };
 
     child.stdout?.on('data', append('out'));
@@ -101,6 +115,20 @@ export function runShellCommand(
       }
     };
 
+    // Track the command so it can be listed/killed if it hangs.
+    const info: RunningCommandInfo = {
+      pid: child.pid ?? 0,
+      command,
+      cwd: opts.cwd,
+      startedAt: started,
+      detached: opts.detached === true,
+    };
+    runningCommands.set(child.pid ?? 0, { child, info });
+
+    const cleanupTracking = () => {
+      runningCommands.delete(child.pid ?? 0);
+    };
+
     if (opts.detached === true) {
       // Detached mode: resolve after a short delay so initial output can be
       // captured, without waiting for background child processes to exit.
@@ -111,7 +139,7 @@ export function runShellCommand(
         timeoutTimer = setTimeout(() => {
           // Auto-kill detached process after explicit timeout.
           killTree(child);
-          detachedProcesses.delete(child.pid ?? 0);
+          runningCommands.delete(child.pid ?? 0);
           if (!settled) {
             settled = true;
             opts.signal?.removeEventListener('abort', onAbort);
@@ -127,17 +155,9 @@ export function runShellCommand(
         }, opts.detached_timeout_ms);
       }
 
-      const info: DetachedProcessInfo = {
-        pid: child.pid ?? 0,
-        command,
-        cwd: opts.cwd,
-        startedAt: started,
-      };
-      detachedProcesses.set(child.pid ?? 0, { child, info });
-
       // Clean up from tracking when the process exits on its own.
       child.on('close', () => {
-        detachedProcesses.delete(child.pid ?? 0);
+        cleanupTracking();
         if (timeoutTimer) clearTimeout(timeoutTimer);
       });
 
@@ -171,6 +191,7 @@ export function runShellCommand(
       settled = true;
       clearTimeout(timer);
       opts.signal?.removeEventListener('abort', onAbort);
+      cleanupTracking();
       resolve({ exitCode, stdout, stderr, timedOut, signal, durationMs: Date.now() - started });
     };
 
@@ -237,7 +258,10 @@ export const runCommandTool: Tool<{
       timeout_ms: { type: 'number', description: 'Timeout in milliseconds. Defaults to the configured value (60s).' },
       purpose: { type: 'string', description: 'One short line telling the user why you are running this.' },
       detached: { type: 'boolean', description: 'Run in the background and return without waiting for completion.' },
-      detached_timeout_ms: { type: 'number', description: 'Auto-kill detached process after this many ms. Default 120000 (2 minutes).' },
+      detached_timeout_ms: {
+        type: 'number',
+        description: 'Auto-kill detached process after this many ms. When omitted, detached servers run indefinitely.',
+      },
     },
     required: ['command'],
   },
