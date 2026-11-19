@@ -9,7 +9,13 @@ import { estimateMessagesTokens } from '../core/compaction';
 import { agentFilesSummary, discoverAgentFiles, selectAgentFiles, type AgentFilesResult } from '../core/agentFiles';
 import { buildSystemPrompt, summarizeDiagnostics } from '../core/prompt';
 import { apiKeyFromEnv, createProvider } from '../core/providers';
-import { createDefaultTools, ToolRegistry } from '../core/tools';
+import {
+  createDefaultTools,
+  ToolRegistry,
+  getDetachedProcesses,
+  killDetachedProcess,
+  killAllDetachedProcesses,
+} from '../core/tools';
 import { resolveAgentToolPolicy } from '../core/toolPolicy';
 import { McpManager, sanitizeMcpServers } from '../core/tools/mcp';
 import {
@@ -1753,6 +1759,23 @@ export class HarnessController {
     this.pushNotice('info', `MCP settings saved (${toWorkspace ? 'workspace' : 'user'}): ${Object.keys(servers).length} server(s) configured.`);
     this.post({ type: 'mcp-settings-saved', ok: true });
     await this.postMcpSettings();
+  }
+
+  /* ------------------------------------------------------ detached processes */
+
+  /** Returns info about all currently running detached (background) processes. */
+  getDetachedProcesses(): import('../core/tools/shellTool').DetachedProcessInfo[] {
+    return getDetachedProcesses();
+  }
+
+  /** Kills a detached process by PID. Returns true if found and killed. */
+  killDetachedProcess(pid: number): boolean {
+    return killDetachedProcess(pid);
+  }
+
+  /** Kills all running detached processes. Returns the count killed. */
+  killAllDetachedProcesses(): number {
+    return killAllDetachedProcesses();
   }
 
   /* ------------------------------------------------------ agent instructions */

@@ -7,6 +7,43 @@ import { fail, ok, type Tool } from '../types';
 
 const MAX_OUTPUT_CHARS = 20_000;
 
+/** Default timeout for detached commands: 2 minutes. */
+export const DETACHED_DEFAULT_TIMEOUT_MS = 120_000;
+
+/** Tracks currently running detached processes so they can be listed or killed. */
+export interface DetachedProcessInfo {
+  pid: number;
+  command: string;
+  cwd: string;
+  startedAt: number;
+}
+
+const detachedProcesses = new Map<number, { child: ReturnType<typeof spawn>; info: DetachedProcessInfo }>();
+
+/** Returns info about all currently running detached processes. */
+export function getDetachedProcesses(): DetachedProcessInfo[] {
+  return [...detachedProcesses.values()].map((entry) => entry.info);
+}
+
+/** Kills a detached process by PID. Returns true if found and killed. */
+export function killDetachedProcess(pid: number): boolean {
+  const entry = detachedProcesses.get(pid);
+  if (!entry) return false;
+  killTree(entry.child);
+  detachedProcesses.delete(pid);
+  return true;
+}
+
+/** Kills all running detached processes. Returns the count killed. */
+export function killAllDetachedProcesses(): number {
+  const count = detachedProcesses.size;
+  for (const entry of detachedProcesses.values()) {
+    killTree(entry.child);
+  }
+  detachedProcesses.clear();
+  return count;
+}
+
 export interface CommandOutput {
   exitCode: number | null;
   stdout: string;
@@ -19,7 +56,14 @@ export interface CommandOutput {
 /** Runs a shell command and captures its output. Exported for tests. */
 export function runShellCommand(
   command: string,
-  opts: { cwd: string; timeoutMs: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv; detached?: boolean },
+  opts: {
+    cwd: string;
+    timeoutMs: number;
+    signal?: AbortSignal;
+    env?: NodeJS.ProcessEnv;
+    detached?: boolean;
+    detached_timeout_ms?: number;
+  },
 ): Promise<CommandOutput> {
   return new Promise((resolve) => {
     const started = Date.now();
@@ -59,6 +103,39 @@ export function runShellCommand(
     if (opts.detached === true) {
       // Detached mode: resolve after a short delay so initial output can be
       // captured, without waiting for background child processes to exit.
+      const detachedTimeoutMs = opts.detached_timeout_ms ?? DETACHED_DEFAULT_TIMEOUT_MS;
+      const timeoutTimer = setTimeout(() => {
+        // Auto-kill detached process after timeout so it doesn't run forever.
+        killTree(child);
+        detachedProcesses.delete(child.pid ?? 0);
+        if (!settled) {
+          settled = true;
+          opts.signal?.removeEventListener('abort', onAbort);
+          resolve({
+            exitCode: null,
+            stdout,
+            stderr: `${stderr}\n[detached process killed after ${detachedTimeoutMs}ms timeout]`,
+            timedOut: true,
+            signal: 'SIGKILL',
+            durationMs: Date.now() - started,
+          });
+        }
+      }, detachedTimeoutMs);
+
+      const info: DetachedProcessInfo = {
+        pid: child.pid ?? 0,
+        command,
+        cwd: opts.cwd,
+        startedAt: started,
+      };
+      detachedProcesses.set(child.pid ?? 0, { child, info });
+
+      // Clean up from tracking when the process exits on its own.
+      child.on('close', () => {
+        detachedProcesses.delete(child.pid ?? 0);
+        clearTimeout(timeoutTimer);
+      });
+
       setTimeout(() => {
         if (!settled) {
           settled = true;
@@ -136,6 +213,9 @@ export const runCommandTool: Tool<{
    *  Useful for starting long-running servers. The child keeps running
    *  detached from the harness. */
   detached?: boolean;
+  /** Auto-kill the detached process after this many milliseconds.
+   *  Defaults to 120000 (2 minutes). Only applies when detached is true. */
+  detached_timeout_ms?: number;
 }> = {
   name: 'run_command',
   description:
@@ -151,6 +231,7 @@ export const runCommandTool: Tool<{
       timeout_ms: { type: 'number', description: 'Timeout in milliseconds. Defaults to the configured value (60s).' },
       purpose: { type: 'string', description: 'One short line telling the user why you are running this.' },
       detached: { type: 'boolean', description: 'Run in the background and return without waiting for completion.' },
+      detached_timeout_ms: { type: 'number', description: 'Auto-kill detached process after this many ms. Default 120000 (2 minutes).' },
     },
     required: ['command'],
   },
@@ -214,7 +295,13 @@ export const runCommandTool: Tool<{
       );
     }
 
-    const result = await runShellCommand(args.command, { cwd: cwd.abs, timeoutMs, signal: ctx.signal, detached: args.detached });
+    const result = await runShellCommand(args.command, {
+      cwd: cwd.abs,
+      timeoutMs,
+      signal: ctx.signal,
+      detached: args.detached,
+      detached_timeout_ms: args.detached_timeout_ms,
+    });
 
     const parts: string[] = [];
     parts.push(`$ ${args.command}${cwd.rel === '.' ? '' : `   (cwd: ${cwd.rel})`}`);

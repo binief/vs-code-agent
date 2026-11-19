@@ -121,6 +121,32 @@ function registerCommands(
       await controller.revertLastTask();
     }),
 
+    vscode.commands.registerCommand('codingHarness.listDetachedProcesses', async () => {
+      await chatView.reveal();
+      const processes = controller.getDetachedProcesses();
+      if (processes.length === 0) {
+        void vscode.window.showInformationMessage('No detached background processes are running.');
+        return;
+      }
+      const lines = processes.map(
+        (p) => `PID ${p.pid}: ${p.command} (cwd: ${p.cwd}, started ${new Date(p.startedAt).toLocaleTimeString()})`,
+      );
+      void vscode.window.showInformationMessage(
+        `Detached background processes (${processes.length}):\n${lines.join('\n')}`,
+        { modal: true },
+      );
+    }),
+
+    vscode.commands.registerCommand('codingHarness.stopDetachedCommands', async () => {
+      await chatView.reveal();
+      const count = controller.killAllDetachedProcesses();
+      if (count === 0) {
+        void vscode.window.showInformationMessage('No detached background processes to stop.');
+        return;
+      }
+      void vscode.window.showInformationMessage(`Stopped ${count} detached background process(es).`);
+    }),
+
     vscode.commands.registerCommand('codingHarness.selectCopilotModel', async () => {
       await controller.selectCopilotModel();
     }),
