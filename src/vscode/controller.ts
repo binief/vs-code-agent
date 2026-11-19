@@ -1043,6 +1043,10 @@ export class HarnessController {
       // If tools changed, we need to recreate session to pick up new registry
       // For simplicity, we recreate registry via a private field hack: create new session if tool count changed
       if (toolRegistry && toolRegistry.size !== this.session.toolNames.length) {
+        // Preserve task list items and approval state before recreating the
+        // session, so task items survive tool registry changes.
+        const oldTaskListItems = this.session.taskListStore?.list() ?? [];
+        const oldTaskListApproved = this.session.taskListApprovedFlag;
         this.host = new VsCodeHost({ root, log: this.log, approvals: this.approvals });
         const oldHistory = this.session.transcript;
         const oldOriginal = this.session.originalConversationSnapshot;
@@ -1054,6 +1058,10 @@ export class HarnessController {
           registry: toolRegistry,
           agentSelection: this.agentSelection,
         });
+        if (oldTaskListItems.length > 0) {
+          this.session.replaceTaskList(oldTaskListItems);
+        }
+        this.session.setTaskListApprovedFlag(oldTaskListApproved);
         this.session.restoreConversation(oldHistory, this.cumulativeUsage, oldOriginal, oldOriginalComplete);
         this.log.info(`session recreated with ${toolRegistry.size} tools (MCP updated)`);
       }

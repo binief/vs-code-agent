@@ -200,6 +200,26 @@ export class HarnessSession {
     return this.taskList;
   }
 
+  /** Replace the task list with the given items (used when the session is
+   *  recreated, e.g. when the tool registry changes, so task items survive
+   *  across session boundaries). */
+  replaceTaskList(items: readonly TaskItem[]): void {
+    if (!this.taskList) {
+      this.taskList = new TaskListStore();
+    }
+    this.taskList.restore(items);
+  }
+
+  /** Whether the task list has been approved by the user this task run. */
+  get taskListApprovedFlag(): boolean {
+    return this.taskListApproved;
+  }
+
+  /** Set the task list approval state (used when session is recreated). */
+  setTaskListApprovedFlag(approved: boolean): void {
+    this.taskListApproved = approved;
+  }
+
   updateConfig(config: HarnessConfig): void {
     if (config.model !== this.deps.config.model || config.provider !== this.deps.config.provider || config.baseUrl !== this.deps.config.baseUrl) this.inputCalibration = 1;
     this.deps.config = config;
