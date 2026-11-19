@@ -113,6 +113,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case 'cancel':
         this.controller.cancel();
         break;
+      case 'list-running-commands':
+        this.post({
+          type: 'running-commands',
+          commands: this.controller.getRunningCommands(),
+        });
+        break;
+      case 'stop-command':
+        this.controller.killRunningCommand(message.pid);
+        break;
+      case 'stop-all-commands':
+        this.controller.killAllRunningCommands();
+        break;
+      case 'view-command-output':
+        this.post({
+          type: 'command-output',
+          pid: message.pid,
+          output: this.controller.getRunningCommandOutput(message.pid),
+        });
+        break;
       case 'reset':
         await this.controller.reset();
         break;

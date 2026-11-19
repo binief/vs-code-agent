@@ -67,6 +67,9 @@
       <button type="button" class="icon-btn" id="btn-export-chat" aria-label="Export chat" title="Export the current chat to a JSON file">
         <svg class="icon" aria-hidden="true"><use href="#i-export"></use></svg>
       </button>
+      <button type="button" class="icon-btn" id="btn-running-commands" aria-label="Running commands" title="Running shell commands — view output and stop if needed">
+        <svg class="icon" aria-hidden="true"><use href="#i-terminal"></use></svg>
+      </button>
       <button type="button" class="icon-btn" id="btn-settings" aria-label="Settings" title="Open Coding Harness settings">
         <svg class="icon" aria-hidden="true"><use href="#i-sliders"></use></svg>
       </button>
@@ -284,6 +287,42 @@
         <span class="modal-status" id="agents-modal-status"></span>
         <button type="button" id="agents-cancel">Cancel</button>
         <button type="button" class="primary" id="agents-save" title="Send only the checked files from now on">Apply</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="running-commands-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="running-commands-modal-title">
+      <div class="modal-head">
+        <span class="modal-title" id="running-commands-modal-title">Running shell commands</span>
+        <button type="button" class="icon-btn" id="running-commands-modal-close" aria-label="Close" title="Close">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div id="running-commands-empty" hidden>No shell commands are currently running.</div>
+        <div id="running-commands-list"></div>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="danger" id="running-commands-stop-all" hidden>Stop all commands</button>
+        <button type="button" id="running-commands-modal-close-foot" title="Close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="command-output-modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="command-output-modal-title">
+      <div class="modal-head">
+        <span class="modal-title" id="command-output-modal-title">Command output</span>
+        <button type="button" class="icon-btn" id="command-output-modal-close" aria-label="Close" title="Close">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <pre id="command-output-text"></pre>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="primary" id="command-output-modal-close-foot" title="Close">Close</button>
       </div>
     </div>
   </div>
