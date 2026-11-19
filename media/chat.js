@@ -1033,15 +1033,28 @@
   }
 
   function renderCommand(item) {
-    const node = el('div', 'msg command');
+    const status = item.status || 'pending';
+    const node = el('div', 'msg command command-' + status);
     node.dataset.id = item.id;
-    node.appendChild(icon('slash'));
+    node.appendChild(icon(status === 'pending' ? 'sync' : status === 'done' ? 'check' : 'stop'));
     const body = el('div', 'command-body');
     const name = el('span', 'command-name', '/' + item.name);
     body.appendChild(name);
+    // Show args: prompt for create_tasks, id + key=value for edit_task.
     if (item.args && item.args.prompt) {
       const prompt = el('span', 'command-prompt', ' — ' + item.args.prompt);
       body.appendChild(prompt);
+    }
+    if (item.args && item.args.id) {
+      const detail = el('span', 'command-detail', ' ' + item.args.id +
+        (item.args.status ? ' status=' + item.args.status : '') +
+        (item.args.title ? ' title=' + item.args.title : ''));
+      body.appendChild(detail);
+    }
+    // Show result message for completed/failed commands.
+    if (status !== 'pending' && item.resultMessage) {
+      const msg = el('span', 'command-result-msg', ' — ' + item.resultMessage);
+      body.appendChild(msg);
     }
     node.appendChild(body);
     return node;
@@ -1589,37 +1602,107 @@
     }
   });
 
+  // Tokenise a string, honouring double/single quotes and backslash escapes.
+  // e.g. 1 status=done title="fix the bug" -> ['1', 'status=done', 'title=fix the bug']
+  function tokenizeQuoted(str) {
+    const tokens = [];
+    let current = '';
+    let inQuote = null;
+    let i = 0;
+    while (i < str.length) {
+      const ch = str[i];
+      if (inQuote) {
+        if (ch === inQuote) {
+          inQuote = null;
+        } else if (ch === '\\' && i + 1 < str.length) {
+          current += str[i + 1];
+          i += 2;
+          continue;
+        } else {
+          current += ch;
+        }
+      } else {
+        if (ch === '"' || ch === "'") {
+          inQuote = ch;
+        } else if (ch === '\\' && i + 1 < str.length) {
+          current += str[i + 1];
+          i += 2;
+          continue;
+        } else if (/\s/.test(ch)) {
+          if (current) {
+            tokens.push(current);
+            current = '';
+          }
+        } else {
+          current += ch;
+        }
+      }
+      i++;
+    }
+    if (current) tokens.push(current);
+    return tokens;
+  }
+
   function parseSlashCommand(value) {
     // Strip the leading '/' and split into command + rest.
     const body = value.slice(1);
     const space = body.indexOf(' ');
-    const name = space === -1 ? body : body.slice(0, space);
+    const name = space === -1 ? body.trim() : body.slice(0, space).trim();
     const rest = space === -1 ? '' : body.slice(space + 1).trim();
+
+    // Reject empty command names (e.g. "/  foo").
+    if (!name) return { name: '', args: {}, error: 'Empty command name.' };
+
     const args = {};
 
     if (name === 'create_tasks') {
       args.prompt = rest;
     } else if (name === 'edit_task') {
-      const [id, ...kvPairs] = rest.split(/\s+/);
-      if (!id) return null;
+      const tokens = tokenizeQuoted(rest);
+      const id = tokens[0];
+      if (!id) return { name, args, error: 'Missing task id. Usage: /edit_task <id> status=done|title=...' };
       args.id = id;
-      for (const kv of kvPairs) {
-        const eq = kv.indexOf('=');
-        if (eq === -1) continue;
-        const k = kv.slice(0, eq);
-        const v = kv.slice(eq + 1);
+      for (const token of tokens.slice(1)) {
+        const eq = token.indexOf('=');
+        if (eq === -1) {
+          return { name, args, error: 'Invalid argument "' + token + '". Use key=value format.' };
+        }
+        const k = token.slice(0, eq);
+        let v = token.slice(eq + 1);
+        // Strip matching surrounding quotes.
+        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+          v = v.slice(1, -1);
+        }
         if (k === 'status') args.status = v;
         else if (k === 'title') args.title = v;
+        else return { name, args, error: 'Unknown argument "' + k + '". Use status=... or title=...' };
       }
+    } else {
+      // Unknown slash command.
+      return { name, args, error: 'Unknown command "/' + name + '".' };
     }
+
     return { name, args };
   }
 
   function submit(text) {
     const value = (text !== undefined ? text : input.value).trim();
+
+    // Reject input while busy — prevents concurrent command execution.
+    if (busy) return;
+
     // Slash commands: /create_tasks, /edit_task, /start_implementation, /refresh_tasklist, /verify_tasks
     if (value.startsWith('/')) {
       const parsed = parseSlashCommand(value);
+      if (parsed.error) {
+        // Invalid slash command — show a local error bubble instead of falling through.
+        addNotice('Error: ' + parsed.error);
+        if (text === undefined) {
+          input.value = '';
+          input.style.height = 'auto';
+        }
+        return;
+      }
       if (!parsed) {
         // Unknown/invalid command — treat as normal message
         vscode.postMessage({ type: 'submit', text: value, images: [] });
@@ -1634,9 +1717,9 @@
       }
       // Show local command bubble immediately so user sees feedback
       const localId = 'local-' + Date.now();
-      const cmdItem = { id: localId, kind: 'command', name: parsed.name, args: parsed.args };
+      const cmdItem = { id: localId, kind: 'command', name: parsed.name, args: parsed.args, status: 'pending' };
       addItem(cmdItem, true);
-      vscode.postMessage({ type: 'command', ...parsed });
+      vscode.postMessage({ type: 'command', name: parsed.name, args: parsed.args, localId });
       clearAttachments();
       if (text === undefined) {
         input.value = '';
@@ -1690,10 +1773,12 @@
     }
     cmdMenu.hidden = false;
     cmdMenu.focus();
+    cmdMenuIndex = -1;
   }
 
   function hideCmdMenu() {
     if (cmdMenu) cmdMenu.hidden = true;
+    cmdMenuIndex = -1;
   }
 
   function pasteCmd(cmd, usage) {
@@ -1736,12 +1821,54 @@
     hideCmdMenu();
     submit();
   });
+  let cmdMenuIndex = -1;
   input.addEventListener('keydown', (event) => {
+    // Command menu keyboard navigation.
+    if (cmdMenu && !cmdMenu.hidden) {
+      const items = cmdMenu.querySelectorAll('.cmd-menu-item');
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        cmdMenuIndex = (cmdMenuIndex + 1) % items.length;
+        updateCmdMenuFocus(items);
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        cmdMenuIndex = (cmdMenuIndex - 1 + items.length) % items.length;
+        updateCmdMenuFocus(items);
+        return;
+      }
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        const item = items[cmdMenuIndex];
+        if (item) {
+          const cmd = item.dataset.cmd;
+          const usage = item.dataset.usage;
+          if (cmd) pasteCmd(cmd, usage);
+          // Auto-submit for commands that take no args.
+          if (!usage && cmd) {
+            submit();
+          }
+        }
+        return;
+      }
+      if (event.key === 'Escape') {
+        hideCmdMenu();
+        return;
+      }
+    }
     if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
       event.preventDefault();
       submit();
     }
   });
+
+  function updateCmdMenuFocus(items) {
+    items.forEach((item, i) => {
+      item.classList.toggle('cmd-focused', i === cmdMenuIndex);
+      if (i === cmdMenuIndex) item.scrollIntoView({ block: 'nearest' });
+    });
+  }
   input.addEventListener('input', () => {
     const value = input.value;
     input.style.height = 'auto';
@@ -2495,6 +2622,20 @@
       case 'status':
         setStatus(message.status, message.step, message.maxSteps);
         break;
+      case 'command-result': {
+        // Update the local command bubble with success/failure status.
+        const cmdItem = items.get(message.localId);
+        if (cmdItem && cmdItem.kind === 'command') {
+          cmdItem.status = message.ok ? 'done' : 'error';
+          cmdItem.resultMessage = message.message || '';
+          const node = elements.get(message.localId);
+          if (node) {
+            replaceNode(cmdItem, renderCommand(cmdItem));
+          }
+          items.set(message.localId, cmdItem);
+        }
+        break;
+      }
       case 'task-list':
         renderTaskStrip(message.items);
         break;

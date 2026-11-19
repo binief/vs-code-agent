@@ -50,26 +50,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Dispatch a slash command from the chat panel to the controller. */
-  private async handleCommand(name: string, args: any): Promise<void> {
+  private async handleCommand(name: string, args: any, localId?: string): Promise<void> {
     await this.controller.whenReady();
-    switch (name) {
-      case 'create_tasks':
-        await this.controller.createTasks(String(args?.prompt ?? ''));
-        break;
-      case 'edit_task':
-        await this.controller.editTask(String(args?.id ?? ''), args);
-        break;
-      case 'start_implementation':
-        await this.controller.startImplementation();
-        break;
-      case 'refresh_tasklist':
-        this.controller.refreshTasklist();
-        break;
-      case 'verify_tasks':
-        await this.controller.verifyTasks();
-        break;
-      default:
-        this.log.debug(`unknown slash command: ${name}`);
+    try {
+      switch (name) {
+        case 'create_tasks':
+          await this.controller.createTasks(String(args?.prompt ?? ''));
+          break;
+        case 'edit_task':
+          await this.controller.editTask(String(args?.id ?? ''), args);
+          break;
+        case 'start_implementation':
+          await this.controller.startImplementation();
+          break;
+        case 'refresh_tasklist':
+          this.controller.refreshTasklist();
+          break;
+        case 'verify_tasks':
+          await this.controller.verifyTasks();
+          break;
+        default:
+          this.log.debug(`unknown slash command: ${name}`);
+          if (localId) this.post({ type: 'command-result', localId, name, ok: false, message: 'Unknown command.' });
+          return;
+      }
+      if (localId) this.post({ type: 'command-result', localId, name, ok: true });
+    } catch (err) {
+      this.log.error(`slash command /${name} failed: ${(err as Error).message}`);
+      if (localId) this.post({ type: 'command-result', localId, name, ok: false, message: (err as Error).message });
     }
   }
 
@@ -207,7 +215,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await vscode.commands.executeCommand('workbench.action.openSettings', 'codingHarness');
         break;
       case 'command':
-        await this.handleCommand(message.name, message.args);
+        await this.handleCommand(message.name, message.args, message.localId);
         break;
       case 'copy':
         try {

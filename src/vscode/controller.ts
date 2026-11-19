@@ -368,6 +368,8 @@ export class HarnessController {
   }
 
   getTaskListItems(): TaskItem[] {
+    // Read from the session store as the single source of truth.
+    if (this.session?.taskListStore) return [...this.session.taskListStore.list()];
     return [...this.taskListItems];
   }
 
@@ -1282,6 +1284,10 @@ export class HarnessController {
    *  Works as the first prompt — no active session required. */
   async createTasks(prompt: string): Promise<void> {
     await this.whenReady();
+    if (this.state.busy) {
+      void vscode.window.showWarningMessage('Coding Harness is already running a task. Stop it first.');
+      return;
+    }
     const trimmed = prompt.trim();
     if (!trimmed) {
       void vscode.window.showWarningMessage('Provide a prompt after /create_tasks.');
@@ -1314,6 +1320,10 @@ export class HarnessController {
   /** Edit a task list item (slash command /edit_task <id> status=done|title=...). */
   async editTask(id: string, updates: { title?: string; status?: string }): Promise<void> {
     await this.whenReady();
+    if (this.state.busy) {
+      void vscode.window.showWarningMessage('Coding Harness is already running a task. Stop it first.');
+      return;
+    }
     if (!id) {
       void vscode.window.showWarningMessage('Usage: /edit_task <id> status=done|title=...');
       return;
@@ -1353,6 +1363,10 @@ export class HarnessController {
   /** Start implementing pending task list items (slash command /start_implementation). */
   async startImplementation(): Promise<void> {
     await this.whenReady();
+    if (this.state.busy) {
+      void vscode.window.showWarningMessage('Coding Harness is already running a task. Stop it first.');
+      return;
+    }
     const config = this.readConfig();
     if (!config.taskListEnabled) {
       void vscode.window.showWarningMessage('Enable codingHarness.taskList.enabled in settings to use /start_implementation.');
@@ -1376,7 +1390,10 @@ export class HarnessController {
 
   /** Re-emit the current task list to the panel (slash command /refresh_tasklist). */
   refreshTasklist(): void {
-    this.post({ type: 'task-list', items: this.taskListItems });
+    // Read from the session store as the single source of truth.
+    const items = this.session?.taskListStore?.list() ?? [];
+    this.taskListItems = items;
+    this.post({ type: 'task-list', items });
   }
 
   /** Verify task list against actual file changes (slash command /verify_tasks).
@@ -1386,12 +1403,17 @@ export class HarnessController {
    */
   async verifyTasks(): Promise<void> {
     await this.whenReady();
+    if (this.state.busy) {
+      void vscode.window.showWarningMessage('Coding Harness is already running a task. Stop it first.');
+      return;
+    }
     const config = this.readConfig();
     if (!config.taskListEnabled) {
       void vscode.window.showWarningMessage('Enable codingHarness.taskList.enabled in settings to use /verify_tasks.');
       return;
     }
-    const items = this.taskListItems;
+    // Read from the session store as the single source of truth.
+    const items = this.session?.taskListStore?.list() ?? [];
     if (items.length === 0) {
       void vscode.window.showInformationMessage('No task list items. Use /create_tasks to create some first.');
       return;
@@ -1481,6 +1503,8 @@ export class HarnessController {
     this.restoredHistory = [];
     this.restoredOriginalHistory = [];
     this.restoredOriginalComplete = true;
+    // Reject any pending approvals so they don't dangle after a reset.
+    this.approvals.cancelAll();
     this.approvals.forgetAll();
     this.cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
     this.lastTokensPerSecond = 0;
