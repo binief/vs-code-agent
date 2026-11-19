@@ -2281,29 +2281,6 @@ body.dragging .composer-box {
   display: none;
 }
 
-/* Quick command reference (visible fallback for the / button menu) */
-.cmd-reference {
-  margin: 8px 12px 4px 12px;
-  font-size: 11px;
-  color: var(--vscode-descriptionForeground, #858585);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.cmd-reference strong {
-  color: var(--vscode-foreground, #cccccc);
-  font-size: 12px;
-}
-.cmd-ref-item {
-  color: var(--vscode-textLink-foreground, #3794ff);
-  cursor: default;
-  white-space: nowrap;
-}
-.cmd-ref-item:hover {
-  text-decoration: underline;
-}
-
 /* Slash command message bubble */
 .msg.command {
   background: var(--vscode-input-background, #252525);
