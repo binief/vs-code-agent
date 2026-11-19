@@ -1550,7 +1550,6 @@ export class HarnessSession {
       outputTokenBudget,
       taskList: this.taskList,
       approval: async (req: ApprovalRequest): Promise<ApprovalDecision> => {
-        onEvent({ type: 'approval', id: call.id, phase: 'request', request: req });
         onEvent({ type: 'status', status: 'approval' });
         let decision: ApprovalDecision = 'reject';
         try {
