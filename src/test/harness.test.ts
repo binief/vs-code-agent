@@ -431,6 +431,24 @@ test('run_command kills idle command after idle_timeout_ms', async () => {
   assert.match(res.content, /timed out/);
 });
 
+test('run_command requests approval exactly once per invocation (no duplicate modal)', async () => {
+  const root = makeTempWorkspace();
+  const host = new FakeHost(root);
+  const ctx = makeContext(root, host, { commandPolicy: 'auto-safe' });
+
+  // A destructive command requires approval, so run_command must call
+  // host.requestApproval exactly once. The redundant onEvent('approval', 'request')
+  // bypass in the agent loop was removed so it can no longer render a second
+  // approval card alongside the one produced by host.requestApproval().
+  const res = await runCommandTool.run(
+    { command: 'rm -rf ./build', purpose: 'cleanup' },
+    ctx,
+  );
+
+  assert.equal(res.ok, true, 'destructive command approved by default');
+  assert.equal(host.approvals.length, 1, 'ApprovalService.request called exactly once');
+});
+
 test('run_command respects cwd inside the workspace and rejects escapes', async () => {
   const root = makeTempWorkspace({ 'sub/.keep': '' });
   const ctx = makeContext(root, new FakeHost(root));
