@@ -171,6 +171,11 @@ export class VsCodeHost implements HarnessHost {
     else void vscode.window.showInformationMessage(message);
   }
 
+  async prompt(message: string, options: string[]): Promise<number | undefined> {
+    const picked = await vscode.window.showWarningMessage(message, { modal: true }, ...options);
+    return picked === undefined ? undefined : options.indexOf(picked);
+  }
+
   /** Preserve mixed/CR endings on disk; VS Code text edits normalize them. */
   async applyFileWrite(absPath: string, content: string, options?: { preserveBytes?: boolean }): Promise<void> {
     const uri = vscode.Uri.file(absPath);

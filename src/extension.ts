@@ -166,9 +166,50 @@ function registerCommands(
 
     vscode.commands.registerCommand('codingHarness.stopRunningCommands', async () => {
       await chatView.reveal();
-      const count = controller.killAllRunningCommands();
-      if (count === 0) {
+      const processes = controller.getRunningCommands();
+      if (processes.length === 0) {
         void vscode.window.showInformationMessage('No shell commands to stop.');
+        return;
+      }
+      if (processes.length === 1) {
+        const p = processes[0];
+        const killed = controller.killRunningCommand(p.pid) ? 1 : 0;
+        if (killed === 0) {
+          void vscode.window.showInformationMessage(`Could not stop command PID ${p.pid}.`);
+          return;
+        }
+        void vscode.window.showInformationMessage(`Stopped command PID ${p.pid}: ${p.command}.`);
+        return;
+      }
+      // Multiple running commands: let the user choose which to stop.
+      interface CommandPick extends vscode.QuickPickItem {
+        pid: number | undefined;
+      }
+      const picks: CommandPick[] = processes.map((p) => ({
+        label: `PID ${p.pid}${p.detached ? ' [detached]' : ''}`,
+        description: p.command,
+        detail: `cwd: ${p.cwd}, started ${new Date(p.startedAt).toLocaleTimeString()}`,
+        pid: p.pid,
+      }));
+      picks.unshift({
+        label: 'Stop all running commands',
+        description: `${processes.length} command(s)`,
+        detail: 'Kill every shell command currently running.',
+        pid: undefined,
+      });
+      const picked = await vscode.window.showQuickPick(picks, {
+        title: 'Coding Harness — stop a running command',
+        placeHolder: 'Choose a command to stop, or stop all.',
+      });
+      if (!picked) return;
+      let count = 0;
+      if (picked.pid === undefined) {
+        count = controller.killAllRunningCommands();
+      } else {
+        count = controller.killRunningCommand(picked.pid) ? 1 : 0;
+      }
+      if (count === 0) {
+        void vscode.window.showInformationMessage('No commands were stopped.');
         return;
       }
       void vscode.window.showInformationMessage(`Stopped ${count} running command(s).`);

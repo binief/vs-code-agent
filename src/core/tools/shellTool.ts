@@ -315,21 +315,34 @@ export const runCommandTool: Tool<{
     const timeoutMs = Math.max(1000, Math.min(args.timeout_ms ?? ctx.config.commandTimeoutMs, 10 * 60_000));
     ctx.host.log('info', `run_command${verdict.decision === 'allow' ? ' (auto)' : ''}: ${args.command} [cwd=${cwd.rel}]`);
 
-    // Warn when a command looks like a long-running server but detached is not set,
-    // so the user knows it may block the task until stopped.
+    // Notify the user that a command is running and how to stop it if it hangs.
+    // This is shown for every non-detached command so the user always has a
+    // way to manually stop a long-running command.
+    ctx.host.notify?.(
+      `Command running: ${args.command}\nUse "Coding Harness: Stop Running Commands" to stop it if it takes too long.`,
+      'info',
+    );
+
+    // When a command looks like a long-running server and detached is not set,
+    // offer to move it to the background so the task can keep moving forward.
     const LONG_RUNNING = /\\b(mvn|maven|gradle|mvnw|gradlew|java|node|python|python3|ruby|php|dotnet)\\b/;
-    if (!args.detached && LONG_RUNNING.test(args.command)) {
-      ctx.host.notify?.(
-        `Command may run indefinitely: "${args.command}". Consider detached: true to start it in the background and return immediately.`,
-        'warn',
+    let detached = args.detached === true;
+    if (!detached && LONG_RUNNING.test(args.command) && ctx.host.prompt) {
+      const choice = await ctx.host.prompt(
+        `Command may run indefinitely: "${args.command}".\nRun it in the background so the task can continue?`,
+        ['Run in background', 'Run in foreground', 'Cancel'],
       );
+      if (choice === 2) {
+        return fail('User cancelled running this command.', 'cancelled', { cancelled: true });
+      }
+      detached = choice === 0;
     }
 
     const result = await runShellCommand(args.command, {
       cwd: cwd.abs,
       timeoutMs,
       signal: ctx.signal,
-      detached: args.detached,
+      detached,
       detached_timeout_ms: args.detached_timeout_ms,
     });
 

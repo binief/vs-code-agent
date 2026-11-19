@@ -1454,6 +1454,12 @@ export class HarnessController {
     } else {
       return;
     }
+    // Kill any running shell commands so a hanging command doesn't keep the
+    // user blocked after they cancel the task.
+    const killed = killAllRunningCommands();
+    if (killed > 0) {
+      this.log.info(`cancel: killed ${killed} running command(s)`);
+    }
     // Reject any pending approvals (file writes, command runs) so the
     // waiting tool calls fail fast instead of hanging until the user
     // clicks Apply/Reject on a cancelled task.
