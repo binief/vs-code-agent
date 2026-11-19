@@ -203,6 +203,17 @@ export const runCommandTool: Tool<{
     if (ctx.signal?.aborted) return fail('Cancelled before running this command.', 'cancelled', { cancelled: true });
     const timeoutMs = Math.max(1000, Math.min(args.timeout_ms ?? ctx.config.commandTimeoutMs, 10 * 60_000));
     ctx.host.log('info', `run_command${verdict.decision === 'allow' ? ' (auto)' : ''}: ${args.command} [cwd=${cwd.rel}]`);
+
+    // Warn when a command looks like a long-running server but detached is not set,
+    // so the user knows it may block the task until stopped.
+    const LONG_RUNNING = /\\b(mvn|maven|gradle|mvnw|gradlew|java|node|python|python3|ruby|php|dotnet)\\b/;
+    if (!args.detached && LONG_RUNNING.test(args.command)) {
+      ctx.host.notify?.(
+        `Command may run indefinitely: "${args.command}". Consider detached: true to start it in the background and return immediately.`,
+        'warn',
+      );
+    }
+
     const result = await runShellCommand(args.command, { cwd: cwd.abs, timeoutMs, signal: ctx.signal, detached: args.detached });
 
     const parts: string[] = [];

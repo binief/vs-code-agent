@@ -68,6 +68,7 @@ const ELEVATED: Rule[] = [
   { re: /\bcurl\b|\bwget\b/i, reason: 'network access' },
   // Launching application servers / long-running processes is a side effect.
   { re: /\b(java|node|python|python3|ruby|php|dotnet)\s+(-jar|\.|\w+\.js|\w+\.py)\b/i, reason: 'starts a long-running application server' },
+  { re: /\b(mvn|maven|gradle|mvnw|gradlew)\b/i, reason: 'build tool that may start a long-running server — use detached: true to avoid blocking' },
 ];
 
 /** Shell metacharacters that make a "safe" prefix unsafe. */
