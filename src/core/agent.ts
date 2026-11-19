@@ -353,13 +353,7 @@ export class HarnessSession {
     }
 
     if (signal?.aborted) return;
-    if (relevantFiles.size === 0) {
-      // No relevant project files found. Use the LLM to decompose the prompt
-      // into discrete, actionable task items instead of creating a single
-      // fallback task with the raw prompt as its title.
-      await this.decomposePromptViaLLM(prompt);
-      return;
-    }
+    if (relevantFiles.size === 0) return;
 
     // Deterministic ordering.
     const files = Array.from(relevantFiles)
@@ -401,12 +395,7 @@ export class HarnessSession {
     }
     if (current.files.length > 0) slices.push(current);
 
-    if (slices.length === 0) {
-      // Slicing produced nothing (e.g. context window too small). Use the LLM
-      // to decompose the prompt into task items instead.
-      await this.decomposePromptViaLLM(prompt);
-      return;
-    }
+    if (slices.length === 0) return;
 
     // Ensure the task list store exists (it may not be initialized when
     // decomposeProject is called directly, e.g. via /create_tasks slash command).
@@ -443,12 +432,11 @@ export class HarnessSession {
 
   /**
    * Use the LLM to decompose a free-form prompt into discrete, actionable
-   * task list items. Called by decomposeProject when no project files match
-   * the prompt, so the user still gets a meaningful task list based on the
-   * prompt text itself rather than a single fallback task with the raw prompt
-   * as its title.
+   * task list items. Called by /create_tasks slash command so it analyzes the
+   * prompt text (not project files) and creates discrete tasks like "Read
+   * requirement.md", "Identify pending items", "Implement pending item X".
    */
-  private async decomposePromptViaLLM(prompt: string): Promise<void> {
+  async createTaskListFromPrompt(prompt: string): Promise<void> {
     if (!this.taskList) {
       this.taskList = new TaskListStore();
     }

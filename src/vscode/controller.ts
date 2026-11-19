@@ -1280,15 +1280,15 @@ export class HarnessController {
       return;
     }
     // Wire up the event handler so the task-list approval modal can be shown
-    // when decomposeProject is called directly (not through runTask).
+    // when createTaskListFromPrompt is called directly (not through runTask).
     this.session.setOnEvent((event) => {
       this.handleEvent('id' in event ? { ...event, id: `${this.id()}:${event.id}` } : event);
     });
     this.setStatus('thinking', true);
     try {
-      await this.session.decomposeProject(trimmed);
+      await this.session.createTaskListFromPrompt(trimmed);
       // Sync task list items from the session store so startImplementation
-      // sees the items decomposeProject just created.
+      // sees the items createTaskListFromPrompt just created.
       if (this.session?.taskListStore) {
         this.taskListItems = this.session.taskListStore.list();
       }
