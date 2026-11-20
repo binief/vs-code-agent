@@ -51,6 +51,7 @@ import {
 } from '../core/types';
 import { CHAT_ARCHIVE_FORMAT, CHAT_ARCHIVE_VERSION, MAX_CHAT_ARCHIVE_BYTES, parseChatArchive, type ChatArchive } from './chatArchive';
 import type { ApprovalService } from './host';
+import { BrowserManager } from '../core/tools/browserTool';
 import { VsCodeHost } from './host';
 import type { Logger } from './log';
 import type { ProposalStore } from './proposals';
@@ -252,6 +253,8 @@ export class HarnessController {
   private session?: HarnessSession;
   private host?: VsCodeHost;
   private mcpManager?: McpManager;
+  /** Persistent Playwright browser session for browser_tool automation. */
+  private browserManager?: BrowserManager;
   /** Last loaded MCP config files (kept for the dialog and state). */
   private mcpFileConfig?: McpFileConfig;
   /** Signature of the servers the running manager was started with. */
@@ -344,6 +347,15 @@ export class HarnessController {
     if (stored && stored.length > 0) this.agentSelection = stored;
     this.chatSaveSettings = this.readChatSaveSettings();
     this.ready = this.restoreSavedChat();
+    // Create the Playwright browser manager for browser_tool automation.
+    // It starts lazily on first browser_tool call (detect-and-prompt for Playwright).
+    this.browserManager = new BrowserManager();
+    // Register cleanup on extension deactivation (guarded for test contexts without subscriptions).
+    if (context.subscriptions) {
+      context.subscriptions.push(new vscode.Disposable(() => {
+        void this.browserManager?.close();
+      }));
+    }
   }
 
   /* ------------------------------------------------------------- wiring */
@@ -703,6 +715,8 @@ export class HarnessController {
     await this.whenReady();
     this.cancel();
     this.approvals.cancelAll();
+    // Close the Playwright browser session on deactivation.
+    void this.browserManager?.close();
     // Honor the latest setting even if its change event is still queued.
     await this.refreshChatSaveSettings();
     await this.persistChat();
@@ -859,6 +873,7 @@ export class HarnessController {
       maxOutputTokens: c.get('maxOutputTokens'),
       editPolicy: c.get('editPolicy'),
       commandPolicy: c.get('commandPolicy'),
+      browsePolicy: c.get('browsePolicy'),
       allowDangerousCommands: c.get('allowDangerousCommands'),
       commandTimeoutMs: c.get('commandTimeoutMs'),
       allowOutsideWorkspace: c.get('allowOutsideWorkspace'),
@@ -1037,7 +1052,7 @@ export class HarnessController {
       const history = this.session?.conversationSnapshot ?? this.restoredHistory;
       const original = this.session?.originalConversationSnapshot ?? this.restoredOriginalHistory;
       const originalComplete = this.session?.isOriginalConversationComplete ?? this.restoredOriginalComplete;
-      this.host = new VsCodeHost({ root, log: this.log, approvals: this.approvals });
+      this.host = new VsCodeHost({ root, log: this.log, approvals: this.approvals, browser: this.browserManager });
       this.session = new HarnessSession({
         host: this.host,
         config,
@@ -1060,7 +1075,7 @@ export class HarnessController {
         // session, so task items survive tool registry changes.
         const oldTaskListItems = this.session.taskListStore?.list() ?? [];
         const oldTaskListApproved = this.session.taskListApprovedFlag;
-        this.host = new VsCodeHost({ root, log: this.log, approvals: this.approvals });
+        this.host = new VsCodeHost({ root, log: this.log, approvals: this.approvals, browser: this.browserManager });
         const oldHistory = this.session.transcript;
         const oldOriginal = this.session.originalConversationSnapshot;
         const oldOriginalComplete = this.session.isOriginalConversationComplete;
@@ -2116,7 +2131,7 @@ export class HarnessController {
     let diagnostics: string[] | undefined;
     if (config.context.diagnostics) {
       try {
-        const host = this.host ?? new VsCodeHost({ root, log: this.log, approvals: this.approvals });
+        const host = this.host ?? new VsCodeHost({ root, log: this.log, approvals: this.approvals, browser: this.browserManager });
         const diags = await host.getDiagnostics();
         if (diags.length) diagnostics = summarizeDiagnostics(diags);
       } catch {

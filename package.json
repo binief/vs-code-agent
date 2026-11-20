@@ -264,6 +264,16 @@
           "default": "auto-safe",
           "markdownDescription": "How shell commands are gated. `auto-safe` runs known read-only commands silently and asks for everything else. `ask` asks for all commands. `auto-all` runs everything that is not on the hard deny-list. `deny-all` disables the shell tool."
         },
+        "codingHarness.browsePolicy": {
+          "type": "string",
+          "enum": [
+            "auto-safe",
+            "ask",
+            "deny-all"
+          ],
+          "default": "auto-safe",
+          "markdownDescription": "How browser automation is gated. `auto-safe` allows same-origin navigation silently and asks for cross-origin navigation and form submissions. `ask` asks for every browser action. `deny-all` disables the browser tool."
+        },
         "codingHarness.allowDangerousCommands": {
           "type": "boolean",
           "default": false,
