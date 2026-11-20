@@ -6,6 +6,19 @@ import { CheckpointStore, type RevertReport } from './checkpoints';
 import { CompactionCancelled, compactHistory, contextBreakdown, contextBreakdownTotal, estimateMessagesTokens, estimateRequestTokens, estimateTokens } from './compaction';
 import { isRetryableProviderError, retryDelayMs } from './providers/errors';
 import { buildSystemPrompt, summarizeDiagnostics } from './prompt';
+import {
+  CONTINUE_AFTER_TRUNCATION,
+  CANCELLED_TOOL_RESULT,
+  subagentTaskPrompt,
+  AUTOMATIC_SUBAGENT_TASK,
+  SUBAGENT_SKIPPED_NOTICE,
+  SUBAGENT_STARTED_NOTICE,
+  subagentFailedMessage,
+  subagentIncompleteMessage,
+  SUBAGENT_DISABLED,
+  SUBAGENT_NO_READ_TOOLS,
+  COMPACTION_FAILED_NOTICE,
+} from './prompts';
 import { createDefaultTools, ToolRegistry } from './tools';
 import { walkFiles } from './tools/walk';
 import { TaskListStore, type TaskItem } from './taskList';
@@ -79,10 +92,6 @@ const MAX_THINKING_DISPLAY_CHARS = 12_000;
  * are retried with backoff instead of ending the task where it stands.
  */
 const MAX_PROVIDER_ATTEMPTS = 3;
-/** Operational note sent when a turn was cut off by the output limit. */
-const CONTINUE_AFTER_TRUNCATION = 'Your previous message was cut off by the output token limit.';
-/** Result recorded for tool calls the user cancelled before they could run. */
-const CANCELLED_TOOL_RESULT = 'Skipped: the task was cancelled before this tool ran.';
 
 /**
  * Drives one conversation: builds the prompt, calls the model, executes the
@@ -861,27 +870,27 @@ export class HarnessSession {
       // tool call, not a claim that the parent model chose to delegate.
       if (!this.deps.delegated && this.deps.config.subagentsEnabled && !signal.aborted) {
         if (!allowedToolNames.has(DELEGATE_TOOL.name)) {
-          onEvent({ type: 'notice', level: 'warn', message: 'Automatic subagent skipped: selected agent files do not permit delegation. Continuing with the main agent. Allow subagent and read/search in every declaring agent file to enable it.' });
+          onEvent({ type: 'notice', level: 'warn', message: SUBAGENT_SKIPPED_NOTICE });
         } else {
-          const task = `You are the delegated read-only subagent, not the main agent. Do not delegate further. Investigate the user's request using permitted read-only tools if relevant. Return concise findings, relevant paths and evidence; explicitly identify uncertainty or missing context. The parent will handle edits and commands.\n\nUser request:\n${text}` +
+          const task = subagentTaskPrompt(text) +
             (images?.length ? '\nThe user attached images, but they are not available to you. Do not assume their contents; the parent can inspect them.' : '');
           // The current request is already in parent history; don't duplicate
           // its full text in the synthetic tool-call arguments.
           const call: ToolCall = { id: `auto-subagent-${randomUUID()}`, name: DELEGATE_TOOL.name,
-            arguments: JSON.stringify({ task: 'Automatic read-only investigation of the current user request.' }) };
-          onEvent({ type: 'notice', level: 'info', message: 'Starting the automatic read-only subagent before the main agent.' });
+            arguments: JSON.stringify({ task: AUTOMATIC_SUBAGENT_TASK }) };
+          onEvent({ type: 'notice', level: 'info', message: SUBAGENT_STARTED_NOTICE });
           addMessage({ role: 'assistant', content: '', toolCalls: [call] });
           let result: ToolResult;
           try {
             result = await this.executeToolCall(call, onEvent, signal, allowedToolNames, 2048, selected, policySpecs, 0, task);
           } catch (err) {
-            result = { ok: false, content: `Automatic subagent failed: ${(err as Error).message}`, summary: 'subagent failed' };
+            result = { ok: false, content: subagentFailedMessage(err as Error), summary: 'subagent failed' };
             onEvent({ type: 'tool-end', id: call.id, name: call.name, ok: false, summary: result.summary ?? 'subagent failed', detail: result.content, durationMs: 0 });
           }
           toolCallsRun++;
           addMessage({ role: 'tool', toolCallId: call.id, name: call.name, content: result.content });
           if (!result.ok && !signal.aborted) {
-            onEvent({ type: 'notice', level: 'warn', message: `Automatic subagent did not complete (${result.summary ?? 'failed'}). Continuing with the main agent; its findings are unavailable or incomplete.` });
+            onEvent({ type: 'notice', level: 'warn', message: subagentIncompleteMessage(result.summary ?? 'failed') });
           }
         }
       }
@@ -909,12 +918,21 @@ export class HarnessSession {
             onTrace: (trace) => onEvent({ type: 'compaction-trace', trace }),
           });
         } catch (err) {
-          if (err instanceof CompactionCancelled && err.usage) {
-            this.cumulativeUsage = mergeUsage(this.cumulativeUsage, err.usage);
-            usage = mergeUsage(usage, err.usage);
-            onEvent({ type: 'usage', step: steps, usage: err.usage, cumulative: { ...this.cumulativeUsage } });
+          if (err instanceof CompactionCancelled) {
+            // User cancellation must propagate so the task stops cleanly.
+            if (err.usage) {
+              this.cumulativeUsage = mergeUsage(this.cumulativeUsage, err.usage);
+              usage = mergeUsage(usage, err.usage);
+              onEvent({ type: 'usage', step: steps, usage: err.usage, cumulative: { ...this.cumulativeUsage } });
+            }
+            throw err;
           }
-          throw err;
+          // A compaction failure (provider error, timeout, etc.) must not
+          // kill the whole task. Continue with the uncompacted history and
+          // let the model keep working; compaction can be retried later.
+          host.log('warn', `compaction failed, continuing uncompacted: ${(err as Error).message}`);
+          onEvent({ type: 'notice', level: 'warn', message: COMPACTION_FAILED_NOTICE });
+          return false;
         } finally {
           onEvent({ type: 'compaction-progress', progress: null });
         }
@@ -1456,7 +1474,7 @@ export class HarnessSession {
     }
     if (call.name === DELEGATE_TOOL.name) {
       if (this.deps.config.subagentsEnabled !== true || this.deps.delegated) {
-        return finish({ ok: false, content: 'Subagents are disabled.', summary: 'subagent disabled' });
+        return finish({ ok: false, content: SUBAGENT_DISABLED, summary: 'subagent disabled' });
       }
       let args: Record<string, unknown>;
       try { args = parseToolArguments(call.arguments); } catch (err) {
@@ -1467,7 +1485,7 @@ export class HarnessSession {
       }
       const safeTools = createDefaultTools().filter((tool) => SUBAGENT_READ_TOOLS.has(tool.name) &&
         allowedTools.has(tool.name) && this.registry.get(tool.name) === tool);
-      if (!safeTools.length) return finish({ ok: false, content: 'No read-only built-in tools are allowed for this subagent. Add read or search permissions in the selected agent files.', summary: 'no read tools' });
+      if (!safeTools.length) return finish({ ok: false, content: SUBAGENT_NO_READ_TOOLS, summary: 'no read tools' });
       const child = new HarnessSession({
         host, provider: this.deps.provider, config: { ...this.deps.config, subagentsEnabled: false },
         registry: new ToolRegistry(safeTools),
@@ -1564,18 +1582,40 @@ export class HarnessSession {
       },
     };
 
+    const timeoutMs = this.deps.config.toolTimeoutMs || 0;
+    let timeoutId: NodeJS.Timeout | undefined;
+
+    const runWithTimeout = (): Promise<ToolResult> => {
+      if (timeoutMs <= 0) return tool.run(args, context);
+      return new Promise<ToolResult>((resolve, reject) => {
+        timeoutId = setTimeout(() => {
+          // Best-effort: signal cancellation to the tool.
+          if (!signal.aborted) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (signal as any).abort?.();
+          }
+          reject(new Error(`Tool "${call.name}" timed out after ${timeoutMs} ms`));
+        }, timeoutMs);
+        tool.run(args, context).then(resolve, reject);
+      });
+    };
+
     try {
-      const result = await tool.run(args, context);
+      const result = timeoutMs > 0 ? await runWithTimeout() : await tool.run(args, context);
       return finish(result);
     } catch (err) {
       const message = (err as Error).message;
-      host.log('error', `tool ${call.name} threw: ${message}`);
+      const timedOut = message.includes('timed out after');
+      host.log(timedOut ? 'warn' : 'error', `tool ${call.name} ${timedOut ? 'timed out' : 'threw'}: ${message}`);
       return finish({
         ok: false,
-        content: `Tool "${call.name}" failed: ${message}`,
-        summary: `error: ${message.slice(0, 80)}`,
+        content: timedOut
+          ? `Tool "${call.name}" timed out after ${timeoutMs} ms. The operation was cancelled.`
+          : `Tool "${call.name}" failed: ${message}`,
+        summary: timedOut ? `timeout after ${timeoutMs} ms` : `error: ${message.slice(0, 80)}`,
       });
     } finally {
+      if (timeoutId) clearTimeout(timeoutId);
       // Broadcast the current task list so the panel strip stays in sync,
       // even when the call failed (e.g. unknown task item id).
       if ((call.name === 'task_list' || call.name === 'task_decompose') && this.taskList) {
