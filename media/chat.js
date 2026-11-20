@@ -635,16 +635,21 @@
       return;
     }
     const marks = { done: 'done', 'in-progress': 'in-progress', pending: 'pending' };
-    for (const item of items) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
       const li = document.createElement('li');
       li.className = 'task-item';
       li.dataset.id = item.id;
+      const number = document.createElement('span');
+      number.className = 'task-number';
+      number.textContent = (i + 1) + '. ';
       const mark = document.createElement('span');
       mark.className = 'task-mark ' + (marks[item.status] || 'pending');
       mark.textContent = (item.status === 'done' ? '[x]' : item.status === 'in-progress' ? '[•]' : '[ ]') + ' ';
       const title = document.createElement('span');
       title.className = 'task-title';
       title.textContent = item.title;
+      li.appendChild(number);
       li.appendChild(mark);
       li.appendChild(title);
       taskStripItems.appendChild(li);
@@ -1263,9 +1268,9 @@
         <div class="modal-body">
           <p>The model proposes the following task list for this task:</p>
           <ul class="task-list-approval-items">
-            ${items.map((item) => {
+            ${items.map((item, i) => {
               const mark = item.status === 'done' ? '[x]' : item.status === 'in-progress' ? '[•]' : '[ ]';
-              return `<li><span class="task-mark">${mark}</span> <span class="task-title">${escapeHtml(item.title)}</span></li>`;
+              return `<li><span class="task-number">${i + 1}.</span> <span class="task-mark">${mark}</span> <span class="task-title">${escapeHtml(item.title)}</span></li>`;
             }).join('')}
           </ul>
           <p class="task-list-approval-hint">Review the list. Approve to proceed, or edit items before continuing.</p>
