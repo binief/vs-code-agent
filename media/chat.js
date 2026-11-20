@@ -1677,6 +1677,8 @@
         else if (k === 'title') args.title = v;
         else return { name, args, error: 'Unknown argument "' + k + '". Use status=... or title=...' };
       }
+    } else if (name === 'start_implementation' || name === 'refresh_tasklist' || name === 'verify_tasks') {
+      // No-argument commands: nothing to parse.
     } else {
       // Unknown slash command.
       return { name, args, error: 'Unknown command "/' + name + '".' };
