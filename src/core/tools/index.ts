@@ -16,6 +16,7 @@ import {
 } from './shellTool';
 import { taskListTool } from './taskList';
 import { taskDecomposeTool } from './taskDecompose';
+import { browserTool, type BrowserToolArgs, type BrowserSnapshot } from './browserTool';
 import type { Tool, ToolSpec } from '../types';
 
 /**
@@ -37,6 +38,7 @@ export function createDefaultTools(): Tool[] {
     openFileTool as Tool,
     taskListTool as Tool,
     taskDecomposeTool as Tool,
+    browserTool as Tool,
   ];
 }
 
@@ -100,4 +102,6 @@ export {
 };
 export type { RunningCommandInfo };
 export { taskDecomposeTool };
+export { browserTool };
+export type { BrowserToolArgs, BrowserSnapshot };
 export { McpManager, McpClient } from './mcp';

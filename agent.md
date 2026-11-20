@@ -21,6 +21,7 @@ The `tools:` front-matter above is an **opt-in allowlist**. Only tools named her
 | `replace_in_file` | Exact-snippet replacement; preserves file style | per `editPolicy` |
 | `delete_file` | Remove one file | always |
 | `run_command` | Shell command in the workspace, with timeout and exit-code capture | per `commandPolicy` |
+| `browser_tool` | Automate a web browser (navigate, click, type, press keys, scroll, wait, snapshot, screenshot) | per `browsePolicy` |
 | `get_diagnostics` | Current errors/warnings from language servers | never |
 | `open_file` | Reveal a file/line in the editor | never |
 | `task_list` | Add/update/list/remove items in a per-task task list (shown in the panel strip, saved in the chat JSON) | never |
@@ -32,6 +33,7 @@ Use a group in `tools:` instead of naming tools one-by-one:
 - `search` — `list_files`, `search_text`
 - `edit` — `create_file`, `write_file`, `replace_in_file`, `delete_file`
 - `execute` — `run_command`
+- `browse` — `browser_tool`
 - `mcp` — all registered `mcp_<server>_<tool>` tools
 - `subagent` — `delegate_task` (read-only subagent, when enabled)
 
@@ -49,8 +51,22 @@ Mix groups and exact names as needed, e.g. `tools: [read, search, task_list]`.
 
 - `create_file`/`write_file`/`replace_in_file`/`delete_file` are governed by `codingHarness.editPolicy`.
 - `run_command` is governed by `codingHarness.commandPolicy`.
+- `browser_tool` navigation/actions are governed by `codingHarness.browsePolicy` (`auto-safe`/`ask`/`deny-all`).
 - `delete_file` always requires approval.
 - `tools: []` or a malformed policy fails closed (no tools).
+
+## Browser tool setup
+
+The `browser_tool` uses Playwright to drive a headless Chromium browser. Playwright is **not bundled** with the extension (to keep the download small). On first use of `browser_tool`, you'll be prompted to install it:
+
+```
+Browser automation requires Playwright, which is not installed.
+Run "npm install playwright-core" in the workspace to enable browser tools.
+```
+
+Once installed, Playwright downloads Chromium on first launch and keeps a persistent session per workspace (cookies, localStorage, page state survive across calls). Every action returns an accessibility snapshot so you can target elements by role/name/ref. Navigated URLs are also opened in VS Code's Simple Browser tab so you can watch the automation in the editor.
+
+The browser session closes automatically when the extension deactivates.
 
 ## Task list enforcement (required)
 

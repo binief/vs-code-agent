@@ -123,7 +123,7 @@ export interface Provider {
 export type ApprovalDecision = 'apply' | 'reject';
 
 export interface ApprovalRequest {
-  kind: 'write' | 'delete' | 'command';
+  kind: 'write' | 'delete' | 'command' | 'navigate';
   /** Short headline, e.g. `Write src/app.py`. */
   title: string;
   /** Body text: unified-ish diff for writes, the raw command line for commands. */
@@ -195,6 +195,8 @@ export interface HarnessHost {
   prompt?(message: string, options: string[]): Promise<number | undefined>;
   /** Editor/workspace facts used to build the context section of the prompt. */
   getWorkspaceContext?(): WorkspaceContext | Promise<WorkspaceContext>;
+  /** Browser automation manager, available when Playwright is installed. */
+  browser?: any;
 }
 
 /* --------------------------------------------------------------- config */
@@ -202,6 +204,7 @@ export interface HarnessHost {
 export type ProviderId = 'openai' | 'anthropic' | 'mock' | 'copilot';
 export type EditPolicy = 'ask' | 'auto';
 export type CommandPolicy = 'auto-safe' | 'ask' | 'auto-all' | 'deny-all';
+export type BrowsePolicy = 'auto-safe' | 'ask' | 'deny-all';
 export type LineEndingPreference = 'auto' | 'lf' | 'crlf' | 'cr' | 'native';
 
 /** Transport used to reach an MCP server. Inferred from `url`/`command` when omitted. */
@@ -299,6 +302,7 @@ export interface HarnessConfig {
   maxOutputTokens: number;
   editPolicy: EditPolicy;
   commandPolicy: CommandPolicy;
+  browsePolicy: BrowsePolicy;
   allowDangerousCommands: boolean;
   commandTimeoutMs: number;
   allowOutsideWorkspace: boolean;
@@ -346,6 +350,7 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   maxOutputTokens: 2048,
   editPolicy: 'ask',
   commandPolicy: 'auto-safe',
+  browsePolicy: 'auto-safe',
   allowDangerousCommands: false,
   commandTimeoutMs: 60_000,
   allowOutsideWorkspace: false,

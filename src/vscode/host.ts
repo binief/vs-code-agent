@@ -12,6 +12,7 @@ import type {
   WorkspaceContext,
 } from '../core/types';
 import type { Logger } from './log';
+import { BrowserManager } from '../core/tools/browserTool';
 
 /** Compare editor and disk paths even when they use different symlink aliases. */
 function sameFilePath(left: string, right: string): boolean {
@@ -23,7 +24,7 @@ function sameFilePath(left: string, right: string): boolean {
   return canonical(left) === canonical(right);
 }
 
-export const APPROVAL_KINDS = ['write', 'delete', 'command'] as const;
+export const APPROVAL_KINDS = ['write', 'delete', 'command', 'navigate'] as const;
 
 type PendingResolver = (decision: ApprovalDecision) => void;
 
@@ -141,6 +142,7 @@ export interface VsCodeHostOptions {
   root: string;
   log: Logger;
   approvals: ApprovalService;
+  browser?: BrowserManager;
 }
 
 /**
@@ -152,9 +154,11 @@ export interface VsCodeHostOptions {
  */
 export class VsCodeHost implements HarnessHost {
   readonly workspaceRoot: string;
+  readonly browser?: BrowserManager;
 
   constructor(private readonly opts: VsCodeHostOptions) {
     this.workspaceRoot = opts.root;
+    this.browser = opts.browser;
   }
 
   log(level: 'debug' | 'info' | 'warn' | 'error', message: string): void {
