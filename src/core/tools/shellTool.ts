@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { evaluateCommand } from '../policy';
@@ -36,6 +36,20 @@ interface RunningCommandEntry {
  *  so they can be listed or killed when they hang. */
 const runningCommands = new Map<number, RunningCommandEntry>();
 
+/** Optional callback invoked whenever the running-commands set changes,
+ *  so the host layer can sync the webview UI proactively. */
+let onRunningCommandsChange: (() => void) | undefined;
+
+/** Register a callback to be invoked on every running-commands change. */
+export function setRunningCommandsChangeHandler(handler: () => void): void {
+  onRunningCommandsChange = handler;
+}
+
+/** Notify listeners that the running-commands set has changed. */
+function notifyRunningCommandsChange(): void {
+  onRunningCommandsChange?.();
+}
+
 /** Returns info about all currently running shell commands. */
 export function getRunningCommands(): RunningCommandInfo[] {
   return [...runningCommands.values()].map((entry) => entry.info);
@@ -53,6 +67,7 @@ export function killRunningCommand(pid: number): boolean {
   if (!entry) return false;
   killTree(entry.child);
   runningCommands.delete(pid);
+  notifyRunningCommandsChange();
   return true;
 }
 
@@ -63,6 +78,7 @@ export function killAllRunningCommands(): number {
     killTree(entry.child);
   }
   runningCommands.clear();
+  if (count > 0) notifyRunningCommandsChange();
   return count;
 }
 
@@ -186,6 +202,7 @@ export function runShellCommand(
       outputLines: [],
     };
     runningCommands.set(child.pid ?? 0, { child, info, outputBuffer: '' });
+    notifyRunningCommandsChange();
 
     const cleanupTracking = () => {
       // Flush any remaining partial line before removing from tracking.
@@ -197,6 +214,7 @@ export function runShellCommand(
         }
       }
       runningCommands.delete(child.pid ?? 0);
+      notifyRunningCommandsChange();
     };
 
     /** Kill the child process tree and resolve as cancelled/terminated. */
@@ -228,6 +246,7 @@ export function runShellCommand(
           // Auto-kill detached process after explicit timeout.
           killTree(child);
           runningCommands.delete(child.pid ?? 0);
+          notifyRunningCommandsChange();
           if (!settled) {
             settled = true;
             opts.signal?.removeEventListener('abort', onAbort);
@@ -295,6 +314,31 @@ function cap(text: string): string {
   return `${text.slice(0, MAX_OUTPUT_CHARS)}\n\u2026 [output truncated]`;
 }
 
+/**
+ * Recursively find all descendant PIDs of a process on Unix and SIGKILL them,
+ * then kill the root process itself. Used when process-group kill is not
+ * sufficient (e.g. grandchildren that created their own process groups).
+ */
+function killProcessTreeUnix(pid: number): void {
+  try {
+    const stdout = execFileSync('ps', ['-eo', 'pid,ppid'], { encoding: 'utf8' });
+    const children: number[] = [];
+    for (const line of stdout.trim().split('\n').slice(1)) {
+      const parts = line.trim().split(/\s+/);
+      const ppid = Number(parts[1]);
+      const cpid = Number(parts[0]);
+      if (ppid === pid) children.push(cpid);
+    }
+    // Kill descendants depth-first so parents are killed after children.
+    for (const cpid of children) {
+      killProcessTreeUnix(cpid);
+      try { process.kill(cpid, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  } catch {
+    /* ps unavailable or pid already gone; nothing more to do */
+  }
+}
+
 function killTree(child: ReturnType<typeof spawn>): void {
   if (child.pid === undefined) return;
   try {
@@ -306,19 +350,23 @@ function killTree(child: ReturnType<typeof spawn>): void {
       // with taskkill /T /F so no orphaned server processes survive.
       spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
     } else {
-      // Kill the entire process group (shell + all grandchildren such as
-      // a Maven daemon or Node server spawned by the shell). Use a positive
-      // PID first in case -pid is not a valid process group ID, then fall
-      // back to the negated process-group kill.
+      // Kill the entire process group first (shell + all grandchildren such as
+      // a Maven daemon or Node server spawned by the shell). If the shell PID
+      // is not a process-group leader this fails silently, so we fall through
+      // to recursive descendant killing.
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        /* process group may not exist; fall through to recursive kill below */
+      }
+      // Recursively find and kill all descendant processes so orphaned
+      // grandchildren (e.g. a Java server forked by Maven) cannot survive.
+      killProcessTreeUnix(child.pid);
+      // Finally ensure the shell itself is dead.
       try {
         process.kill(child.pid, 'SIGKILL');
       } catch {
         /* child may already be gone */
-      }
-      try {
-        process.kill(-child.pid, 'SIGKILL');
-      } catch {
-        /* process group may not exist; child.kill('SIGKILL') above was tried */
       }
     }
   } catch {

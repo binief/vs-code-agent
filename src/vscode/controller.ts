@@ -16,6 +16,7 @@ import {
   getRunningCommandOutput,
   killRunningCommand,
   killAllRunningCommands,
+  setRunningCommandsChangeHandler,
   getDetachedProcesses,
   killDetachedProcess,
   killAllDetachedProcesses,
@@ -356,6 +357,14 @@ export class HarnessController {
         void this.browserManager?.close();
       }));
     }
+
+    // Wire running-commands change notifications so the webview UI stays in
+    // sync with the backend process registry without requiring manual refresh.
+    // Uses 'running-commands-update' (not 'running-commands') so the frontend
+    // updates its local array without popping the modal on every change.
+    setRunningCommandsChangeHandler(() => {
+      this.post({ type: 'running-commands-update', commands: getRunningCommands() });
+    });
   }
 
   /* ------------------------------------------------------------- wiring */
@@ -715,6 +724,10 @@ export class HarnessController {
     await this.whenReady();
     this.cancel();
     this.approvals.cancelAll();
+    // Kill every tracked shell command unconditionally so detached background
+    // processes (e.g. dev servers started with detached: true) do not survive
+    // extension deactivation or reload as untracked orphans.
+    killAllRunningCommands();
     // Close the Playwright browser session on deactivation.
     void this.browserManager?.close();
     // Honor the latest setting even if its change event is still queued.
