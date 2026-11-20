@@ -332,6 +332,10 @@ export interface HarnessConfig {
    * project scan is performed. Each slice becomes a task_list item the
    * model works through in order. */
   decompositionEnabled: boolean;
+
+  /** Per-tool execution timeout in milliseconds. Applied in
+   * HarnessSession.executeToolCall around tool.run(). 0 disables the timeout. */
+  toolTimeoutMs: number;
   /** Instructions loaded from agent.md/AGENTS.md files. */
   agentFiles: AgentFilesConfig;
   /** Which factual context is included in the system message. */
@@ -362,6 +366,7 @@ export const DEFAULT_CONFIG: HarnessConfig = {
   subagentsEnabled: false,
   taskListEnabled: true,
   decompositionEnabled: false,
+  toolTimeoutMs: 30_000,
   agentFiles: {
     enabled: true,
     names: ['AGENTS.md', 'agent.md', 'agents.md', 'copilot-instructions.md'],

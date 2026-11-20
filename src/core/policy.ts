@@ -51,7 +51,7 @@ const SAFE_PATTERNS: RegExp[] = [
   // Infrastructure / process-management commands used to start, wait on, and
   // inspect long-running services. These are read-only with respect to the
   // workspace and safe to run under auto-safe even when chained.
-  /^\s*(set\b|start\s+\/b\b|timeout\b|netstat\b|findstr\b|tasklist\b|ping\b|curl\b|wget\b)\b/,
+  /^\s*(set\b|start\s+\/b\b|timeout\b|netstat\b|findstr\b|tasklist\b|ping\b)\b/,
 ];
 
 /** Risky but legitimate commands: always confirmed, even under `auto-safe`. */
