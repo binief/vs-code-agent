@@ -113,6 +113,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           activity: this.controller.getActivity(),
           compactionTrace: this.controller.getCompactionTrace(),
           taskList: this.controller.getTaskListItems(),
+          runningCommands: this.controller.getRunningCommands(),
         });
         break;
       case 'submit':

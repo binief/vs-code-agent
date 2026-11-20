@@ -2588,6 +2588,7 @@
         applyActivity(message.activity);
         applyCompactionTrace(message.compactionTrace);
         renderTaskStrip(message.taskList ?? []);
+        if (message.runningCommands) runningCommands = message.runningCommands;
         if (message.usage) {
           cumulativeUsage = message.usage;
           updateTokenChips();
@@ -2789,6 +2790,12 @@
           }
         }
         break;
+      case 'running-commands-update': {
+        // Proactive backend push: update the local array without showing the
+        // modal, so the UI is accurate when the user opens it later.
+        runningCommands = message.commands ?? [];
+        break;
+      }
       case 'running-commands': {
         showRunningCommandsModal(message.commands ?? []);
         break;
