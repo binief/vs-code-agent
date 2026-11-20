@@ -470,6 +470,7 @@ export class HarnessSession {
         this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
       }
       this.taskListApproved = true;
+      this.taskListApprovedSnapshot = [...(this.taskList?.list() ?? [])];
     }
   }
 
@@ -560,6 +561,7 @@ export class HarnessSession {
           this.currentOnEvent?.({ type: 'task-list', items: this.taskList?.list() ?? [] });
         }
         this.taskListApproved = true;
+        this.taskListApprovedSnapshot = [...(this.taskList?.list() ?? [])];
       }
     } catch (err) {
       this.deps.host.log(
@@ -699,8 +701,9 @@ export class HarnessSession {
     // Reset server-side compaction counter for this task.
     this.serverSideCompactionCount = 0;
     // Reset task list approval state for this task run, unless it was already
-    // approved AND the task list hasn't changed since approval. If new tasks
-    // were added or existing ones modified, re-approval is required.
+    // approved AND the task list structure hasn't changed since approval
+    // (same items in the same order). Status changes (marking items done,
+    // in-progress) are progress updates and do not require re-approval.
     if (this.taskListApproved && this.taskListApprovedSnapshot) {
       const snapshot = this.taskListApprovedSnapshot;
       const current = this.taskList.list();
@@ -708,9 +711,7 @@ export class HarnessSession {
         current.length === snapshot.length &&
         current.every(
           (item, i) =>
-            item.id === snapshot[i].id &&
-            item.title === snapshot[i].title &&
-            item.status === snapshot[i].status,
+            item.id === snapshot[i].id && item.title === snapshot[i].title,
         );
       if (!same) {
         this.taskListApproved = false;
@@ -999,6 +1000,7 @@ export class HarnessSession {
             continue;
           }
           this.taskListApproved = true;
+          this.taskListApprovedSnapshot = [...(this.taskList?.list() ?? [])];
         }
         steps = step;
         onEvent({ type: 'step', index: step, maxSteps: 0 });
