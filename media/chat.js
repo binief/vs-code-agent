@@ -131,14 +131,18 @@
     return svg;
   }
 
-  function escapeHtml(value) {
+  /**
+   * The single HTML-escape helper. A const function expression cannot be
+   * shadowed by another hoisted declaration added later in this scope.
+   */
+  const escapeHtml = function escapeHtml(value) {
     return String(value)
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;');
-  }
+  };
 
   function oneLine(text, limit) {
     const flat = String(text || '').replace(/\s+/g, ' ').trim();
@@ -150,13 +154,6 @@
     if (ms < 1000) return ms + 'ms';
     if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
     return Math.round(ms / 60000) + 'm';
-  }
-
-  function formatTokens(n) {
-    if (n == null) return '0';
-    if (n < 1000) return String(n);
-    if (n < 10000) return (n / 1000).toFixed(1) + 'k';
-    return Math.round(n / 1000) + 'k';
   }
 
   function formatBytes(bytes) {
@@ -177,6 +174,10 @@
       return '\u0000' + (codes.length - 1) + '\u0000';
     });
 
+    // URLs are matched after escaping: quotes are now `&quot;`, so they cannot
+    // terminate the href attribute. Restore them only when setting the DOM value.
+    // Quotes have already been escaped, so they cannot terminate the href
+    // attribute. They are decoded once the DOM node is built below.
     out = out.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" rel="noreferrer">$1</a>');
     out = out.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
     out = out.replace(/(^|[\s([{>])__([^_\n]+)__/g, '$1<strong>$2</strong>');
@@ -303,6 +304,12 @@
   }
 
   /** Markdown -> HTML. Escaping happens first; only tags built here are emitted. */
+  function restoreLinkUrls(root) {
+    for (const link of root.querySelectorAll('a[href]')) {
+      link.setAttribute('href', link.getAttribute('href').replace(/&quot;/g, '"').replace(/&#39;/g, "'"));
+    }
+  }
+
   function renderMarkdown(source) {
     const lines = String(source == null ? '' : source).replace(/\r\n?/g, '\n').split('\n');
     const out = [];
@@ -982,6 +989,7 @@
 
     const body = el('div', 'msg-body prose');
     body.innerHTML = renderMarkdown(item.text);
+    restoreLinkUrls(body);
     if (item.streaming) caretInto(body);
     node.appendChild(body);
 
@@ -1258,7 +1266,7 @@
 
   function showTaskListApproval(items) {
     if (taskListApprovalModal) return; // already showing
-    const modal = el('div', 'modal task-list-approval-modal');
+    const modal = el('div', 'task-list-approval-overlay task-list-approval-modal');
     modal.innerHTML = `
       <div class="modal-card task-list-approval-card">
         <div class="modal-head">
@@ -1273,10 +1281,9 @@
               return `<li><span class="task-number">${i + 1}.</span> <span class="task-mark">${mark}</span> <span class="task-title">${escapeHtml(item.title)}</span></li>`;
             }).join('')}
           </ul>
-          <p class="task-list-approval-hint">Review the list. Approve to proceed, or edit items before continuing.</p>
+          <p class="task-list-approval-hint">Review the list and approve to proceed. Use the task commands to change items afterwards.</p>
         </div>
         <div class="modal-actions">
-          <button class="modal-btn secondary" data-action="edit">Edit items</button>
           <button class="modal-btn danger" data-action="reject">Reject</button>
           <button class="modal-btn primary" data-action="approve">Approve</button>
         </div>
@@ -1310,12 +1317,6 @@
     setTimeout(() => notice.remove(), 5000);
   }
 
-  function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-  }
-
   const DONE_LABEL = {
     complete: 'Done',
     'max-steps': 'Step limit reached',
@@ -1346,6 +1347,7 @@
     if (item.summary) {
       const summary = el('div', 'done-summary prose');
       summary.innerHTML = renderMarkdown(item.summary);
+      restoreLinkUrls(summary);
       node.appendChild(summary);
     }
 
@@ -1483,6 +1485,7 @@
       return;
     }
     body.innerHTML = renderMarkdown(item.text);
+    restoreLinkUrls(body);
     if (item.streaming) caretInto(body);
     delete node.dataset.pendingRender;
   }
@@ -2611,6 +2614,15 @@
             items.delete(existingId);
           }
         }
+        if (message.item.kind === 'approval') {
+          const existing = [...items.entries()].find(
+            ([, item]) => item.kind === 'approval' && item.approvalId === message.item.approvalId,
+          );
+          if (existing) {
+            updateItem({ ...message.item, id: existing[0] });
+            break;
+          }
+        }
         addItem(message.item, message.item.kind === 'user' || message.item.kind === 'approval');
         break;
       case 'update':
@@ -2744,6 +2756,7 @@
         }
         break;
       case 'approval-request':
+        if ([...items.values()].some((item) => item.kind === 'approval' && item.approvalId === message.id)) break;
         addItem(
           {
             id: 'approval-' + message.id,
@@ -2754,6 +2767,19 @@
           true,
         );
         break;
+      case 'approval-resolved': {
+        const entry = [...items.entries()].find(([, item]) => item.kind === 'approval' && item.approvalId === message.id);
+        if (entry) {
+          const resolved = { ...entry[1], decision: message.decision, interrupted: !!message.interrupted };
+          items.set(entry[0], resolved);
+          const node = elements.get(entry[0]);
+          const replacement = renderApproval(resolved);
+          if (node?.parentElement) node.parentElement.replaceChild(replacement, node);
+          else if (node) node.replaceWith(replacement);
+          elements.set(entry[0], replacement);
+        }
+        break;
+      }
       case 'reset':
         rebuild([]);
         clearAttachments();

@@ -16,6 +16,7 @@ import {
   getRunningCommandOutput,
   killRunningCommand,
   killAllRunningCommands,
+  clearRunningCommandsChangeHandler,
   setRunningCommandsChangeHandler,
   getDetachedProcesses,
   killDetachedProcess,
@@ -53,6 +54,7 @@ import {
 import { CHAT_ARCHIVE_FORMAT, CHAT_ARCHIVE_VERSION, MAX_CHAT_ARCHIVE_BYTES, parseChatArchive, type ChatArchive } from './chatArchive';
 import type { ApprovalService } from './host';
 import { BrowserManager } from '../core/tools/browserTool';
+import { createBrowserToolInvoker } from './browserToolInvoker';
 import { VsCodeHost } from './host';
 import type { Logger } from './log';
 import type { ProposalStore } from './proposals';
@@ -254,7 +256,7 @@ export class HarnessController {
   private session?: HarnessSession;
   private host?: VsCodeHost;
   private mcpManager?: McpManager;
-  /** Persistent Playwright browser session for browser_tool automation. */
+  /** Bridge to VS Code's integrated browser tools for browser_tool automation. */
   private browserManager?: BrowserManager;
   /** Last loaded MCP config files (kept for the dialog and state). */
   private mcpFileConfig?: McpFileConfig;
@@ -335,6 +337,8 @@ export class HarnessController {
   private lastTokensPerSecond = 0;
   /** Pinned instruction files; absent means "everything discovered". */
   private agentSelection?: string[];
+  /** Approval requests currently shown as webview cards, keyed by ApprovalService id. */
+  private readonly liveApprovals = new Map<string, ApprovalRequest>();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -348,9 +352,9 @@ export class HarnessController {
     if (stored && stored.length > 0) this.agentSelection = stored;
     this.chatSaveSettings = this.readChatSaveSettings();
     this.ready = this.restoreSavedChat();
-    // Create the Playwright browser manager for browser_tool automation.
-    // It starts lazily on first browser_tool call (detect-and-prompt for Playwright).
-    this.browserManager = new BrowserManager();
+    // browser_tool drives VS Code's own integrated browser through the
+    // built-in language model tools. No browser runtime is bundled here.
+    this.browserManager = new BrowserManager(createBrowserToolInvoker(), (level, message) => this.log[level](message));
     // Register cleanup on extension deactivation (guarded for test contexts without subscriptions).
     if (context.subscriptions) {
       context.subscriptions.push(new vscode.Disposable(() => {
@@ -723,12 +727,13 @@ export class HarnessController {
   async shutdown(): Promise<void> {
     await this.whenReady();
     this.cancel();
-    this.approvals.cancelAll();
+    this.cancelApprovals();
     // Kill every tracked shell command unconditionally so detached background
     // processes (e.g. dev servers started with detached: true) do not survive
     // extension deactivation or reload as untracked orphans.
     killAllRunningCommands();
-    // Close the Playwright browser session on deactivation.
+    clearRunningCommandsChangeHandler();
+    // Release the browser page handle on deactivation; VS Code owns the tab.
     void this.browserManager?.close();
     // Honor the latest setting even if its change event is still queued.
     await this.refreshChatSaveSettings();
@@ -821,7 +826,7 @@ export class HarnessController {
       void vscode.window.showWarningMessage('The current chat changed while importing. Please try again.');
       return;
     }
-    this.approvals.cancelAll();
+    this.cancelApprovals();
     this.approvals.forgetAll();
     this.clearCompactionTrace();
     this.applyChatArchive(archive);
@@ -952,9 +957,16 @@ export class HarnessController {
 
   private async resolveApiKey(config: HarnessConfig): Promise<string | undefined> {
     if (config.provider === 'copilot' || config.provider === 'mock') return undefined;
-    if (config.apiKey?.trim()) return config.apiKey.trim();
+    // Secret storage is the documented, safer home for keys; a stale plaintext
+    // setting must not silently override a key the user moved into secrets.
     const stored = await this.secretKey();
-    if (stored?.trim()) return stored.trim();
+    if (stored?.trim()) {
+      if (config.apiKey?.trim()) {
+        this.log.warn('Both a stored secret and codingHarness.apiKey are set; using the stored secret.');
+      }
+      return stored.trim();
+    }
+    if (config.apiKey?.trim()) return config.apiKey.trim();
     return apiKeyFromEnv(config.provider);
   }
 
@@ -1001,7 +1013,23 @@ export class HarnessController {
 
   /* ------------------------------------------------------------- session */
 
+  private sessionInit?: Promise<HarnessSession>;
+
+  private mcpSignatureFor(root: string, config: HarnessConfig, servers: Record<string, unknown>): string {
+    return JSON.stringify({ root, servers, timeout: config.mcp.timeoutMs });
+  }
+
+  /** Serialize session/MCP setup so two quick commands cannot race. */
   private async ensureSession(): Promise<HarnessSession> {
+    if (this.sessionInit) return this.sessionInit;
+    const pending = this.ensureSessionInner().finally(() => {
+      if (this.sessionInit === pending) this.sessionInit = undefined;
+    });
+    this.sessionInit = pending;
+    return pending;
+  }
+
+  private async ensureSessionInner(): Promise<HarnessSession> {
     const root = this.workspaceRoot();
     if (!root) throw new Error('Open a folder or workspace before running the Coding Harness.');
 
@@ -1021,7 +1049,7 @@ export class HarnessController {
     // re-read here so editing `.mcp.json` is picked up on the next task.
     const mcp = await this.resolveMcpServers(config, root);
     let toolRegistry: ToolRegistry;
-    const signature = JSON.stringify({ servers: mcp.servers, timeout: config.mcp.timeoutMs });
+    const signature = this.mcpSignatureFor(root, config, mcp.servers);
     if (config.mcp.enabled && Object.keys(mcp.servers).length > 0) {
       try {
         if (this.mcpManager && this.mcpSignature === signature) {
@@ -1033,8 +1061,10 @@ export class HarnessController {
           }
           this.mcpManager = new McpManager(root, config.mcp.timeoutMs);
           const { started, failed } = await this.mcpManager.startServers(mcp.servers);
-          this.mcpSignature = signature;
           if (started.length > 0) {
+            // Only cache a signature that produced a usable manager; failures
+            // must be retried on the next task instead of being stuck.
+            this.mcpSignature = signature;
             this.log.info(`MCP: started ${started.length} server(s): ${started.join(', ')}`);
             this.post({ type: 'mcp-status', enabled: true, servers: started.length, tools: this.mcpManager.toolCount });
           }
@@ -1081,9 +1111,11 @@ export class HarnessController {
     } else {
       this.session.updateConfig(config);
       this.session.setProvider(provider);
-      // If tools changed, we need to recreate session to pick up new registry
-      // For simplicity, we recreate registry via a private field hack: create new session if tool count changed
-      if (toolRegistry && toolRegistry.size !== this.session.toolNames.length) {
+      // Recreate the session whenever the tool set changes, even if the count
+      // stays the same (e.g. one MCP server is swapped for another).
+      const sameTools = toolRegistry
+        && toolRegistry.names().slice().sort().join('\u0000') === this.session.toolNames.slice().sort().join('\u0000');
+      if (!sameTools) {
         // Preserve task list items and approval state before recreating the
         // session, so task items survive tool registry changes.
         const oldTaskListItems = this.session.taskListStore?.list() ?? [];
@@ -1300,7 +1332,7 @@ export class HarnessController {
     } finally {
       this.flushAllStreams();
       this.setStatus('idle', false);
-      this.approvals.cancelAll();
+      this.cancelApprovals();
       this.trimItems();
       await this.persistChat();
     }
@@ -1514,7 +1546,7 @@ export class HarnessController {
     // Reject any pending approvals (file writes, command runs) so the
     // waiting tool calls fail fast instead of hanging until the user
     // clicks Apply/Reject on a cancelled task.
-    this.approvals.cancelAll();
+    this.cancelApprovals();
     this.pushNotice('info', 'Cancelling the current task…');
   }
 
@@ -1532,7 +1564,7 @@ export class HarnessController {
     this.restoredOriginalHistory = [];
     this.restoredOriginalComplete = true;
     // Reject any pending approvals so they don't dangle after a reset.
-    this.approvals.cancelAll();
+    this.cancelApprovals();
     this.approvals.forgetAll();
     this.cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
     this.lastTokensPerSecond = 0;
@@ -1646,7 +1678,7 @@ export class HarnessController {
       } else {
         this.mcpManager = undefined;
       }
-      this.mcpSignature = JSON.stringify({ servers: mcp.servers, timeout: config.mcp.timeoutMs });
+      this.mcpSignature = started > 0 ? this.mcpSignatureFor(root, config, mcp.servers) : undefined;
       const toolCount = this.mcpManager?.toolCount ?? 0;
       this.state = {
         ...this.state,
@@ -2168,6 +2200,10 @@ export class HarnessController {
   /** Undo every file change made during the last task. */
   async revertLastTask(): Promise<void> {
     await this.whenReady();
+    if (this.isBusy) {
+      void vscode.window.showWarningMessage('Stop or finish the current task before reverting changes.');
+      return;
+    }
     if (!this.session) {
       void vscode.window.showInformationMessage('Nothing to revert yet.');
       return;
@@ -2211,16 +2247,41 @@ export class HarnessController {
     void vscode.window.showTextDocument(vscode.Uri.file(abs), { preview: false, preserveFocus: false });
   }
 
+  /**
+   * Remember an approval request as soon as it is handed to the webview. The
+   * card is created by chatView, so this is the only reliable place to get the
+   * real request (and its id) into the transcript for diff/remember/undo.
+   */
+  recordApprovalRequest(id: string, request: ApprovalRequest): void {
+    this.liveApprovals.set(id, request);
+    this.push({
+      id: this.id(),
+      kind: 'approval',
+      approvalId: id,
+      request,
+    });
+  }
+
   /** Called by the webview when the user answers an approval card. */
   respondToApproval(id: string, decision: 'apply' | 'reject', remember?: 'kind' | 'all'): void {
+    const request = this.liveApprovals.get(id);
     if (decision === 'apply' && remember) {
-      const item = this.items.find(
-        (i): i is Extract<TranscriptItem, { kind: 'approval' }> => i.kind === 'approval' && i.approvalId === id,
-      );
-      this.approvals.rememberAlways(remember === 'all' ? 'all' : (item?.request.kind ?? 'all'));
+      this.approvals.rememberAlways(remember === 'all' ? 'all' : (request?.kind ?? 'all'));
     }
+    this.liveApprovals.delete(id);
     this.approvals.resolve(id, decision);
     this.patchApproval(id, decision);
+    this.post({ type: 'approval-resolved', id, decision, interrupted: false });
+  }
+
+  /** Reject pending approvals and close their webview cards. */
+  private cancelApprovals(): void {
+    for (const id of this.liveApprovals.keys()) {
+      this.patchApproval(id, 'reject');
+      this.post({ type: 'approval-resolved', id, decision: 'reject', interrupted: true });
+    }
+    this.liveApprovals.clear();
+    this.approvals.cancelAll();
   }
 
   /** Called by the webview when the user responds to a task-list approval request. */
@@ -2348,6 +2409,8 @@ export class HarnessController {
             request: event.request,
           });
         } else {
+          // The webview card is resolved by respondToApproval() using the
+          // ApprovalService id; this event uses the tool-call id.
           this.patchApproval(event.id, event.decision);
         }
         break;

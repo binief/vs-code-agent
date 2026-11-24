@@ -2,7 +2,7 @@
   "name": "coding-harness",
   "displayName": "Coding Harness",
   "description": "A tool harness for VS Code: file create/edit/search, shell commands and MCP tools, with context about the environment and workspace. Project instructions come from your agent.md files.",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "publisher": "binief",
   "license": "MIT",
   "repository": {
@@ -14,7 +14,7 @@
   },
   "homepage": "https://github.com/binief/vs-code-agent#readme",
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.95.0"
   },
   "categories": [
     "AI",
@@ -46,7 +46,12 @@
     "onCommand:codingHarness.openAgentFiles",
     "onCommand:codingHarness.reloadAgentFiles",
     "onCommand:codingHarness.previewContext",
-    "onCommand:codingHarness.selectCopilotModel"
+    "onCommand:codingHarness.selectCopilotModel",
+    "onCommand:codingHarness.listDetachedProcesses",
+    "onCommand:codingHarness.stopDetachedCommands",
+    "onCommand:codingHarness.listRunningCommands",
+    "onCommand:codingHarness.stopRunningCommands",
+    "onCommand:codingHarness.showCommandOutput"
   ],
   "contributes": {
     "viewsContainers": {
@@ -142,6 +147,26 @@
       {
         "command": "codingHarness.selectCopilotModel",
         "title": "Coding Harness: Select Copilot Model"
+      },
+      {
+        "command": "codingHarness.listDetachedProcesses",
+        "title": "Coding Harness: List Detached Background Processes"
+      },
+      {
+        "command": "codingHarness.stopDetachedCommands",
+        "title": "Coding Harness: Stop All Detached Background Processes"
+      },
+      {
+        "command": "codingHarness.listRunningCommands",
+        "title": "Coding Harness: List Running Commands"
+      },
+      {
+        "command": "codingHarness.stopRunningCommands",
+        "title": "Coding Harness: Stop Running Commands"
+      },
+      {
+        "command": "codingHarness.showCommandOutput",
+        "title": "Coding Harness: Show Command Output"
       }
     ],
     "menus": {

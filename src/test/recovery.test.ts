@@ -112,6 +112,23 @@ test('repairToolMessages drops orphaned results and unanswered calls', () => {
   assert.equal(repairToolMessages(repaired), repaired);
 });
 
+test('repairToolMessages removes duplicate call ids inside one assistant turn', () => {
+  const messages: ChatMessage[] = [
+    { role: 'user', content: 'do it' },
+    { role: 'assistant', content: '', toolCalls: [
+      { id: 'dup', name: 'read_file', arguments: '{}' },
+      { id: 'dup', name: 'read_file', arguments: '{}' },
+    ] },
+    { role: 'tool', toolCallId: 'dup', name: 'read_file', content: 'contents' },
+  ];
+
+  assert.deepEqual(auditToolMessages(messages).duplicateToolCalls, ['dup']);
+  const repaired = repairToolMessages(messages);
+  assert.deepEqual(repaired[1].toolCalls?.map((c) => c.id), ['dup']);
+  assert.equal(repaired.filter((m) => m.role === 'tool').length, 1);
+  assert.equal(isTranscriptWellFormed(repaired), true);
+});
+
 test('a cancelled tool batch leaves a transcript the provider still accepts', async () => {
   const dir = makeWorkspace();
   const provider = new StrictProvider((turn) =>

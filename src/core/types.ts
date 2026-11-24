@@ -56,6 +56,8 @@ export interface ChatMessage {
   /** tool only */
   toolCallId?: string;
   name?: string;
+  /** tool only: whether the tool succeeded, for protocols that label results. */
+  ok?: boolean;
 }
 
 export interface ToolSpec {
@@ -195,7 +197,7 @@ export interface HarnessHost {
   prompt?(message: string, options: string[]): Promise<number | undefined>;
   /** Editor/workspace facts used to build the context section of the prompt. */
   getWorkspaceContext?(): WorkspaceContext | Promise<WorkspaceContext>;
-  /** Browser automation manager, available when Playwright is installed. */
+  /** Browser automation manager backed by VS Code's integrated browser tools. */
   browser?: any;
 }
 

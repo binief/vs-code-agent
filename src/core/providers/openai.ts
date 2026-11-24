@@ -176,7 +176,7 @@ export class OpenAiCompatibleProvider implements Provider {
       if (displayText && req.onDelta) req.onDelta(displayText);
       if (extracted.thinking && req.onThinking) req.onThinking(extracted.thinking, true);
       return {
-        text: extracted.text,
+        text: displayText,
         toolCalls: parsed.toolCalls,
         finishReason: choice?.finish_reason ?? undefined,
         usage: normalizeUsage(json.usage),
@@ -341,7 +341,7 @@ function toChatmlMessages(messages: ChatMessage[], tools: ToolSpec[]): unknown[]
     if (m.role === 'tool') {
       // Tool results are sent back as user-turn text so a non-Jinja endpoint
       // can ingest them without a dedicated `tool` role.
-      const content = toolResultToText(m.toolCallId ?? '', m.name ?? '', m.content || '', true);
+      const content = toolResultToText(m.toolCallId ?? '', m.name ?? '', m.content || '', m.ok !== false);
       out.push({ role: 'user', content });
       continue;
     }
@@ -430,9 +430,10 @@ async function readChatmlStream(
         if (line.startsWith('data:')) handleData(line.slice(5));
         newline = sseBuffer.indexOf('\n');
       }
-      // Flush a trailing `data:` line that arrived without a newline.
-      if (sseBuffer.startsWith('data:')) handleData(sseBuffer.slice(5));
     }
+    // Flush the trailing `data:` line once, after the loop, so a later newline
+    // cannot replay the same delta/tool call and duplicate its side effects.
+    if (sseBuffer.startsWith('data:')) handleData(sseBuffer.slice(5));
     // Flush any remaining buffered text (incomplete tool-call blocks stay in
     // the parser and are not emitted as text).
     const flushed = parser.flush();

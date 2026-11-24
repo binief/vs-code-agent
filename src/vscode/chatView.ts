@@ -15,6 +15,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private messageDisposable?: vscode.Disposable;
   private templateHtml?: string;
+  /** The webview script posts `ready` only after its listeners are installed. */
+  private ready = false;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -24,6 +26,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
+    this.ready = false;
     view.webview.options = {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media')],
@@ -31,16 +34,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     view.webview.html = this.render(view.webview);
 
     this.messageDisposable?.dispose();
-    this.messageDisposable = view.webview.onDidReceiveMessage((message) => void this.handle(message));
+    this.messageDisposable = view.webview.onDidReceiveMessage((message) => {
+      void this.handle(message).catch((err) => this.log.warn(`panel message failed: ${(err as Error).message}`));
+    });
 
     view.onDidChangeVisibility(() => {
       if (view.visible) this.post({ type: 'state', state: this.controller.getState() });
     });
   }
 
-  /** True when the approval was actually delivered to a visible panel. */
+  /** True when the approval was actually delivered to a ready, visible panel. */
   postApproval(id: string, request: ApprovalRequest): boolean {
-    if (!this.view || !this.view.visible) return false;
+    if (!this.view || !this.view.visible || !this.ready) return false;
+    this.controller.recordApprovalRequest(id, request);
     this.post({ type: 'approval-request', id, request });
     return true;
   }
@@ -105,6 +111,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     switch (message.type) {
       case 'ready':
       case 'reload':
+        this.ready = true;
         if (!this.controller.isBusy) await this.controller.refreshState();
         this.post({
           type: 'init',

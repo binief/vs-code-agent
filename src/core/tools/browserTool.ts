@@ -1,6 +1,4 @@
-import * as path from 'path';
-import { fail, ok, type Tool } from '../types';
-import { resolveWorkspacePath } from '../paths';
+import { fail, type Tool } from '../types';
 
 // `window` and `document` are referenced inside page.evaluate() callbacks,
 // which run in the browser context, not the Node.js context.
@@ -13,11 +11,37 @@ const MAX_SNAPSHOT_ELEMENTS = 60;
 /** Maximum characters for any single element description in a snapshot. */
 const MAX_ELEMENT_DESCRIPTION = 120;
 
-/** Default navigation timeout in ms. */
-const DEFAULT_NAVIGATE_TIMEOUT_MS = 30_000;
-
 /** Default action timeout in ms. */
 const DEFAULT_ACTION_TIMEOUT_MS = 10_000;
+
+/**
+ * The VS Code built-in browser tools this manager relies on. They are exposed
+ * to extensions through `vscode.lm.tools` / `vscode.lm.invokeTool`, which is
+ * how Copilot drives the integrated browser. Keeping the call behind this
+ * small interface lets the core tool stay platform-agnostic and unit-testable.
+ */
+export const REQUIRED_BROWSER_TOOL_NAMES = [
+  'open_browser_page',
+  'navigate_page',
+  'read_page',
+  'click_element',
+  'type_in_page',
+  'run_playwright_code',
+] as const;
+
+/** Result of invoking a platform browser tool. */
+export interface BrowserInvocation {
+  /** Concatenated text content returned by the tool. */
+  text: string;
+}
+
+/** Bridge to VS Code's built-in browser tools (implemented in the vscode layer). */
+export interface BrowserToolInvoker {
+  /** Names of the language model tools currently available in this host. */
+  availableTools(): Promise<readonly string[]>;
+  /** Invoke a built-in browser tool with the given input. */
+  invoke(name: string, input: Record<string, unknown>): Promise<BrowserInvocation>;
+}
 
 /**
  * Information about an interactive element in the page accessibility tree.
@@ -75,375 +99,418 @@ export interface BrowserActionResult {
   error?: string;
 }
 
+type LogFn = (level: 'debug' | 'info' | 'warn' | 'error', message: string) => void;
+
+const noopLog: LogFn = () => {};
+
 /**
- * Manages a persistent Playwright browser session per workspace.
+ * Drives browser automation through VS Code's integrated browser tools.
  *
- * Lazily installs `playwright-core` on first use (detect-and-prompt), then
- * launches a headless Chromium with an isolated context so cookies, localStorage,
- * and page state persist across tool calls within a session.
+ * No browser engine or Playwright package is shipped with this extension:
+ * the `open_browser_page`, `navigate_page`, `type_in_page`, `click_element`,
+ * `read_page` and `run_playwright_code` tools are built into VS Code and are
+ * the same tools Copilot uses. This manager only translates browser_tool
+ * arguments into calls to those tools and normalizes their results.
  */
 export class BrowserManager {
-  private browser: any = null;
-  private context: any = null;
-  private page: any = null;
+  private invoker?: BrowserToolInvoker;
+  private pageId?: string;
   private started = false;
-  private playwright: any = null;
-  private installPending = false;
+  private log: LogFn = noopLog;
 
-  /** Whether Playwright is available (installed or already present). */
-  async isPlaywrightAvailable(): Promise<boolean> {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const pw = require('playwright-core');
-      this.playwright = pw;
-      return true;
-    } catch {
-      return false;
-    }
+  constructor(invoker?: BrowserToolInvoker, log?: LogFn) {
+    this.invoker = invoker;
+    if (log) this.log = log;
   }
 
-  /** Prompt the user to install Playwright, then launch the browser. */
-  async ensureStarted(log: (level: string, message: string) => void): Promise<void> {
-    if (this.started) return;
-    if (this.installPending) {
-      throw new Error('Playwright installation is already in progress.');
-    }
+  /** Attach the platform bridge after construction (used by test hosts). */
+  setInvoker(invoker: BrowserToolInvoker): void {
+    this.invoker = invoker;
+  }
 
-    const available = await this.isPlaywrightAvailable();
-    if (!available) {
-      this.installPending = true;
+  /** Verify that the built-in browser tools are available. */
+  private async ensureStarted(log?: LogFn): Promise<BrowserToolInvoker> {
+    if (log) this.log = log;
+    const invoker = this.invoker;
+    if (!invoker) {
       throw new Error(
-        'Browser automation requires Playwright, which is not installed. ' +
-          'Run "npm install playwright-core" in the workspace to enable browser tools.',
+        'Browser automation is not available in this environment: no browser tool bridge was configured.',
       );
     }
+    if (this.started) return invoker;
 
+    const available = await invoker.availableTools();
+    const missing = REQUIRED_BROWSER_TOOL_NAMES.filter((name) => !available.includes(name));
+    if (missing.length > 0) {
+      throw new Error(
+        'VS Code built-in browser tools are not available. ' +
+          'Use VS Code with the integrated browser enabled (workbench.browser.enableChatTools). ' +
+          `Missing tools: ${missing.join(', ')}.`,
+      );
+    }
+    this.started = true;
+    this.log('info', 'BrowserManager: using VS Code integrated browser tools');
+    return invoker;
+  }
+
+  /** Invoke a built-in tool, surfacing a clear error when it fails. */
+  private async call(invoker: BrowserToolInvoker, name: string, input: Record<string, unknown>): Promise<string> {
     try {
-      // Launch headless Chromium with an isolated browser context.
-      this.browser = await this.playwright.chromium.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox'],
-      });
-      this.context = await this.browser.newContext();
-      this.page = await this.context.newPage();
-      this.started = true;
-      log('info', 'BrowserManager: headless Chromium started');
+      const result = await invoker.invoke(name, input);
+      return result.text ?? '';
     } catch (err) {
-      throw new Error(
-        `Failed to start headless browser: ${(err as Error).message}. ` +
-          'Ensure Playwright is installed and a Chromium browser is available.',
-      );
+      throw new Error(`${name} failed: ${(err as Error).message}`);
     }
   }
 
-  /** Close the browser and release all resources. Called on extension deactivation. */
-  async close(): Promise<void> {
+  /** Extract the JSON value returned by a `run_playwright_code` snippet. */
+  private parseCodeResult(text: string): any {
+    const match = text.match(/Result:\s*([^\r\n]*)/);
+    if (!match) {
+      throw new Error(`Unexpected browser tool result: ${text.slice(0, 200)}`);
+    }
     try {
-      if (this.page) {
-        await this.page.close().catch(() => {});
-        this.page = null;
-      }
-      if (this.context) {
-        await this.context.close().catch(() => {});
-        this.context = null;
-      }
-      if (this.browser) {
-        await this.browser.close().catch(() => {});
-        this.browser = null;
-      }
+      return JSON.parse(match[1]);
     } catch {
-      /* best-effort cleanup */
+      throw new Error(`Could not parse browser tool result: ${match[1].slice(0, 200)}`);
     }
-    this.started = false;
   }
 
-  /** Get the current page, throwing if not started. */
-  private requirePage(): any {
-    if (!this.page) throw new Error('Browser not started. Call navigate() first.');
-    return this.page;
+  /** Run a Playwright snippet inside VS Code's integrated browser page. */
+  private async runCode(invoker: BrowserToolInvoker, pageId: string, code: string): Promise<any> {
+    const text = await this.call(invoker, 'run_playwright_code', {
+      pageId,
+      code,
+      timeoutMs: DEFAULT_ACTION_TIMEOUT_MS,
+    });
+    return this.parseCodeResult(text);
+  }
+
+  /** Short human-readable summary from a built-in tool result. */
+  private shortNote(text: string): string | undefined {
+    const cleaned = text.replace(/Result:[\s\S]*$/m, '').trim();
+    if (!cleaned) return undefined;
+    return cleaned.length > 700 ? `${cleaned.slice(0, 700)}…` : cleaned;
+  }
+
+  /** Build a failed action result with current page state where possible. */
+  private async failed(invoker: BrowserToolInvoker | undefined, error: string): Promise<BrowserActionResult> {
+    let snapshot: BrowserSnapshot = { url: '', title: '', elements: [] };
+    if (invoker && this.pageId) {
+      try {
+        snapshot = await this.captureSnapshot(invoker, this.pageId);
+      } catch {
+        /* keep the empty snapshot */
+      }
+    }
+    return { ok: false, url: snapshot.url, title: snapshot.title, elements: snapshot.elements, error };
   }
 
   /** Navigate to a URL and return a snapshot. */
-  async navigate(url: string, log: (level: string, message: string) => void): Promise<BrowserActionResult> {
-    const page = await this.ensureStartedAndGetPage(log);
+  async navigate(url: string, log?: LogFn): Promise<BrowserActionResult> {
+    let invoker: BrowserToolInvoker;
     try {
-      await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: DEFAULT_NAVIGATE_TIMEOUT_MS,
-      });
-      const snapshot = await this.captureSnapshot(page);
-      return { ok: true, url, title: await page.title().catch(() => ''), elements: snapshot.elements, note: snapshot.note };
+      invoker = await this.ensureStarted(log);
     } catch (err) {
-      const message = (err as Error).message;
-      const snapshot = this.page ? await this.captureSnapshot(this.page) : { elements: [], note: undefined };
-      return {
-        ok: false,
-        url,
-        title: '',
-        elements: snapshot.elements,
-        error: message,
-        note: snapshot.note,
-      };
+      return this.failed(undefined, (err as Error).message);
+    }
+
+    try {
+      if (!this.pageId) {
+        const text = await this.call(invoker, 'open_browser_page', { url, forceNew: true });
+        const match = text.match(/Page ID:\s*([^\s]+)/);
+        if (!match) return this.failed(invoker, `Could not open browser page: ${text.slice(0, 200)}`);
+        this.pageId = match[1];
+        const snapshot = await this.captureSnapshot(invoker, this.pageId, this.shortNote(text));
+        return { ok: true, ...snapshot };
+      }
+
+      const text = await this.call(invoker, 'navigate_page', { pageId: this.pageId, type: 'url', url });
+      const snapshot = await this.captureSnapshot(invoker, this.pageId, this.shortNote(text));
+      return { ok: true, ...snapshot };
+    } catch (err) {
+      return this.failed(invoker, (err as Error).message);
     }
   }
 
-  /** Click an element by selector or coordinates. */
+  /** Click an element by selector/ref or coordinates. */
   async click(selector?: string, x?: number, y?: number): Promise<BrowserActionResult> {
-    const page = this.requirePage();
-    let targetDesc = '';
+    let invoker: BrowserToolInvoker;
+    try {
+      invoker = await this.ensureStarted();
+    } catch (err) {
+      return this.failed(undefined, (err as Error).message);
+    }
+    if (!this.pageId) return this.failed(invoker, 'Navigate to a page before clicking.');
+
     try {
       if (selector) {
-        await page.click(selector, { timeout: DEFAULT_ACTION_TIMEOUT_MS });
-        targetDesc = selector;
+        const input: Record<string, unknown> = { pageId: this.pageId, element: selector };
+        const ref = selector.startsWith('aria-ref=') ? selector.slice('aria-ref='.length) : undefined;
+        if (ref) input.ref = ref;
+        else input.selector = selector;
+        await this.call(invoker, 'click_element', input);
       } else if (x !== undefined && y !== undefined) {
-        await page.click(`x=${x},y=${y}`, { timeout: DEFAULT_ACTION_TIMEOUT_MS });
-        targetDesc = `(${x},${y})`;
+        await this.runCode(invoker, this.pageId, `await page.mouse.click(${x}, ${y}); return { ok: true };`);
       } else {
-        return failResult(page, 'click requires a selector or x/y coordinates');
+        return this.failed(invoker, 'click requires a selector or x/y coordinates');
       }
-      const snapshot = await this.captureSnapshot(page);
-      return { ok: true, url: page.url(), title: await page.title().catch(() => ''), elements: snapshot.elements, note: snapshot.note };
+      const snapshot = await this.captureSnapshot(invoker, this.pageId);
+      return { ok: true, ...snapshot };
     } catch (err) {
-      return failResult(page, `click(${targetDesc}) failed: ${(err as Error).message}`);
+      return this.failed(invoker, `click failed: ${(err as Error).message}`);
     }
   }
 
   /** Type text into an element by selector. */
   async type(selector: string, text: string): Promise<BrowserActionResult> {
-    const page = this.requirePage();
+    let invoker: BrowserToolInvoker;
     try {
-      await page.fill(selector, text, { timeout: DEFAULT_ACTION_TIMEOUT_MS });
-      const snapshot = await this.captureSnapshot(page);
-      return { ok: true, url: page.url(), title: await page.title().catch(() => ''), elements: snapshot.elements, note: snapshot.note };
+      invoker = await this.ensureStarted();
     } catch (err) {
-      return failResult(page, `type(${selector}) failed: ${(err as Error).message}`);
+      return this.failed(undefined, (err as Error).message);
+    }
+    if (!this.pageId) return this.failed(invoker, 'Navigate to a page before typing.');
+
+    try {
+      const input: Record<string, unknown> = { pageId: this.pageId, text, element: selector };
+      const ref = selector.startsWith('aria-ref=') ? selector.slice('aria-ref='.length) : undefined;
+      if (ref) input.ref = ref;
+      else input.selector = selector;
+      await this.call(invoker, 'type_in_page', input);
+      const snapshot = await this.captureSnapshot(invoker, this.pageId);
+      return { ok: true, ...snapshot };
+    } catch (err) {
+      return this.failed(invoker, `type(${selector}) failed: ${(err as Error).message}`);
     }
   }
 
-  /** Press a key on the keyboard. */
-  async pressKey(key: string): Promise<BrowserActionResult> {
-    const page = this.requirePage();
+  /** Press a key on the keyboard, optionally after focusing a target element. */
+  async pressKey(key: string, selector?: string): Promise<BrowserActionResult> {
+    let invoker: BrowserToolInvoker;
     try {
-      await page.keyboard.press(key, { timeout: DEFAULT_ACTION_TIMEOUT_MS });
-      const snapshot = await this.captureSnapshot(page);
-      return { ok: true, url: page.url(), title: await page.title().catch(() => ''), elements: snapshot.elements, note: snapshot.note };
+      invoker = await this.ensureStarted();
     } catch (err) {
-      return failResult(page, `press_key(${key}) failed: ${(err as Error).message}`);
+      return this.failed(undefined, (err as Error).message);
+    }
+    if (!this.pageId) return this.failed(invoker, 'Navigate to a page before pressing keys.');
+
+    try {
+      const input: Record<string, unknown> = { pageId: this.pageId, key };
+      if (selector) {
+        input.element = selector;
+        const ref = selector.startsWith('aria-ref=') ? selector.slice('aria-ref='.length) : undefined;
+        if (ref) input.ref = ref;
+        else input.selector = selector;
+      }
+      await this.call(invoker, 'type_in_page', input);
+      const snapshot = await this.captureSnapshot(invoker, this.pageId);
+      return { ok: true, ...snapshot };
+    } catch (err) {
+      return this.failed(invoker, `press_key(${key}) failed: ${(err as Error).message}`);
     }
   }
 
   /** Scroll at an element or coordinates. */
   async scroll(selector?: string, x?: number, y?: number, dx = 0, dy = 300): Promise<BrowserActionResult> {
-    const page = this.requirePage();
-    let targetDesc = '';
+    let invoker: BrowserToolInvoker;
     try {
-      if (selector) {
-        await page.hover(selector, { timeout: DEFAULT_ACTION_TIMEOUT_MS });
-        targetDesc = selector;
-      } else if (x !== undefined && y !== undefined) {
-        await page.mouse.move(x, y);
-        targetDesc = `(${x},${y})`;
-      } else {
-        return failResult(page, 'scroll requires a selector or x/y coordinates');
-      }
-      await page.evaluate((dX: number, dY: number) => {
-        (window as any).scrollBy(dX, dY);
-      }, dx, dy);
-      const snapshot = await this.captureSnapshot(page);
-      return { ok: true, url: page.url(), title: await page.title().catch(() => ''), elements: snapshot.elements, note: snapshot.note };
+      invoker = await this.ensureStarted();
     } catch (err) {
-      return failResult(page, `scroll(${targetDesc}) failed: ${(err as Error).message}`);
+      return this.failed(undefined, (err as Error).message);
+    }
+    if (!this.pageId) return this.failed(invoker, 'Navigate to a page before scrolling.');
+
+    try {
+      let code = '';
+      if (selector) {
+        code += `await page.locator(${JSON.stringify(selector)}).hover();\n`;
+      } else if (x !== undefined && y !== undefined) {
+        code += `await page.mouse.move(${x}, ${y});\n`;
+      } else {
+        return this.failed(invoker, 'scroll requires a selector or x/y coordinates');
+      }
+      code += `await page.mouse.wheel(${dx}, ${dy}); return { ok: true };`;
+      await this.runCode(invoker, this.pageId, code);
+      const snapshot = await this.captureSnapshot(invoker, this.pageId);
+      return { ok: true, ...snapshot };
+    } catch (err) {
+      return this.failed(invoker, `scroll failed: ${(err as Error).message}`);
     }
   }
 
   /** Wait for an element to appear or a fixed time. */
   async waitFor(selector?: string, ms?: number): Promise<BrowserActionResult> {
-    const page = this.requirePage();
+    let invoker: BrowserToolInvoker;
+    try {
+      invoker = await this.ensureStarted();
+    } catch (err) {
+      return this.failed(undefined, (err as Error).message);
+    }
+    if (!this.pageId) return this.failed(invoker, 'Navigate to a page before waiting.');
+
     try {
       if (selector) {
-        await page.waitForSelector(selector, { timeout: ms ?? DEFAULT_ACTION_TIMEOUT_MS });
+        const timeout = ms ?? DEFAULT_ACTION_TIMEOUT_MS;
+        await this.runCode(
+          invoker,
+          this.pageId,
+          `await page.locator(${JSON.stringify(selector)}).waitFor({ state: 'visible', timeout: ${timeout} }); return { ok: true };`,
+        );
       } else if (ms) {
-        await page.waitForTimeout(ms);
+        await this.runCode(invoker, this.pageId, `await page.waitForTimeout(${ms}); return { ok: true };`);
       } else {
-        return failResult(page, 'wait_for requires a selector or ms timeout');
+        return this.failed(invoker, 'wait_for requires a selector or ms timeout');
       }
-      const snapshot = await this.captureSnapshot(page);
-      return { ok: true, url: page.url(), title: await page.title().catch(() => ''), elements: snapshot.elements, note: snapshot.note };
+      const snapshot = await this.captureSnapshot(invoker, this.pageId);
+      return { ok: true, ...snapshot };
     } catch (err) {
-      return failResult(page, `wait_for failed: ${(err as Error).message}`);
+      return this.failed(invoker, `wait_for failed: ${(err as Error).message}`);
     }
   }
 
-  /** Capture an accessibility snapshot of the current page. */
+  /** Capture an accessibility-style snapshot of the current page. */
   async getSnapshot(): Promise<BrowserActionResult> {
-    const page = this.requirePage();
-    const snapshot = await this.captureSnapshot(page);
-    return { ok: true, url: page.url(), title: await page.title().catch(() => ''), elements: snapshot.elements, note: snapshot.note };
+    let invoker: BrowserToolInvoker;
+    try {
+      invoker = await this.ensureStarted();
+    } catch (err) {
+      return this.failed(undefined, (err as Error).message);
+    }
+    if (!this.pageId) return this.failed(invoker, 'Navigate to a page before taking a snapshot.');
+
+    try {
+      const note = await this.pageNote(invoker, this.pageId);
+      const snapshot = await this.captureSnapshot(invoker, this.pageId, note);
+      return { ok: true, ...snapshot };
+    } catch (err) {
+      return this.failed(invoker, (err as Error).message);
+    }
   }
 
   /** Capture a screenshot of the current page. */
   async screenshot(fullPage = false): Promise<BrowserActionResult> {
-    const page = this.requirePage();
+    let invoker: BrowserToolInvoker;
     try {
-      const buffer = await page.screenshot({ fullPage, type: 'png' });
-      const base64 = buffer.toString('base64');
-      const snapshot = await this.captureSnapshot(page);
-      return {
-        ok: true,
-        url: page.url(),
-        title: await page.title().catch(() => ''),
-        elements: snapshot.elements,
-        screenshot: base64,
-        note: snapshot.note,
-      };
+      invoker = await this.ensureStarted();
     } catch (err) {
-      return failResult(page, `screenshot failed: ${(err as Error).message}`);
+      return this.failed(undefined, (err as Error).message);
     }
-  }
+    if (!this.pageId) return this.failed(invoker, 'Navigate to a page before taking a screenshot.');
 
-  /** Ensure started and return the page. */
-  private async ensureStartedAndGetPage(log: (level: string, message: string) => void): Promise<any> {
-    if (!this.started) await this.ensureStarted(log);
-    return this.requirePage();
-  }
-
-  /** Build a token-efficient accessibility snapshot of interactive elements. */
-  private async captureSnapshot(page: any): Promise<BrowserSnapshot> {
-    const url = page.url();
-    const title = await page.title().catch(() => '');
-    let note: string | undefined;
-
-    // Detect iframe embedding restrictions that Simple Browser would enforce.
     try {
-      const frameAncestors = await page.evaluate(() => {
-        const meta = (document as any).querySelector('meta[http-equiv="Content-Security-Policy"]');
-        return meta ? meta.getAttribute('content') : null;
-      });
-      if (frameAncestors && /frame-ancestors/.test(frameAncestors)) {
-        note = 'Page may not render in Simple Browser due to CSP frame-ancestors; Playwright automation still functional.';
-      }
-    } catch {
-      /* ignore CSP check failures */
+      const base64 = await this.runCode(
+        invoker,
+        this.pageId,
+        `return (await page.screenshot({ type: 'png', fullPage: ${fullPage ? 'true' : 'false'} })).toString('base64');`,
+      );
+      const snapshot = await this.captureSnapshot(invoker, this.pageId);
+      return { ok: true, ...snapshot, screenshot: typeof base64 === 'string' ? base64 : String(base64) };
+    } catch (err) {
+      return this.failed(invoker, `screenshot failed: ${(err as Error).message}`);
     }
+  }
 
+  /** Drop the current page handle. VS Code owns the tab and its lifetime. */
+  async close(): Promise<void> {
+    this.pageId = undefined;
+    this.started = false;
+  }
+
+  /** Get a short page summary (including recent console errors) for the model. */
+  private async pageNote(invoker: BrowserToolInvoker, pageId: string): Promise<string | undefined> {
+    try {
+      const text = await this.call(invoker, 'read_page', { pageId });
+      return this.shortNote(text);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Collect page metadata and interactive elements in one round trip each. */
+  private async captureSnapshot(
+    invoker: BrowserToolInvoker,
+    pageId: string,
+    note?: string,
+  ): Promise<BrowserSnapshot> {
+    let url = '';
+    let title = '';
     let elements: BrowserElement[] = [];
+
     try {
-      const axTree = await page.accessibility.snapshot({ interestingOnly: true, root: page.locator('body') });
-      elements = this.flattenAxTree(axTree, 0);
+      const meta = await this.runCode(invoker, pageId, 'return { url: page.url(), title: await page.title() };');
+      url = typeof meta?.url === 'string' ? meta.url : '';
+      title = typeof meta?.title === 'string' ? meta.title : '';
     } catch {
-      // Fallback: query common interactive selectors directly.
-      elements = await this.fallbackSnapshot(page);
+      /* metadata is best effort */
     }
 
-    // Cap elements to keep the snapshot token-efficient.
-    if (elements.length > MAX_SNAPSHOT_ELEMENTS) {
-      elements = elements.slice(0, MAX_SNAPSHOT_ELEMENTS);
-      note = (note ? note + ' ' : '') + `Snapshot capped at ${MAX_SNAPSHOT_ELEMENTS} elements.`;
+    try {
+      elements = await this.runCode(invoker, pageId, SNAPSHOT_CODE);
+      if (!Array.isArray(elements)) elements = [];
+      elements = elements.slice(0, MAX_SNAPSHOT_ELEMENTS).map((el: any, index: number) => ({
+        role: String(el?.role ?? 'element').slice(0, 40),
+        name: String(el?.name ?? '').slice(0, MAX_ELEMENT_DESCRIPTION),
+        ref: typeof el?.ref === 'number' ? el.ref : index + 1,
+        selector: typeof el?.selector === 'string' ? el.selector : undefined,
+      }));
+    } catch {
+      /* elements are best effort */
     }
 
-    return { url, title, elements, note };
+    const result: BrowserSnapshot = { url, title, elements };
+    if (note) result.note = note;
+    return result;
   }
-
-  /** Flatten the Playwright accessibility tree into BrowserElement list. */
-  private flattenAxTree(node: any, depth: number, refCounter = [0]): BrowserElement[] {
-    if (!node || depth > 6) return [];
-    const elements: BrowserElement[] = [];
-
-    const role = node.role;
-    const name = node.name || '';
-    const interactiveRoles = new Set([
-      'button', 'link', 'textbox', 'combobox', 'checkbox', 'radio', 'menuitem',
-      'tab', 'search', 'slider', 'spinbutton', 'heading', 'listbox', 'option',
-    ]);
-
-    if (role && interactiveRoles.has(role) && name) {
-      const selector = this.buildSelector(node);
-      elements.push({
-        role,
-        name: name.slice(0, MAX_ELEMENT_DESCRIPTION),
-        ref: refCounter[0]++,
-        selector,
-      });
-    }
-
-    if (node.children) {
-      for (const child of node.children) {
-        elements.push(...this.flattenAxTree(child, depth + 1, refCounter));
-      }
-    }
-
-    return elements;
-  }
-
-  /** Best-effort selector for an accessibility node. */
-  private buildSelector(node: any): string | undefined {
-    // Playwright AX nodes don't always expose a direct selector; return best-effort.
-    if (node.name) {
-      // Use role + accessible name as a Playwright-compatible selector.
-      return `${node.role.toLowerCase()}:has-text("${node.name.replace(/"/g, '\\"')}")`;
-    }
-    return undefined;
-  }
-
-  /** Fallback snapshot using direct DOM queries when accessibility tree fails. */
-  private async fallbackSnapshot(page: any): Promise<BrowserElement[]> {
-    const selectors = [
-      'button', 'a', 'input', 'select', 'textarea', '[role="button"]',
-      '[role="link"]', '[role="textbox"]', '[role="checkbox"]',
-    ];
-    const elements: BrowserElement[] = [];
-    let ref = 0;
-    for (const sel of selectors) {
-      try {
-        const count = await page.locator(sel).count();
-        for (let i = 0; i < Math.min(count, 10); i++) {
-          const loc = page.locator(sel).nth(i);
-          const name = (await loc.textContent?.() || loc.getAttribute('aria-label') || '').slice(0, MAX_ELEMENT_DESCRIPTION);
-          const visible = await loc.isVisible().catch(() => false);
-          if (visible && name) {
-            elements.push({ role: sel, name, ref: ref++, selector: `${sel}:nth-match("${name}", ${i + 1})` });
-          }
-        }
-      } catch {
-        /* ignore selector failures */
-      }
-    }
-    return elements;
-  }
-}
-
-/** Build a failed action result with current page state. */
-async function failResult(page: any, error: string): Promise<BrowserActionResult> {
-  let elements: BrowserElement[] = [];
-  let url = '';
-  let title = '';
-  try {
-    url = page.url();
-    title = await page.title().catch(() => '');
-    const snap = await page.accessibility.snapshot({ interestingOnly: true, root: page.locator('body') });
-    elements = []; // keep minimal on failure
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    const _ = snap;
-  } catch {
-    /* ignore */
-  }
-  return { ok: false, url, title, elements, error };
 }
 
 /**
- * browser_tool: automate a web browser inside VS Code Simple Browser.
+ * Playwright snippet run inside VS Code's browser page. It marks visible
+ * interactive elements with a stable `data-cdh-ref` attribute so subsequent
+ * tool calls can target them without guessing CSS selectors.
+ */
+const SNAPSHOT_CODE = `
+return await page.evaluate((max) => {
+  const selectors = [
+    'a[href]', 'button', 'input', 'select', 'textarea',
+    '[role="button"]', '[role="link"]', '[role="textbox"]',
+    '[role="checkbox"]', '[role="combobox"]', '[role="tab"]',
+    '[role="menuitem"]', '[role="searchbox"]',
+  ];
+  const nodes = Array.from(document.querySelectorAll(selectors.join(',')));
+  const out = [];
+  for (const el of nodes) {
+    if (out.length >= max) break;
+    const rect = el.getBoundingClientRect();
+    if (!rect || (rect.width === 0 && rect.height === 0)) continue;
+    const style = window.getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none') continue;
+    const ref = 'cdh' + (out.length + 1);
+    el.setAttribute('data-cdh-ref', ref);
+    const role = (el.getAttribute('role') || el.tagName.toLowerCase()).toLowerCase();
+    const name = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.textContent || '')
+      .trim().replace(/\\s+/g, ' ').slice(0, ${MAX_ELEMENT_DESCRIPTION});
+    out.push({ role, name, ref: out.length + 1, selector: '[data-cdh-ref="' + ref + '"]' });
+  }
+  return out;
+}, ${MAX_SNAPSHOT_ELEMENTS});
+`;
+
+/**
+ * browser_tool: automate a web browser inside VS Code's integrated browser.
  *
  * Exposes navigate, click, type, press_key, scroll, wait_for, get_snapshot,
  * and screenshot actions. Returns a structured accessibility snapshot after
  * every action so the LLM can target elements by role/name/ref without
- * guessing coordinates.
+ * guessing coordinates. The browser runtime is provided by VS Code itself
+ * (the same tools Copilot uses), so nothing is bundled with this extension.
  */
 export const browserTool: Tool<BrowserToolArgs> = {
   name: 'browser_tool',
   description:
-    'Automate a web browser inside VS Code Simple Browser. Navigate, click, type, press keys, scroll, wait, inspect page snapshot, and capture screenshots. ' +
-    'Multi-step state (cookies, localStorage) persists across calls within a workspace session. ' +
-    'On first use, prompts to install Playwright if not already present.',
+    'Automate a web browser inside VS Code integrated browser. Navigate, click, type, press keys, scroll, wait, inspect page snapshot, and capture screenshots. ' +
+    'Uses the browser tools built into VS Code; no browser engine is bundled with the extension. ' +
+    'Page state persists across calls within the same session.',
   parameters: {
     type: 'object',
     properties: {
@@ -513,7 +580,7 @@ export const browserTool: Tool<BrowserToolArgs> = {
           return await browser.type(args.selector, args.text);
         case 'press_key':
           if (!args.key) return fail('"key" is required for press_key.', 'bad arguments');
-          return await browser.pressKey(args.key);
+          return await browser.pressKey(args.key, args.selector);
         case 'scroll':
           return await browser.scroll(args.selector, args.x, args.y, args.dx ?? 0, args.dy ?? 300);
         case 'wait_for':

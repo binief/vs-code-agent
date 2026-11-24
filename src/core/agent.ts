@@ -619,7 +619,12 @@ export class HarnessSession {
     this.taskList = undefined;
     this.pendingTaskList = undefined;
     this.taskListApproved = false;
-    this.taskListApprovalResolve = undefined;
+    // Never strand a waiter: reset can happen while a task is awaiting approval.
+    const pendingApproval = this.taskListApprovalResolve;
+    if (pendingApproval) {
+      this.taskListApprovalResolve = undefined;
+      pendingApproval('reject');
+    }
   }
 
   cancel(): void {
@@ -841,7 +846,7 @@ export class HarnessSession {
       if (toolPolicy.restricted) {
         onEvent({ type: 'notice', level: 'info', message: `Selected agent tool policy: ${toolPolicy.tools.map((tool) => tool.name).join(', ') || 'no tools'}.` });
       }
-      const system = buildSystemPrompt({
+      let system = buildSystemPrompt({
         root: host.workspaceRoot,
         config: this.deps.config,
         tools: toolPolicy.tools,
@@ -851,19 +856,20 @@ export class HarnessSession {
       });
 
       // Prepend a strong system instruction when task list enforcement is on.
-      let finalSystem = system;
+      // This must modify `system` itself: it is the exact string sent to the
+      // provider on every step and used for compaction/context estimates.
       if (this.deps.config.taskListEnabled) {
-        finalSystem =
-          '# Task list enforcement (required)\\n' +
-          'For every long-running task (more than one step), you MUST maintain a task list:\\n' +
-          '1. Create: Call `task_decompose` with a prompt describing the work, or call `task_list` with `action: "add"` to add items manually.\\n' +
-          '2. Progress: Call `task_list` with `action: "update"` to set `status: "in-progress"` when you begin an item, and `status: "done"` when complete.\\n' +
-          '3. Review: Call `task_list` with `action: "list"` before finishing to confirm nothing is pending.\\n' +
-          'Never claim a task is complete unless all its items are marked `done` in the task list.\\n\\n' +
+        system =
+          '# Task list enforcement (required)\n' +
+          'For every long-running task (more than one step), you MUST maintain a task list:\n' +
+          '1. Create: Call `task_decompose` with a prompt describing the work, or call `task_list` with `action: "add"` to add items manually.\n' +
+          '2. Progress: Call `task_list` with `action: "update"` to set `status: "in-progress"` when you begin an item, and `status: "done"` when complete.\n' +
+          '3. Review: Call `task_list` with `action: "list"` before finishing to confirm nothing is pending.\n' +
+          'Never claim a task is complete unless all its items are marked `done` in the task list.\n\n' +
           system;
       }
 
-      this.lastSystemPrompt = finalSystem;
+      this.lastSystemPrompt = system;
 
       // Enabling subagents requests one automatic read-only investigation for
       // every parent task. Never bypass the agent-file permission ceiling, and
@@ -889,7 +895,7 @@ export class HarnessSession {
             onEvent({ type: 'tool-end', id: call.id, name: call.name, ok: false, summary: result.summary ?? 'subagent failed', detail: result.content, durationMs: 0 });
           }
           toolCallsRun++;
-          addMessage({ role: 'tool', toolCallId: call.id, name: call.name, content: result.content });
+          addMessage({ role: 'tool', toolCallId: call.id, name: call.name, content: result.content, ok: result.ok });
           if (!result.ok && !signal.aborted) {
             onEvent({ type: 'notice', level: 'warn', message: subagentIncompleteMessage(result.summary ?? 'failed') });
           }
@@ -1300,13 +1306,14 @@ export class HarnessSession {
               toolCallId: call.id,
               name: call.name,
               content: CANCELLED_TOOL_RESULT,
+              ok: false,
             });
             continue;
           }
           const result = await this.executeToolCall(call, onEvent, signal, allowedToolNames, 2048, selected, policySpecs, step);
           toolCallsRun++;
           addMessage({ role: 'tool', toolCallId: call.id, name: call.name,
-            content: result.content });
+            content: result.content, ok: result.ok });
         }
 
         if (signal.aborted) {
@@ -1561,12 +1568,21 @@ export class HarnessSession {
       if (issue) return finish({ ok: false, content: `Invalid arguments for "${call.name}": ${issue} No tool was run.`, summary: 'bad arguments' });
     }
 
+    // A tool timeout must cancel only this call, not the entire task. Compose a
+    // per-call controller with the task signal: user cancellation still stops
+    // the tool, but one slow tool cannot abort every remaining step.
+    const toolAbort = new AbortController();
+    const toolSignal = toolAbort.signal;
+    const abortWithTask = (): void => toolAbort.abort();
+    if (signal.aborted) abortWithTask();
+    else signal.addEventListener('abort', abortWithTask, { once: true });
+
     const context: ToolContext = {
       root: host.workspaceRoot,
       host,
       config: this.deps.config,
       checkpoints: this.checkpoints,
-      signal,
+      signal: toolSignal,
       outputTokenBudget,
       taskList: this.taskList,
       approval: async (req: ApprovalRequest): Promise<ApprovalDecision> => {
@@ -1591,11 +1607,8 @@ export class HarnessSession {
       if (timeoutMs <= 0) return tool.run(args, context);
       return new Promise<ToolResult>((resolve, reject) => {
         timeoutId = setTimeout(() => {
-          // Best-effort: signal cancellation to the tool.
-          if (!signal.aborted) {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (signal as any).abort?.();
-          }
+          // Cancel only this tool call; the shared task signal stays intact.
+          toolAbort.abort();
           reject(new Error(`Tool "${call.name}" timed out after ${timeoutMs} ms`));
         }, timeoutMs);
         tool.run(args, context).then(resolve, reject);
@@ -1618,6 +1631,7 @@ export class HarnessSession {
       });
     } finally {
       if (timeoutId) clearTimeout(timeoutId);
+      signal.removeEventListener('abort', abortWithTask);
       // Broadcast the current task list so the panel strip stays in sync,
       // even when the call failed (e.g. unknown task item id).
       if ((call.name === 'task_list' || call.name === 'task_decompose') && this.taskList) {

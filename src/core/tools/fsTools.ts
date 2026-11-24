@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { diffPreview, readIfExists } from '../checkpoints';
 import { applyEol, detectEol, eolName, hasMixedEol, isWellFormedText, normalizeEol, replaceNormalizedPreservingEol, resolveEol } from '../lineEndings';
-import { ensureDir, fileSize, formatBytes, looksBinary, resolveWorkspacePath, toPosix } from '../paths';
+import { assertPathWithinWorkspace, ensureDir, fileSize, formatBytes, looksBinary, resolveWorkspacePath, toPosix } from '../paths';
 import { fail, ok, type Tool, type ToolContext, type ToolResult } from '../types';
 import { walk } from './walk';
 
@@ -482,6 +482,9 @@ export const deleteFileTool: Tool<{ path: string; reason?: string }> = {
     });
     if (decision === 'reject') return fail('User rejected the deletion.', 'rejected by user');
 
+    // Re-validate after approval: a path that was safe when the tool started
+    // may have been replaced by a symlink while the user was deciding.
+    assertPathWithinWorkspace(ctx.root, target.abs, { allowOutside: ctx.config.allowOutsideWorkspace });
     // Snapshot right before the removal so the delete can be undone.
     checkpoint(ctx, target.abs, target.rel);
     try {
@@ -534,6 +537,9 @@ async function applyWrite(ctx: ToolContext, abs: string, content: string, previo
   if (previous === null && fs.existsSync(abs)) {
     throw new Error(`refusing to overwrite "${toPosix(abs)}" (it appeared after the tool started)`);
   }
+  // Re-validate after approval (TOCTOU): a component may have become a symlink
+  // pointing outside the workspace while the approval card was open.
+  assertPathWithinWorkspace(ctx.root, abs, { allowOutside: ctx.config.allowOutsideWorkspace });
   ensureDir(path.dirname(abs));
   if (ctx.host.applyFileWrite) {
     await ctx.host.applyFileWrite(abs, content, { preserveBytes });

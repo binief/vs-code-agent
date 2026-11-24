@@ -401,6 +401,13 @@ test('archive validation rejects malformed histories, duplicate IDs and unsafe i
   assert.throws(() => parseChatArchive(JSON.stringify({ ...base, taskList: [{ id: 'task-1', title: 'x', status: 'archived' }] })), /status/);
   assert.throws(() => parseChatArchive(JSON.stringify({ ...base, taskList: 'not-an-array' })), /taskList must be an array/);
   assert.doesNotThrow(() => parseChatArchive(JSON.stringify({ ...base, taskList: [{ id: 'task-1', title: 'x', status: 'done' }] })));
+  assert.doesNotThrow(
+    () => parseChatArchive(JSON.stringify({
+      ...base,
+      items: [{ id: 'nav', kind: 'approval', approvalId: 'nav-1', request: { kind: 'navigate', title: 'Open page', detail: 'https://example.com' } }],
+    })),
+    'navigate is a legal approval kind emitted by browser_tool',
+  );
 });
 
 test('the extension clipboard bridge acknowledges success and reports failures', async () => {

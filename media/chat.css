@@ -2105,17 +2105,14 @@ body.dragging .composer-box {
 }
 
 /* ------------------------------------------------------------- task-list approval modal */
-.modal {
+/* Do not reuse `.modal`: that class is the card inside a settings backdrop. */
+.task-list-approval-overlay {
   position: fixed;
   inset: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 10000;
-}
-.modal-backdrop {
-  position: absolute;
-  inset: 0;
   background: rgba(0, 0, 0, 0.4);
   backdrop-filter: blur(2px);
 }

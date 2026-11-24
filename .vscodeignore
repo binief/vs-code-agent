@@ -15,3 +15,4 @@ test-*
 
 # Development-only agent instructions
 agent.md
+.agents/**

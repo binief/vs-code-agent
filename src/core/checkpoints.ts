@@ -92,8 +92,11 @@ export class CheckpointStore {
       } catch (err) {
         report.failed.push({ path: snap.rel, error: (err as Error).message });
       }
+      // Every snapshot is consumed by this attempt, successful or not. Keeping
+      // successful ones after a partial failure would let a later revert clobber
+      // edits made after this one; keep the failed paths in the report instead.
+      this.snapshots.delete(snap.abs);
     }
-    if (report.failed.length === 0) this.snapshots.clear();
     return report;
   }
 

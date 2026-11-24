@@ -159,7 +159,7 @@ function registerCommands(
           `PID ${p.pid}${p.detached ? ' [detached]' : ''}: ${p.command} (cwd: ${p.cwd}, started ${new Date(p.startedAt).toLocaleTimeString()})${p.outputLines.length ? ` · ${p.outputLines.length} output line(s)` : ''}`,
       );
       void vscode.window.showInformationMessage(
-        `Running shell commands (${processes.length}):\\n${lines.join('\\n')}`,
+        `Running shell commands (${processes.length}):\n${lines.join('\n')}`,
         { modal: true },
       );
     }),

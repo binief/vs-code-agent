@@ -131,7 +131,7 @@ function item(value: unknown): void {
     case 'approval': {
       string(entry.approvalId, 'approval id', true);
       const request = object(entry.request, 'approval request');
-      if (!['write', 'delete', 'command'].includes(request.kind)) invalid('unknown approval kind.');
+      if (!['write', 'delete', 'command', 'navigate'].includes(request.kind)) invalid('unknown approval kind.');
       string(request.title, 'approval title');
       string(request.detail, 'approval detail');
       for (const key of ['relPath', 'absPath', 'newContent', 'oldContent', 'command']) {
