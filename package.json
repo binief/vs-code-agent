@@ -297,7 +297,7 @@
             "deny-all"
           ],
           "default": "auto-safe",
-          "markdownDescription": "How browser automation is gated. `auto-safe` allows same-origin navigation silently and asks for cross-origin navigation and form submissions. `ask` asks for every browser action. `deny-all` disables the browser tool."
+          "markdownDescription": "How browser automation is gated. `auto-safe` runs browser actions without confirmation prompts. `ask` asks before navigation and page-modifying actions. `deny-all` blocks navigation and page-modifying actions."
         },
         "codingHarness.allowDangerousCommands": {
           "type": "boolean",

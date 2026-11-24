@@ -1,4 +1,4 @@
-import { fail, type Tool } from '../types';
+import { fail, type Tool, type ToolResult } from '../types';
 
 // `window` and `document` are referenced inside page.evaluate() callbacks,
 // which run in the browser context, not the Node.js context.
@@ -99,6 +99,12 @@ export interface BrowserActionResult {
   error?: string;
 }
 
+/** Guidance included with failed actions so the model can correct the next call. */
+const RETRY_GUIDANCE =
+  'Inspect the current page snapshot above, then retry with a different ref/selector/coordinate ' +
+  'or call get_snapshot/wait_for first. Do not repeat the identical call if it already failed; ' +
+  'if the page cannot support the action, report the blocker instead of retrying indefinitely.';
+
 type LogFn = (level: 'debug' | 'info' | 'warn' | 'error', message: string) => void;
 
 const noopLog: LogFn = () => {};
@@ -198,12 +204,15 @@ export class BrowserManager {
     let snapshot: BrowserSnapshot = { url: '', title: '', elements: [] };
     if (invoker && this.pageId) {
       try {
-        snapshot = await this.captureSnapshot(invoker, this.pageId);
+        // Include the page note on failures too: it often contains the console
+        // error or validation message that explains why the action failed.
+        const note = await this.pageNote(invoker, this.pageId);
+        snapshot = await this.captureSnapshot(invoker, this.pageId, note);
       } catch {
         /* keep the empty snapshot */
       }
     }
-    return { ok: false, url: snapshot.url, title: snapshot.title, elements: snapshot.elements, error };
+    return { ok: false, ...snapshot, error };
   }
 
   /** Navigate to a URL and return a snapshot. */
@@ -496,6 +505,65 @@ return await page.evaluate((max) => {
 }, ${MAX_SNAPSHOT_ELEMENTS});
 `;
 
+/** Keep one context line readable even if the page supplies odd characters. */
+function oneLine(text: string, max = 500): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  return clean.length > max ? `${clean.slice(0, max)}…` : clean;
+}
+
+/** Render the snapshot in a compact form the model can use for the next call. */
+function formatElements(elements: BrowserElement[]): string {
+  if (!elements.length) return '(no interactive elements found)';
+  return elements
+    .map((el, index) => {
+      const ref = typeof el.ref === 'number' ? el.ref : index + 1;
+      const name = el.name ? ` "${oneLine(el.name, 120)}"` : '';
+      const selector = el.selector ? ` selector: ${el.selector}` : '';
+      return `- [${ref}] ${oneLine(el.role, 40)}${name}${selector}`;
+    })
+    .join('\n');
+}
+
+/**
+ * Convert a BrowserManager result into the tool result consumed by the agent
+ * loop. The model only sees `content`, so both successes and failures must
+ * include the page state; failures also include the error and a correction
+ * hint instead of an opaque `{ ok: false }` result.
+ */
+export function browserResultToToolResult(result: BrowserActionResult, args: BrowserToolArgs): ToolResult {
+  const lines = [
+    result.ok ? `Browser ${args.action} succeeded.` : `Browser ${args.action} FAILED.`,
+    `Action: ${args.action}`,
+    `Arguments: ${JSON.stringify(Object.fromEntries(Object.entries(args).filter(([, value]) => value !== undefined)))}`,
+    `Page: ${oneLine(result.url) || '(unknown)'}`,
+    `Title: ${oneLine(result.title) || '(unknown)'}`,
+  ];
+  if (result.note) lines.push(`Page note: ${result.note}`);
+  if (!result.ok) lines.push(`Error: ${oneLine(result.error ?? 'Unknown browser error.', 1000)}`);
+
+  lines.push('Current page elements:', formatElements(result.elements));
+  if (result.ok) {
+    lines.push('Use selector: <selector> or aria-ref=<ref> from this snapshot to target the next action.');
+    if (args.action === 'screenshot') {
+      lines.push('Screenshot captured as a base64 image (image bytes omitted from this text feedback).');
+    }
+  } else {
+    lines.push(`Retry guidance: ${RETRY_GUIDANCE}`);
+  }
+
+  return {
+    ok: result.ok,
+    content: lines.join('\n'),
+    summary: result.ok ? `${args.action} ok` : `error: ${oneLine(result.error ?? 'browser action failed', 80)}`,
+    meta: {
+      url: result.url,
+      title: result.title,
+      ...(result.error ? { error: result.error } : {}),
+      ...(result.screenshot ? { screenshot: result.screenshot } : {}),
+    },
+  };
+}
+
 /**
  * browser_tool: automate a web browser inside VS Code's integrated browser.
  *
@@ -510,7 +578,7 @@ export const browserTool: Tool<BrowserToolArgs> = {
   description:
     'Automate a web browser inside VS Code integrated browser. Navigate, click, type, press keys, scroll, wait, inspect page snapshot, and capture screenshots. ' +
     'Uses the browser tools built into VS Code; no browser engine is bundled with the extension. ' +
-    'Page state persists across calls within the same session.',
+    'Page state persists across calls within the same session. Every result includes the current page snapshot; failed actions include the error and retry guidance so you can correct the next call instead of repeating it unchanged.',
   parameters: {
     type: 'object',
     properties: {
@@ -539,15 +607,16 @@ export const browserTool: Tool<BrowserToolArgs> = {
       return fail('Browser automation is not available in this environment.', 'browser unavailable');
     }
 
-    // Respect browsePolicy: deny-all blocks, ask always prompts, auto-safe
-    // prompts for navigation and form-submitting actions only.
+    // Respect browsePolicy: auto-safe (the default) auto-approves browser
+    // actions, ask prompts for confirmation, and deny-all blocks them. The
+    // auto-safe name is kept for config compatibility.
     const stateChanging = args.action === 'navigate' || args.action === 'click' || args.action === 'type' || args.action === 'press_key';
     if (stateChanging) {
       const policy = ctx.config.browsePolicy ?? 'auto-safe';
       if (policy === 'deny-all') {
         return fail('Browser automation is disabled by browsePolicy (deny-all).', 'browser disabled', { disabled: true });
       }
-      if (policy === 'ask' || policy === 'auto-safe') {
+      if (policy === 'ask') {
         const target = args.url ?? args.selector ?? args.key ?? args.text ?? args.action;
         const detail = `Action: ${args.action}\nTarget: ${String(target).slice(0, 200)}`;
         const decision = await ctx.approval({
@@ -569,31 +638,44 @@ export const browserTool: Tool<BrowserToolArgs> = {
     const log = (level: 'debug' | 'info' | 'warn' | 'error', message: string) => host.log(level, message);
 
     try {
+      let result: BrowserActionResult;
       switch (args.action) {
         case 'navigate':
           if (!args.url) return fail('"url" is required for navigate.', 'bad arguments');
-          return await browser.navigate(args.url, log);
+          result = await browser.navigate(args.url, log);
+          break;
         case 'click':
-          return await browser.click(args.selector, args.x, args.y);
+          result = await browser.click(args.selector, args.x, args.y);
+          break;
         case 'type':
           if (!args.selector || args.text === undefined) return fail('"selector" and "text" are required for type.', 'bad arguments');
-          return await browser.type(args.selector, args.text);
+          result = await browser.type(args.selector, args.text);
+          break;
         case 'press_key':
           if (!args.key) return fail('"key" is required for press_key.', 'bad arguments');
-          return await browser.pressKey(args.key, args.selector);
+          result = await browser.pressKey(args.key, args.selector);
+          break;
         case 'scroll':
-          return await browser.scroll(args.selector, args.x, args.y, args.dx ?? 0, args.dy ?? 300);
+          result = await browser.scroll(args.selector, args.x, args.y, args.dx ?? 0, args.dy ?? 300);
+          break;
         case 'wait_for':
-          return await browser.waitFor(args.selector, args.ms);
+          result = await browser.waitFor(args.selector, args.ms);
+          break;
         case 'get_snapshot':
-          return await browser.getSnapshot();
+          result = await browser.getSnapshot();
+          break;
         case 'screenshot':
-          return await browser.screenshot(args.fullPage ?? false);
+          result = await browser.screenshot(args.fullPage ?? false);
+          break;
         default:
           return fail(`Unknown action: ${args.action}.`, 'bad arguments');
       }
+      return browserResultToToolResult(result, args);
     } catch (err) {
-      return fail(`Browser action failed: ${(err as Error).message}.`, 'browser error');
+      return fail(
+        `Browser ${args.action} failed: ${(err as Error).message}\nRetry guidance: ${RETRY_GUIDANCE}`,
+        'browser error',
+      );
     }
   },
 };

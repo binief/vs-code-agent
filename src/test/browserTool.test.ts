@@ -1,11 +1,15 @@
 import * as assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { CheckpointStore } from '../core/checkpoints';
 import {
+  browserTool,
   BrowserManager,
   REQUIRED_BROWSER_TOOL_NAMES,
+  type BrowserActionResult,
   type BrowserInvocation,
   type BrowserToolInvoker,
 } from '../core/tools/browserTool';
+import { DEFAULT_CONFIG, type BrowsePolicy, type HarnessHost, type ToolContext } from '../core/types';
 
 class FakeInvoker implements BrowserToolInvoker {
   readonly calls: Array<{ name: string; input: Record<string, unknown> }> = [];
@@ -42,6 +46,32 @@ class FakeInvoker implements BrowserToolInvoker {
     return this.calls.find((call) => call.name === name)?.input;
   }
 }
+
+function makeContext(
+  browser: unknown,
+  options: { browsePolicy?: BrowsePolicy; onApproval?: () => void } = {},
+): ToolContext {
+  const host: HarnessHost = {
+    workspaceRoot: process.cwd(),
+    log: () => {},
+    requestApproval: async () => 'apply',
+    browser,
+  };
+  return {
+    root: host.workspaceRoot,
+    host,
+    config: { ...DEFAULT_CONFIG, browsePolicy: options.browsePolicy ?? 'auto-safe' },
+    checkpoints: new CheckpointStore(true),
+    approval: async () => {
+      options.onApproval?.();
+      return 'apply';
+    },
+  };
+}
+
+const clickable: BrowserActionResult['elements'] = [
+  { role: 'button', name: 'Submit', ref: 1, selector: '[data-cdh-ref="cdh1"]' },
+];
 
 test('browser manager uses VS Code built-in browser tools for navigation and snapshots', async () => {
   const invoker = new FakeInvoker();
@@ -127,4 +157,107 @@ test('browser manager reports a clear error when built-in browser tools are miss
   assert.equal(result.ok, false);
   assert.match(result.error ?? '', /built-in browser tools are not available/i);
   assert.match(result.error ?? '', /workbench\.browser\.enableChatTools/);
+});
+
+test('browser tool feeds failed actions back to the model with the snapshot and retry guidance', async () => {
+  let clicks = 0;
+  const result = await browserTool.run(
+    { action: 'click', selector: '#submit' },
+    makeContext({
+      click: async (): Promise<BrowserActionResult> => {
+        clicks++;
+        return {
+          ok: false,
+          url: 'http://example.com/checkout',
+          title: 'Checkout',
+          elements: clickable,
+          error: 'click_element failed: element is not visible',
+        };
+      },
+    }),
+  );
+
+  assert.equal(clicks, 1);
+  assert.equal(result.ok, false);
+  assert.match(result.content, /Browser click FAILED/);
+  assert.match(result.content, /click_element failed: element is not visible/);
+  assert.match(result.content, /selector: \[data-cdh-ref="cdh1"\]/);
+  assert.match(result.content, /Do not repeat the identical call/);
+});
+
+test('browser tool returns the page snapshot in successful tool content', async () => {
+  const result = await browserTool.run(
+    { action: 'click', selector: '[data-cdh-ref="cdh1"]' },
+    makeContext({
+      click: async (): Promise<BrowserActionResult> => ({
+        ok: true,
+        url: 'http://example.com/',
+        title: 'Demo',
+        elements: clickable,
+        note: 'Button became disabled after the click.',
+      }),
+    }),
+  );
+
+  assert.equal(result.ok, true);
+  assert.match(result.content, /Browser click succeeded/);
+  assert.match(result.content, /button "Submit"/);
+  assert.match(result.content, /Page note: Button became disabled after the click\./);
+  assert.match(result.content, /aria-ref=<ref>/);
+});
+
+test('browser tool wraps unexpected host errors so the model can retry', async () => {
+  const result = await browserTool.run(
+    { action: 'click', selector: '#submit' },
+    makeContext({
+      click: async () => {
+        throw new Error('browser tab was closed');
+      },
+    }),
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.content, /Browser click failed: browser tab was closed/);
+  assert.match(result.content, /Retry guidance:/);
+});
+
+test('browser tool auto-approves actions with the default browse policy', async () => {
+  let approvals = 0;
+  const result = await browserTool.run(
+    { action: 'click', selector: '[data-cdh-ref="cdh1"]' },
+    makeContext(
+      {
+        click: async (): Promise<BrowserActionResult> => ({
+          ok: true,
+          url: 'http://example.com/',
+          title: 'Demo',
+          elements: clickable,
+        }),
+      },
+      { onApproval: () => approvals++ },
+    ),
+  );
+
+  assert.equal(approvals, 0);
+  assert.equal(result.ok, true);
+});
+
+test('browser tool still asks for confirmation when browsePolicy is ask', async () => {
+  let approvals = 0;
+  await browserTool.run(
+    { action: 'navigate', url: 'http://example.com/' },
+    makeContext(
+      {
+        navigate: async (): Promise<BrowserActionResult> => ({
+          ok: true,
+          url: 'http://example.com/',
+          title: 'Demo',
+          elements: [],
+        }),
+      },
+      { browsePolicy: 'ask', onApproval: () => approvals++ },
+    ),
+  );
+
+  assert.equal(approvals, 1);
 });

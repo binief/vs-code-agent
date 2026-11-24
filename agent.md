@@ -61,9 +61,9 @@ The `browser_tool` drives **VS Code's integrated browser** through the browser t
 
 Requirements: the integrated browser tools must be enabled via `workbench.browser.enableChatTools` (on by default) and chat agent tools must be available. If the tools are unavailable, browser actions fail with a message naming the missing tools and the setting to check.
 
-Pages open in a VS Code browser tab so you can watch the automation. Every action returns an accessibility-style snapshot with stable refs/selectors you can target on the next call. Page state persists across calls within the session; VS Code owns the tab's lifetime.
+Pages open in a VS Code browser tab so you can watch the automation. Every action returns an accessibility-style snapshot with stable refs/selectors you can target on the next call. If an action fails, the tool result includes the error, the current page snapshot, and retry guidance: correct the selector/ref/coordinates or call `get_snapshot`/`wait_for` first. Do not repeat an identical failed call. Page state persists across calls within the session; VS Code owns the tab's lifetime.
 
-Browser actions still go through `codingHarness.browsePolicy` (`auto-safe`, `ask`, `deny-all`).
+Browser actions are auto-approved by default (`codingHarness.browsePolicy: auto-safe`). Set `ask` to require confirmation before navigation and page-modifying actions, or `deny-all` to block them.
 
 ## Task list enforcement (required)
 
