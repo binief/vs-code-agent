@@ -54,6 +54,7 @@ import {
 import { CHAT_ARCHIVE_FORMAT, CHAT_ARCHIVE_VERSION, MAX_CHAT_ARCHIVE_BYTES, parseChatArchive, type ChatArchive } from './chatArchive';
 import type { ApprovalService } from './host';
 import { BrowserManager } from '../core/tools/browserTool';
+import { createBrowserToolInvoker } from './browserToolInvoker';
 import { VsCodeHost } from './host';
 import type { Logger } from './log';
 import type { ProposalStore } from './proposals';
@@ -255,7 +256,7 @@ export class HarnessController {
   private session?: HarnessSession;
   private host?: VsCodeHost;
   private mcpManager?: McpManager;
-  /** Persistent Playwright browser session for browser_tool automation. */
+  /** Bridge to VS Code's integrated browser tools for browser_tool automation. */
   private browserManager?: BrowserManager;
   /** Last loaded MCP config files (kept for the dialog and state). */
   private mcpFileConfig?: McpFileConfig;
@@ -351,9 +352,9 @@ export class HarnessController {
     if (stored && stored.length > 0) this.agentSelection = stored;
     this.chatSaveSettings = this.readChatSaveSettings();
     this.ready = this.restoreSavedChat();
-    // Create the Playwright browser manager for browser_tool automation.
-    // It starts lazily on first browser_tool call (detect-and-prompt for Playwright).
-    this.browserManager = new BrowserManager();
+    // browser_tool drives VS Code's own integrated browser through the
+    // built-in language model tools. No browser runtime is bundled here.
+    this.browserManager = new BrowserManager(createBrowserToolInvoker(), (level, message) => this.log[level](message));
     // Register cleanup on extension deactivation (guarded for test contexts without subscriptions).
     if (context.subscriptions) {
       context.subscriptions.push(new vscode.Disposable(() => {
@@ -732,7 +733,7 @@ export class HarnessController {
     // extension deactivation or reload as untracked orphans.
     killAllRunningCommands();
     clearRunningCommandsChangeHandler();
-    // Close the Playwright browser session on deactivation.
+    // Release the browser page handle on deactivation; VS Code owns the tab.
     void this.browserManager?.close();
     // Honor the latest setting even if its change event is still queued.
     await this.refreshChatSaveSettings();

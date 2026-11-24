@@ -13,7 +13,12 @@ import { ToolRegistry } from '../core/tools';
 import { listFilesTool } from '../core/tools/fsTools';
 import { createFileTool, deleteFileTool, readFileTool, replaceInFileTool, writeFileTool } from '../core/tools/fsTools';
 import { searchTextTool } from '../core/tools/searchTools';
-import { runCommandTool } from '../core/tools/shellTool';
+import {
+  getRunningCommands,
+  killAllRunningCommands,
+  runCommandTool,
+  runShellCommand,
+} from '../core/tools/shellTool';
 import {
   DEFAULT_CONFIG,
   type ApprovalDecision,
@@ -434,6 +439,88 @@ test('run_command kills idle command after idle_timeout_ms', async () => {
   assert.ok(elapsed < 5000, `sleep should be killed by idle watchdog, took ${elapsed}ms`);
   assert.equal(res.ok, false);
   assert.match(res.content, /timed out/);
+});
+
+test('stopping a detached command kills its whole process tree', async () => {
+  // A detached shell starts a helper that launches a long-lived grandchild.
+  // Killing only the shell used to orphan the helper and its child (e.g. a
+  // cmd window opened by a dev server), which then survived the Stop button.
+  const root = makeTempWorkspace();
+  const marker = path.join(root, 'pids.json');
+  const script = path.join(root, 'detached-child.js');
+  fs.writeFileSync(
+    script,
+    [
+      "const { spawn } = require('child_process');",
+      "const fs = require('fs');",
+      `const long = ${JSON.stringify(
+        process.platform === 'win32'
+          ? { file: 'ping', args: ['-n', '30', '127.0.0.1'] }
+          : { file: 'sleep', args: ['30'] },
+      )};`,
+      'const child = spawn(long.file, long.args, { stdio: "ignore", windowsHide: true });',
+      `fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ helper: process.pid, grandchild: child.pid }));`,
+      'child.on("exit", () => {});',
+    ].join('\n'),
+    'utf8',
+  );
+
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const waitForMarker = async (): Promise<{ helper: number; grandchild: number }> => {
+    for (let i = 0; i < 50; i++) {
+      if (fs.existsSync(marker)) {
+        return JSON.parse(fs.readFileSync(marker, 'utf8')) as { helper: number; grandchild: number };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error('detached helper did not start');
+  };
+
+  const orphanedPids: number[] = [];
+  try {
+    await runShellCommand(`node "${script}"`, { cwd: root, timeoutMs: 1000, detached: true });
+    const pids = await waitForMarker();
+    orphanedPids.push(pids.helper, pids.grandchild);
+    assert.ok(alive(pids.helper), 'helper should be running before Stop');
+    assert.ok(alive(pids.grandchild), 'grandchild should be running before Stop');
+
+    killAllRunningCommands();
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    assert.equal(alive(pids.helper), false, 'helper must not survive Stop');
+    assert.equal(alive(pids.grandchild), false, 'grandchild must not survive Stop');
+
+    // Simulate `start /b`: the shell exits while a child still holds the
+    // output pipe, leaving the command tracked with a dead root PID. Stop used
+    // to fail to reach those orphaned cmd windows.
+    fs.rmSync(marker, { force: true });
+    await runShellCommand(`node "${script}"`, { cwd: root, timeoutMs: 1000, detached: true });
+    const orphaned = await waitForMarker();
+    orphanedPids.push(orphaned.helper, orphaned.grandchild);
+    const shellPid = getRunningCommands()[0]?.pid;
+    assert.ok(shellPid, 'detached shell should still be tracked');
+    try { process.kill(shellPid!, 'SIGKILL'); } catch { /* already gone */ }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.ok(alive(orphaned.helper), 'helper survives the shell exiting');
+
+    killAllRunningCommands();
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    assert.equal(alive(orphaned.helper), false, 'orphaned helper must not survive Stop');
+    assert.equal(alive(orphaned.grandchild), false, 'orphaned grandchild must not survive Stop');
+  } finally {
+    killAllRunningCommands();
+    for (const pid of orphanedPids) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  }
 });
 
 test('run_command requests approval exactly once per invocation (no duplicate modal)', async () => {

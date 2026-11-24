@@ -57,16 +57,13 @@ Mix groups and exact names as needed, e.g. `tools: [read, search, task_list]`.
 
 ## Browser tool setup
 
-The `browser_tool` uses Playwright to drive a headless Chromium browser. Playwright is **not bundled** with the extension (to keep the download small). On first use of `browser_tool`, you'll be prompted to install it:
+The `browser_tool` drives **VS Code's integrated browser** through the browser tools built into VS Code (`open_browser_page`, `navigate_page`, `click_element`, `type_in_page`, `read_page`, `run_playwright_code`). These are the same tools Copilot uses. No Playwright package or Chromium download is needed — nothing browser-related is bundled with the extension.
 
-```
-Browser automation requires Playwright, which is not installed.
-Run "npm install playwright-core" in the workspace to enable browser tools.
-```
+Requirements: the integrated browser tools must be enabled via `workbench.browser.enableChatTools` (on by default) and chat agent tools must be available. If the tools are unavailable, browser actions fail with a message naming the missing tools and the setting to check.
 
-Once installed, Playwright downloads Chromium on first launch and keeps a persistent session per workspace (cookies, localStorage, page state survive across calls). Every action returns an accessibility snapshot so you can target elements by role/name/ref. Navigated URLs are also opened in VS Code's Simple Browser tab so you can watch the automation in the editor.
+Pages open in a VS Code browser tab so you can watch the automation. Every action returns an accessibility-style snapshot with stable refs/selectors you can target on the next call. Page state persists across calls within the session; VS Code owns the tab's lifetime.
 
-The browser session closes automatically when the extension deactivates.
+Browser actions still go through `codingHarness.browsePolicy` (`auto-safe`, `ask`, `deny-all`).
 
 ## Task list enforcement (required)
 

@@ -1,4 +1,4 @@
-import { spawn, execFileSync } from 'child_process';
+import { spawn, spawnSync, execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { evaluateCommand } from '../policy';
@@ -320,67 +320,127 @@ function cap(text: string): string {
 }
 
 /**
- * Recursively find all descendant PIDs of a process on Unix and SIGKILL them,
- * then kill the root process itself. Used when process-group kill is not
- * sufficient (e.g. grandchildren that created their own process groups).
+ * Snapshot all descendant PIDs of a process on Unix, deepest-first. This must
+ * happen BEFORE any kill: once the parent dies its children are reparented, so
+ * a later `ps -eo pid,ppid` scan can no longer find them.
  */
-function killProcessTreeUnix(pid: number): void {
+function descendantPidsUnix(rootPid: number): number[] {
+  const childrenOf = new Map<number, number[]>();
   try {
     const stdout = execFileSync('ps', ['-eo', 'pid,ppid'], { encoding: 'utf8' });
-    const children: number[] = [];
     for (const line of stdout.trim().split('\n').slice(1)) {
       const parts = line.trim().split(/\s+/);
+      const pid = Number(parts[0]);
       const ppid = Number(parts[1]);
-      const cpid = Number(parts[0]);
-      if (ppid === pid) children.push(cpid);
-    }
-    // Kill descendants depth-first so parents are killed after children.
-    for (const cpid of children) {
-      killProcessTreeUnix(cpid);
-      try { process.kill(cpid, 'SIGKILL'); } catch { /* already gone */ }
+      if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid)) continue;
+      const siblings = childrenOf.get(ppid) ?? [];
+      siblings.push(pid);
+      childrenOf.set(ppid, siblings);
     }
   } catch {
-    /* ps unavailable or pid already gone; nothing more to do */
+    return []; // ps unavailable; fall back to process-group kill only
+  }
+
+  const descendants: number[] = [];
+  const visit = (pid: number): void => {
+    for (const childPid of childrenOf.get(pid) ?? []) {
+      visit(childPid);
+      descendants.push(childPid);
+    }
+  };
+  visit(rootPid);
+  return descendants;
+}
+
+/**
+ * Windows keeps the (possibly dead) parent PID in Win32_Process.ParentProcessId
+ * after a process exits, so descendants can still be found by walking the tree.
+ * `taskkill /T` cannot do that: it requires a live root. This is what lets us
+ * kill cmd windows left behind by `start /b` after the shell has already gone.
+ */
+function descendantPidsWindows(rootPid: number): number[] {
+  // One CIM query, then breadth-first walk of the parent -> children map.
+  const script = `
+$procs = Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId
+$children = @{}
+foreach ($p in $procs) {
+  $key = [int]$p.ParentProcessId
+  if (-not $children.ContainsKey($key)) { $children[$key] = [System.Collections.Generic.List[int]]::new() }
+  $children[$key].Add([int]$p.ProcessId)
+}
+$queue = [System.Collections.Generic.Queue[int]]::new()
+$queue.Enqueue(${rootPid})
+$result = [System.Collections.Generic.List[int]]::new()
+while ($queue.Count -gt 0) {
+  $current = $queue.Dequeue()
+  foreach ($next in $children[$current]) { $result.Add($next); $queue.Enqueue($next) }
+}
+$result | ForEach-Object { $_ }
+`;
+  try {
+    const stdout = execFileSync('powershell', ['-NoProfile', '-Command', script], {
+      encoding: 'utf8',
+      windowsHide: true,
+      timeout: 5000,
+    });
+    // Number('') is 0, and killing PID 0 targets the whole process group.
+    return stdout.split(/\s+/).map(Number).filter((n) => Number.isInteger(n) && n > 0);
+  } catch {
+    return [];
   }
 }
 
 function killTree(child: ReturnType<typeof spawn>): void {
   if (child.pid === undefined) return;
-  try {
-    // SIGKILL cannot be caught or ignored, so it is the only reliable way
-    // to stop the shell and force it to release its child processes.
-    child.kill('SIGKILL');
-    if (process.platform === 'win32') {
-      // Clean up the process tree (e.g. a Java process started via `start /b`)
-      // with taskkill /T /F so no orphaned server processes survive.
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
-    } else {
-      // Kill the entire process group first (shell + all grandchildren such as
-      // a Maven daemon or Node server spawned by the shell). If the shell PID
-      // is not a process-group leader this fails silently, so we fall through
-      // to recursive descendant killing.
-      try {
-        process.kill(-child.pid, 'SIGKILL');
-      } catch {
-        /* process group may not exist; fall through to recursive kill below */
-      }
-      // Recursively find and kill all descendant processes so orphaned
-      // grandchildren (e.g. a Java server forked by Maven) cannot survive.
-      killProcessTreeUnix(child.pid);
-      // Finally ensure the shell itself is dead.
-      try {
-        process.kill(child.pid, 'SIGKILL');
-      } catch {
-        /* child may already be gone */
-      }
+  const pid = child.pid;
+
+  if (process.platform === 'win32') {
+    // A live root can be handled by taskkill /T alone. When the shell has
+    // already exited (e.g. `start /b` kept a child holding the output pipe),
+    // taskkill /T fails, so find the orphaned tree by PID and kill it first.
+    // Kill deepest-first so a parent cannot reparent its children mid-walk.
+    let rootAlive = true;
+    try { process.kill(pid, 0); } catch { rootAlive = false; }
+    const descendants = rootAlive ? [] : descendantPidsWindows(pid).reverse();
+    for (const descendant of descendants) {
+      try { process.kill(descendant, 'SIGKILL'); } catch { /* already gone */ }
     }
-  } catch {
+    // taskkill /T /F also catches children spawned between the scan and now,
+    // but only works while the root is alive. Run it synchronously so tracking
+    // is not cleared before the tree is gone.
     try {
-      child.kill('SIGKILL');
+      spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], {
+        windowsHide: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      });
     } catch {
-      /* already gone */
+      /* taskkill unavailable; child.kill below still stops the shell */
     }
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    return;
   }
+
+  // Snapshot descendants first, then kill the process group and each
+  // descendant explicitly. Descendants that created their own process group
+  // escape the group kill, and would be unfindable after the parent dies.
+  const descendants = descendantPidsUnix(pid);
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    /* shell is not a process-group leader; individual kills below still run */
+  }
+  for (const descendant of descendants) {
+    try { process.kill(descendant, 'SIGKILL'); } catch { /* already gone */ }
+  }
+  // Finally ensure the shell itself is dead. SIGKILL cannot be caught or
+  // ignored, so this is the only reliable way to stop it.
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    /* child may already be gone */
+  }
+  try { child.kill('SIGKILL'); } catch { /* already gone */ }
 }
 
 /** Workspace-shell tool: the only tool that can have side effects beyond files. */
