@@ -17,6 +17,7 @@ interface Rule {
  */
 export const DANGEROUS: Rule[] = [
   { re: /\brm\s+(-[^\s]+\s+)*-[a-z]*[rf][a-z]*\s+(\/|~|\$HOME|\/\*)(\s|$)/i, reason: 'recursive delete of / or $HOME' },
+  { re: /\brm\s+(-[^\s]+\s+)*-[a-z]*[rf][a-z]*\s+~\/(?:\s|$)/i, reason: 'recursive delete of the home directory' },
   { re: /\brm\s+-[a-z]*\s+-\/(\s|$)/, reason: 'recursive delete of /' },
   { re: /\b(mkfs|mkfs\.[a-z0-9]+)\b/i, reason: 'format a filesystem' },
   { re: /\bdd\b[^\n]*\bof=\/dev\//i, reason: 'raw write to a block device' },
@@ -24,7 +25,7 @@ export const DANGEROUS: Rule[] = [
   { re: /:\(\)\s*\{\s*:\|\s*:&\s*\}\s*;\s*:/, reason: 'fork bomb' },
   { re: /\b(shutdown|reboot|halt|poweroff|init\s+0)\b/i, reason: 'power state change' },
   { re: /\bchmod\s+(-R\s+)?777\s+\/(\s|$)/i, reason: 'world-writable root' },
-  { re: /\b(curl|wget|iwr|invoke-webrequest)\b[^\n|]*\|\s*(sudo\s+)?(ba|z|fi|k|da)?sh\b/i, reason: 'piping a download straight into a shell' },
+  { re: /\b(curl|wget|iwr|invoke-webrequest)\b[^\n|]*\|\s*(sudo\s+)?([^\s|]*\/)?(ba|z|fi|k|da)?sh\b/i, reason: 'piping a download straight into a shell' },
   { re: /\b(sudo|doas)\s+rm\s+-[a-z]*[rf]/i, reason: 'sudo recursive delete' },
   { re: /\bformat\s+[a-z]:/i, reason: 'format a Windows volume' },
   { re: /\bdel\s+\/[a-z]\s+\/[a-z]\s+[a-z]:\\/i, reason: 'recursive Windows delete of a drive' },
@@ -34,8 +35,8 @@ export const DANGEROUS: Rule[] = [
 
 /** Commands considered read-only / low risk, auto-approved under `auto-safe`. */
 const SAFE_PATTERNS: RegExp[] = [
-  /^\s*(ls|dir|pwd|cat|bat|head|tail|wc|file|stat|tree|du|df|which|whoami|hostname|date|uname|id|env|printenv|type|realpath)\b/,
-  /^\s*(grep|rg|ag|find|fd|fdfind|locate)\b/,
+  /^\s*(ls|dir|pwd|cat|bat|head|tail|wc|file|stat|tree|du|df|which|whoami|hostname|date|uname|id|printenv|type|realpath)\b/,
+  /^\s*(grep|rg|ag|fd|fdfind|locate)\b/,
   /^\s*git\s+(status|diff|log|show|branch|remote|rev-parse|describe|ls-files|blame|shortlog|tag)\b/,
   /^\s*git\s+stash\s+list\b/,
   /^\s*(node|python|python3|deno|bun|go|rustc|cargo|dotnet|java|javac|ruby|php|swift|gcc|g\+\+|clang|tsc)\s+--?v(ersion)?\b/,
@@ -51,7 +52,7 @@ const SAFE_PATTERNS: RegExp[] = [
   // Infrastructure / process-management commands used to start, wait on, and
   // inspect long-running services. These are read-only with respect to the
   // workspace and safe to run under auto-safe even when chained.
-  /^\s*(set\b|start\s+\/b\b|timeout\b|netstat\b|findstr\b|tasklist\b|ping\b)\b/,
+  /^\s*(set\b|netstat\b|findstr\b|tasklist\b|ping\b)\b/,
 ];
 
 /** Risky but legitimate commands: always confirmed, even under `auto-safe`. */
@@ -74,6 +75,27 @@ const ELEVATED: Rule[] = [
 /** Shell metacharacters that make a "safe" prefix unsafe. */
 const SHELL_META = /[;&|><`$()\n]|\|\||&&/;
 
+/**
+ * Strip shell quoting and escapes before matching safety rules. A shell turns
+ * `r""m` and `r\m` into `rm`, so matching the raw command string is evadable.
+ * Substitutions become opaque gaps: their content runs in the shell and cannot
+ * be classified from the command line alone.
+ */
+function normalizeCommand(command: string): string {
+  return command
+    .replace(/\$\([^)]*\)/g, ' ')
+    .replace(/`[^`]*`/g, ' ')
+    .replace(/\\(.)/g, '$1')
+    .replace(/(["'])(.*?)\1/g, '$2')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Substitutions and process expansion can hide arbitrary commands. */
+function hasUnverifiableShellSyntax(command: string): boolean {
+  return /\$\(|`|<\s*\(|>\s*\(/.test(command);
+}
+
 function firstMatch(rules: Rule[], command: string): Rule | undefined {
   return rules.find((r) => r.re.test(command));
 }
@@ -94,7 +116,12 @@ export function evaluateCommand(
     return { decision: 'deny', reason: 'shell tool is disabled by codingHarness.commandPolicy=deny-all' };
   }
 
-  const dangerous = firstMatch(DANGEROUS, cmd);
+  if (hasUnverifiableShellSyntax(cmd)) {
+    return { decision: 'ask', reason: 'command contains shell expansion that cannot be verified safely' };
+  }
+  const normalized = normalizeCommand(cmd);
+
+  const dangerous = firstMatch(DANGEROUS, normalized);
   if (dangerous) {
     if (opts.allowDangerousCommands) {
       return { decision: 'ask', reason: `dangerous command (${dangerous.reason}) \u2014 explicitly allowed by settings` };
@@ -102,11 +129,11 @@ export function evaluateCommand(
     return { decision: 'deny', reason: `blocked by the safety deny-list: ${dangerous.reason}` };
   }
 
-  const elevated = firstMatch(ELEVATED, cmd);
+  const elevated = firstMatch(ELEVATED, normalized);
   if (elevated) return { decision: 'ask', reason: elevated.reason };
 
-  const isSingleCommand = !SHELL_META.test(cmd);
-  if (isSingleCommand && SAFE_PATTERNS.some((re) => re.test(cmd))) {
+  const isSingleCommand = !SHELL_META.test(normalized);
+  if (isSingleCommand && SAFE_PATTERNS.some((re) => re.test(normalized))) {
     if (opts.policy === 'auto-safe' || opts.policy === 'auto-all') {
       return { decision: 'allow', reason: 'read-only command' };
     }
@@ -117,7 +144,7 @@ export function evaluateCommand(
   // safe pattern are treated as safe infrastructure operations under auto-safe.
   // E.g. "start /b ... && timeout /t 12 && netstat ... | findstr ..."
   // Splits on command separators but not on redirection operators like 2>&1.
-  const parts = cmd.split(/\s*[;&|]\s*/);
+  const parts = normalized.split(/\s*[;&|]\s*/);
   const allPartsSafe =
     parts.length > 1 &&
     parts.every((p) => {

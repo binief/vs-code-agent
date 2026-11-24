@@ -40,6 +40,8 @@ export interface AgentFileInfo {
   origin: 'user' | 'workspace';
   /** Size on disk. */
   bytes: number;
+  /** Size of the rendered instruction body, which is what consumes the budget. */
+  promptBytes?: number;
   /** True when only the first `maxBytes` of the file were read. */
   truncated: boolean;
   content: string;
@@ -631,16 +633,9 @@ export function discoverAgentFiles(options: DiscoverAgentFilesOptions): AgentFil
       result.skipped.push({ path: display, reason: 'unreadable' });
       continue;
     }
-    // Skip a file rather than append half of it: a truncated rule reads as a
-    // different rule. Per-file truncation is still allowed while the file fits
-    // in the total budget.
-    if (intended > budgetLeft) {
-      result.skipped.push({
-        path: display,
-        reason: `does not fit in the ${formatBytes(totalBudget)} instruction budget`,
-      });
-      continue;
-    }
+    // Read and strip front matter before the budget check: a large metadata
+    // block does not consume instruction space. `readLimited` still bounds the
+    // read to `maxBytes`, so this cannot load an arbitrarily large file.
     const read = readLimited(candidate.abs, intended);
     if (!read) {
       result.skipped.push({ path: display, reason: 'unreadable' });
@@ -661,6 +656,7 @@ export function discoverAgentFiles(options: DiscoverAgentFilesOptions): AgentFil
       scope: scopeFor(root, candidate.abs),
       origin: candidate.origin,
       bytes: read.bytes,
+      promptBytes: contentBytes,
       truncated: read.truncated,
       content: parsed.body,
       ...(parsed.description ? { description: parsed.description } : {}),
@@ -707,7 +703,7 @@ export function selectAgentFiles(result: AgentFilesResult, selection?: readonly 
   return {
     ...result,
     files,
-    totalBytes: files.reduce((sum, file) => sum + file.bytes, 0),
+    totalBytes: files.reduce((sum, file) => sum + (file.promptBytes ?? Buffer.byteLength(file.content, 'utf8')), 0),
     available,
     selection: selection.slice(),
     missing,

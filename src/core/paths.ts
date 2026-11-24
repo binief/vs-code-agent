@@ -43,6 +43,46 @@ export interface ResolvedPath {
 }
 
 /**
+ * Refuse any path component that is a symlink resolving outside the workspace.
+ * Dangling symlinks are refused too: `realpath` fails with ENOENT for them, so
+ * a later write through the link would silently create the target outside the
+ * workspace.
+ */
+function assertNoSymlinkEscape(rootAbs: string, abs: string, realRoot: string): void {
+  const rel = path.relative(rootAbs, abs);
+  if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return;
+  let current = rootAbs;
+  for (const segment of rel.split(path.sep)) {
+    if (!segment || segment === '.') continue;
+    current = path.join(current, segment);
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(current);
+    } catch {
+      // Nothing below this point exists yet, so no later component can be a
+      // symlink. The last missing component is simply the file to create.
+      return;
+    }
+    if (!stat.isSymbolicLink()) continue;
+    let target: string;
+    try {
+      target = fs.realpathSync.native(current);
+    } catch {
+      throw new PathError(`Path "${abs}" escapes the workspace through a dangling symlink. Refused.`);
+    }
+    if (!isInside(realRoot, target)) {
+      throw new PathError(`Path "${abs}" escapes the workspace through a symlink. Refused.`);
+    }
+  }
+}
+
+/** Re-run workspace/symlink validation immediately before a filesystem mutation. */
+export function assertPathWithinWorkspace(root: string, abs: string, opts: { allowOutside?: boolean } = {}): void {
+  if (opts.allowOutside) return;
+  resolveWorkspacePath(root, abs, opts);
+}
+
+/**
  * Resolve a model-supplied path against the workspace root and refuse anything
  * that escapes it. Absolute paths are allowed only when they already point
  * inside the workspace (or `allowOutside` is set), and symlinks are resolved so
@@ -66,8 +106,9 @@ export function resolveWorkspacePath(
           'Use a workspace-relative path, or enable "codingHarness.allowOutsideWorkspace".',
       );
     }
-    const realAbs = realpathOfNearestExisting(abs);
     const realRoot = realpathOfNearestExisting(rootAbs) ?? rootAbs;
+    assertNoSymlinkEscape(rootAbs, abs, realRoot);
+    const realAbs = realpathOfNearestExisting(abs);
     if (realAbs && !isInside(realRoot, realAbs)) {
       throw new PathError(`Path "${raw}" escapes the workspace through a symlink. Refused.`);
     }

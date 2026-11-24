@@ -88,7 +88,6 @@ export class BrowserManager {
   private page: any = null;
   private started = false;
   private playwright: any = null;
-  private installPending = false;
 
   /** Whether Playwright is available (installed or already present). */
   async isPlaywrightAvailable(): Promise<boolean> {
@@ -105,13 +104,9 @@ export class BrowserManager {
   /** Prompt the user to install Playwright, then launch the browser. */
   async ensureStarted(log: (level: string, message: string) => void): Promise<void> {
     if (this.started) return;
-    if (this.installPending) {
-      throw new Error('Playwright installation is already in progress.');
-    }
 
     const available = await this.isPlaywrightAvailable();
     if (!available) {
-      this.installPending = true;
       throw new Error(
         'Browser automation requires Playwright, which is not installed. ' +
           'Run "npm install playwright-core" in the workspace to enable browser tools.',
@@ -196,7 +191,7 @@ export class BrowserManager {
         await page.click(selector, { timeout: DEFAULT_ACTION_TIMEOUT_MS });
         targetDesc = selector;
       } else if (x !== undefined && y !== undefined) {
-        await page.click(`x=${x},y=${y}`, { timeout: DEFAULT_ACTION_TIMEOUT_MS });
+        await page.mouse.click(x, y);
         targetDesc = `(${x},${y})`;
       } else {
         return failResult(page, 'click requires a selector or x/y coordinates');
@@ -246,9 +241,9 @@ export class BrowserManager {
       } else {
         return failResult(page, 'scroll requires a selector or x/y coordinates');
       }
-      await page.evaluate((dX: number, dY: number) => {
+      await page.evaluate(([dX, dY]: [number, number]) => {
         (window as any).scrollBy(dX, dY);
-      }, dx, dy);
+      }, [dx, dy]);
       const snapshot = await this.captureSnapshot(page);
       return { ok: true, url: page.url(), title: await page.title().catch(() => ''), elements: snapshot.elements, note: snapshot.note };
     } catch (err) {
@@ -398,7 +393,7 @@ export class BrowserManager {
         const count = await page.locator(sel).count();
         for (let i = 0; i < Math.min(count, 10); i++) {
           const loc = page.locator(sel).nth(i);
-          const name = (await loc.textContent?.() || loc.getAttribute('aria-label') || '').slice(0, MAX_ELEMENT_DESCRIPTION);
+          const name = ((await loc.textContent().catch(() => '')) || (await loc.getAttribute('aria-label').catch(() => '')) || '').slice(0, MAX_ELEMENT_DESCRIPTION);
           const visible = await loc.isVisible().catch(() => false);
           if (visible && name) {
             elements.push({ role: sel, name, ref: ref++, selector: `${sel}:nth-match("${name}", ${i + 1})` });

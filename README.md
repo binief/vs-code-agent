@@ -381,6 +381,8 @@ when compacting history.
 | `get_diagnostics` | Current errors/warnings from the editor's language servers | never |
 | `open_file` | Reveal a file/line in the editor | never |
 | `task_list` | Add, update, list and remove items in a task list for long-running work; shown in the panel strip and saved in the chat JSON | never |
+| `task_decompose` | Propose a task list from a prompt and ask for approval before installing it | never |
+| `browser_tool` | Headless Chromium automation (`navigate`, `click`, `type`, `press_key`, `scroll`, `wait_for`, `get_snapshot`, `screenshot`); requires `playwright-core` | per `browsePolicy` for state-changing actions |
 
 `read_file` returns budget-aware pages rather than silently clipping a long line. When a result says
 `next_line` and `next_column`, call `read_file` again with those values as `start_line` and

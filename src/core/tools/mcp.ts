@@ -700,6 +700,8 @@ export class McpClient {
 export class McpManager {
   private clients = new Map<string, McpClient>();
   private toolMap = new Map<string, { clientId: string; toolName: string }>();
+  /** Public tool name per client/tool pair, made unique even for odd server ids. */
+  private publicToolNames = new Map<string, string>();
   /** Why each server failed to start, keyed by server id (for the settings UI). */
   private failures = new Map<string, string>();
 
@@ -727,10 +729,15 @@ export class McpManager {
         this.clients.set(id, client);
         this.failures.delete(id);
         started.push(id);
-        // Register tools
+        // Register tools. Sanitize ids/names and disambiguate collisions so a
+        // server id like `a-b` and another like `a_b` cannot overwrite entries.
         for (const tool of client.toolDefs) {
-          const prefixed = `mcp_${id}_${tool.name}`;
+          const base = `mcp_${this.sanitizeName(id)}_${this.sanitizeName(tool.name)}`;
+          let prefixed = base;
+          let suffix = 2;
+          while (this.toolMap.has(prefixed)) prefixed = `${base}_${suffix++}`;
           this.toolMap.set(prefixed, { clientId: id, toolName: tool.name });
+          this.publicToolNames.set(`${id}\u0000${tool.name}`, prefixed);
         }
       } catch (err) {
         failed.push({ id, error: (err as Error).message });
@@ -746,11 +753,17 @@ export class McpManager {
     return { started, failed };
   }
 
+  private sanitizeName(value: string): string {
+    const cleaned = value.replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+|_+$/g, '');
+    return cleaned || 'tool';
+  }
+
   getTools(): Tool[] {
     const tools: Tool[] = [];
     for (const [clientId, client] of this.clients) {
       for (const def of client.toolDefs) {
-        const prefixedName = `mcp_${clientId}_${def.name}`;
+        const prefixedName = this.publicToolNames.get(`${clientId}\u0000${def.name}`)
+          ?? `mcp_${this.sanitizeName(clientId)}_${this.sanitizeName(def.name)}`;
         const description = def.description
           ? `[MCP ${clientId}] ${def.description}`
           : `Tool ${def.name} from MCP server ${clientId}`;
@@ -768,7 +781,7 @@ export class McpManager {
                 return fail(text || `MCP tool ${def.name} returned error`, `mcp error: ${def.name}`);
               }
               const text = extractMcpContent(result);
-              return ok(text || JSON.stringify(result), `mcp ${clientId}/${def.name}`, {
+              return ok(text || '(accepted, no output)', `mcp ${clientId}/${def.name}`, {
                 relPath: undefined,
                 mcpServer: clientId,
                 mcpTool: def.name,
@@ -810,6 +823,7 @@ export class McpManager {
     await Promise.all(stops);
     this.clients.clear();
     this.toolMap.clear();
+    this.publicToolNames.clear();
     this.failures.clear();
   }
 }

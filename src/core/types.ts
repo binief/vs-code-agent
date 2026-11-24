@@ -56,6 +56,8 @@ export interface ChatMessage {
   /** tool only */
   toolCallId?: string;
   name?: string;
+  /** tool only: whether the tool succeeded, for protocols that label results. */
+  ok?: boolean;
 }
 
 export interface ToolSpec {

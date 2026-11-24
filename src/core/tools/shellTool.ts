@@ -45,6 +45,11 @@ export function setRunningCommandsChangeHandler(handler: () => void): void {
   onRunningCommandsChange = handler;
 }
 
+/** Unregister the global handler (e.g. when the owning controller shuts down). */
+export function clearRunningCommandsChangeHandler(): void {
+  onRunningCommandsChange = undefined;
+}
+
 /** Notify listeners that the running-commands set has changed. */
 function notifyRunningCommandsChange(): void {
   onRunningCommandsChange?.();
@@ -482,7 +487,7 @@ export const runCommandTool: Tool<{
 
     // When a command looks like a long-running server and detached is not set,
     // offer to move it to the background so the task can keep moving forward.
-    const LONG_RUNNING = /\\b(mvn|maven|gradle|mvnw|gradlew|java|node|python|python3|ruby|php|dotnet)\\b/;
+    const LONG_RUNNING = /\b(mvn|maven|gradle|mvnw|gradlew|java|node|python|python3|ruby|php|dotnet)\b/;
     let detached = args.detached === true;
     if (!detached && LONG_RUNNING.test(args.command) && ctx.host.prompt) {
       const choice = await ctx.host.prompt(

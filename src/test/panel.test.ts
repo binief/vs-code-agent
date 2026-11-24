@@ -167,6 +167,21 @@ test('answers render as Markdown, and model HTML can never become markup', () =>
   h.close();
 });
 
+test('markdown links cannot inject attributes through quotes in a URL', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [], state, activity: idle });
+  h.send({
+    type: 'item',
+    item: { id: 'a-xss', kind: 'assistant', text: '[x](https://e.test/"onmouseover="alert(1)', streaming: false },
+  });
+
+  const link = h.doc.querySelector('.msg.assistant a');
+  assert.ok(link, 'the link still renders');
+  assert.equal(link.getAttribute('onmouseover'), null, 'no injected event handler');
+  assert.equal(link.getAttribute('href'), 'https://e.test/"onmouseover="alert(1', 'quotes stay inside the href value');
+  h.close();
+});
+
 test('a streamed answer is patched in place, not rebuilt', () => {
   const h = mount();
   h.send({ type: 'init', items: [], state, activity: idle });
@@ -251,6 +266,23 @@ test('an approval posts a decision and then hides its buttons', () => {
 
   h.send({ type: 'update', item: { id: 'p1', decision: 'apply' } });
   assert.ok(!h.doc.querySelector('.approval .approval-actions'), 'a decided approval cannot be decided twice');
+  h.close();
+});
+
+test('a webview approval card closes when the host reports the resolution', () => {
+  const h = mount();
+  h.send({ type: 'init', items: [], state, activity: idle });
+  h.send({
+    type: 'approval-request',
+    id: '7',
+    request: { kind: 'delete', title: 'Delete file', detail: 'file.txt' },
+  });
+  assert.ok(h.doc.querySelector('.approval'), 'the request renders a card');
+
+  h.send({ type: 'approval-resolved', id: '7', decision: 'reject', interrupted: true });
+  const card = h.doc.querySelector('.approval');
+  assert.ok(card.classList.contains('resolved') && card.classList.contains('interrupted'));
+  assert.ok(!card.querySelector('.approval-actions'), 'a resolved card cannot be answered again');
   h.close();
 });
 
