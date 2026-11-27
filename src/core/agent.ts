@@ -705,26 +705,12 @@ export class HarnessSession {
     }
     // Reset server-side compaction counter for this task.
     this.serverSideCompactionCount = 0;
-    // Reset task list approval state for this task run, unless it was already
-    // approved AND the task list structure hasn't changed since approval
-    // (same items in the same order). Status changes (marking items done,
-    // in-progress) are progress updates and do not require re-approval.
-    if (this.taskListApproved && this.taskListApprovedSnapshot) {
-      const snapshot = this.taskListApprovedSnapshot;
-      const current = this.taskList.list();
-      const same =
-        current.length === snapshot.length &&
-        current.every(
-          (item, i) =>
-            item.id === snapshot[i].id && item.title === snapshot[i].title,
-        );
-      if (!same) {
-        this.taskListApproved = false;
-        this.taskListApprovedSnapshot = undefined;
-      }
-    } else {
-      this.taskListApproved = false;
-    }
+    // Task list approval persists across prompts in the same chat session.
+    // Once the user approves a task list, further prompts do not trigger
+    // re-approval — approval is only required when a brand new task list is
+    // created (via decomposeProject/createTaskListFromPrompt/task_decompose)
+    // or when the task is reset. Status changes (marking items done,
+    // in-progress) are progress updates and never require re-approval.
     this.currentOnEvent = onEvent;
     const host = this.deps.host;
 
